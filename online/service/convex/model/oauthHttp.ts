@@ -4,6 +4,8 @@ import { publicOrigin, randomSecret, sha256Hex } from "./auth";
 import { activeSessionIdentity, type HumanIdentity } from "./humanSession";
 import { MACHINE_CLIENT_ID } from "../oauth";
 
+const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
+
 const MAX_FORM_BYTES = 8192;
 const reply = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
   status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", Pragma: "no-cache" },
@@ -58,7 +60,7 @@ export async function tokenResponse(ctx: ActionCtx, request: Request, checkSessi
   const origin = publicOrigin();
   if (!origin || ![origin, `${origin}/mcp`].includes(resource) || (clientId === MACHINE_CLIENT_ID && resource !== origin)) return error("invalid_target");
   const grantType = input.get("grant_type");
-  if (grantType !== "authorization_code" && grantType !== "refresh_token") return error("unsupported_grant_type");
+  if (grantType !== "authorization_code" && grantType !== "refresh_token" && grantType !== DEVICE_GRANT) return error("unsupported_grant_type");
   // Explicit refresh scope may restate the approved set. The mutation checks
   // it atomically against the stored credential before issuing replacements.
   const scope = input.get("scope");
@@ -69,7 +71,12 @@ export async function tokenResponse(ctx: ActionCtx, request: Request, checkSessi
   const hashes = { accessHash: await sha256Hex(accessToken), refreshHash: await sha256Hex(refreshToken) };
   try {
     let result;
-    if (grantType === "authorization_code") {
+    if (grantType === DEVICE_GRANT) {
+      // One-tap approval: the waiting command line collects its sign-in. Until someone answers, nothing is written.
+      const deviceCode = input.get("device_code") ?? "";
+      if (clientId !== MACHINE_CLIENT_ID || !/^pbv_[A-Za-z0-9_-]{43}$/.test(deviceCode)) return error("invalid_grant");
+      result = await ctx.runMutation(internal.oauth.redeemDevice, { deviceHash: await sha256Hex(deviceCode), clientId, resource, accessHash: hashes.accessHash });
+    } else if (grantType === "authorization_code") {
       const code = input.get("code") ?? "", verifier = input.get("code_verifier") ?? "", redirectUri = input.get("redirect_uri") ?? "";
       if (!/^pbc_[A-Za-z0-9_-]{43}$/.test(code) || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || !redirectUri || redirectUri.length > 2048) return error("invalid_request");
       const codeHash = await sha256Hex(code);

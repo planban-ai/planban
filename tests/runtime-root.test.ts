@@ -32,7 +32,7 @@ test("source checkout wins over marketplace, while configured and bundled runtim
     assert.equal(resolvePlanbanRuntime(plugin, env), explicit);
     const bundled = await runtime(join(plugin, "runtime"));
     assert.equal(resolvePlanbanRuntime(plugin, env), bundled);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("marketplace recovery requires an installed cache and a complete runtime", async () => {
@@ -50,7 +50,7 @@ test("marketplace recovery requires an installed cache and a complete runtime", 
     assert.equal(resolvePlanbanRuntime(cache, env), marketplace);
     assert.throws(() => resolvePlanbanRuntime(join(root, "unrelated/plugin"), env), /runtime not found/u);
     assert.throws(() => resolvePlanbanRuntime(cache, { ...env, PLANBAN_REPO_ROOT: join(root, "missing") }), /PLANBAN_REPO_ROOT/u);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("Claude Code installs resolve the marketplace runtime through the known-marketplaces registry or the conventional clone", async () => {
@@ -82,7 +82,7 @@ test("Claude Code installs resolve the marketplace runtime through the known-mar
     );
     await runtime(join(home, "plugins/marketplaces/other"));
     assert.equal(resolvePlanbanRuntime(otherMarketplace, env), join(home, "plugins/marketplaces/other"));
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("unexpanded host template variables in .mcp.json are ignored", async () => {
@@ -93,5 +93,5 @@ test("unexpanded host template variables in .mcp.json are ignored", async () => 
     await mkdir(plugin, { recursive: true });
     await writeFile(join(plugin, ".mcp.json"), JSON.stringify({ mcpServers: { planban: { cwd: "${CLAUDE_PLUGIN_ROOT}", env: { PLANBAN_REPO_ROOT: "${CLAUDE_PLUGIN_ROOT}/runtime" } } } }));
     assert.equal(resolvePlanbanRuntime(plugin, { CODEX_HOME: join(root, "codex"), CLAUDE_CONFIG_DIR: join(root, "claude") }), local);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });

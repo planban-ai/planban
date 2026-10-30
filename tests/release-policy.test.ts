@@ -6,6 +6,10 @@ const workflows = {
   ".github/workflows/ci.yml": "jobs:\n  release-preflight:\n    runs-on: ubuntu-24.04\n",
   ".github/workflows/release-readiness.yml": [
     "jobs:",
+    "  updater-rehearsal:",
+    "    uses: ./.github/workflows/updater-rehearsal.yml",
+    "    with:",
+    "      expected_commit: ${{ inputs.ref }}",
     "  exact-sha-preflight:",
     "    runs-on: ubuntu-24.04",
     "    steps:",
@@ -100,4 +104,19 @@ test("does not let a disabled Claude Code rehearsal satisfy release readiness", 
   const [installLine] = installAfterRun.splice(installIndex, 1);
   installAfterRun.splice(installAfterRun.length - 1, 0, installLine);
   assert.deepEqual(audit(installAfterRun.join("\n")), [claudeRunMissing]);
+});
+
+test("requires release readiness to run the full updater rehearsal on the exact commit", () => {
+  const readiness = workflows[".github/workflows/release-readiness.yml"];
+  const audit = (source: string) => auditReleasePolicy({
+    remoteUrl: "https://github.com/planban-ai/planban.git",
+    workflows: { ...workflows, ".github/workflows/release-readiness.yml": source },
+    packageJson: { allowScripts: {} },
+    packageLock: { packages: {} },
+  });
+  const missing = [".github/workflows/release-readiness.yml must run ./.github/workflows/updater-rehearsal.yml with expected_commit: ${{ inputs.ref }} in a job that always runs"];
+  assert.deepEqual(audit(readiness), []);
+  assert.deepEqual(audit(readiness.replace(/  updater-rehearsal:\n(    .*\n|      .*\n)*/u, "")), missing);
+  assert.deepEqual(audit(readiness.replace("${{ inputs.ref }}", "${{ inputs.target_ref }}")), missing);
+  assert.deepEqual(audit(readiness.replace("    uses: ./.github", "    if: false\n    uses: ./.github")), missing);
 });

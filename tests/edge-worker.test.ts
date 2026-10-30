@@ -109,6 +109,45 @@ test("limits sign-in starts per caller address before forwarding, and refuses th
   assert.equal(unlimited.seen.length, 0);
 });
 
+test("browser sign-in is limited per address and sign-out passes; neither answers other methods", async () => {
+  let allow = true;
+  const limited: Env = { ...env, SIGNIN_LIMITER: { limit: async () => ({ success: allow }) } };
+  const session = () => new Request(`${PUBLIC}/web/session`, { method: "POST", headers: { "CF-Connecting-IP": "203.0.113.9" } });
+  assert.equal((await through(session(), undefined, limited)).response.status, 200);
+  allow = false;
+  assert.equal((await through(session(), undefined, limited)).response.status, 429);
+  const signOut = await through(new Request(`${PUBLIC}/web/signout`, { method: "POST" }), undefined, limited);
+  assert.equal(signOut.response.status, 200);
+  assert.equal(signOut.seen[0]!.url, `${env.UPSTREAM}/web/signout`);
+  assert.equal((await through(new Request(`${PUBLIC}/web/session`), undefined, limited)).response.status, 405);
+  assert.equal((await through(new Request(`${PUBLIC}/web/other`, { method: "POST" }), undefined, limited)).response.status, 404);
+});
+
+test("new boards are limited per address and refused without a limiter; other API routes aren't", async () => {
+  let allow = false;
+  const limited: Env = { ...env, SIGNIN_LIMITER: { limit: async () => ({ success: allow }) } };
+  const create = () => new Request(`${PUBLIC}/api/v1/boards`, { method: "POST", headers: { "CF-Connecting-IP": "203.0.113.9" }, body: "{}" });
+  assert.equal((await through(create(), undefined, limited)).response.status, 429);
+  allow = true;
+  assert.equal((await through(create(), undefined, limited)).response.status, 200);
+  assert.equal((await through(create())).response.status, 503, "fails closed without a limiter");
+  assert.equal((await through(new Request(`${PUBLIC}/api/v1/boards`), undefined, limited)).response.status, 200, "listing boards isn't limited");
+});
+
+test("the front door never adds cross-site permissions, on success or on any refusal", async () => {
+  const cases = [
+    new Request(`${PUBLIC}/api/v1/boards`, { headers: { Origin: "https://evil.example" } }),
+    new Request(`${PUBLIC}/nowhere`, { headers: { Origin: "https://evil.example" } }),
+    new Request(`${PUBLIC}/web/session`, { headers: { Origin: "https://evil.example" } }),
+    new Request(`${PUBLIC}/web/session`, { method: "OPTIONS", headers: { Origin: "https://evil.example", "Access-Control-Request-Method": "POST" } }),
+  ];
+  const upstreamTriesCors = () => new Response("{}", { status: 200, headers: { "Access-Control-Allow-Origin": "*" } });
+  for (const request of cases) {
+    const { response } = await through(request, upstreamTriesCors);
+    for (const name of response.headers.keys()) assert.ok(!name.startsWith("access-control-"), `${request.method} ${request.url}: ${name}`);
+  }
+});
+
 test("registrations use their own limiter, and a streamed body past the cap fails the upload", async () => {
   const used: string[] = [];
   const limiter = (name: string) => ({ limit: async () => { used.push(name); return { success: true }; } });

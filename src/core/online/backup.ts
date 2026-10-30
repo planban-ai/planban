@@ -10,7 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { cp, mkdir, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type { PlanbanDocPayload, PlanbanHistoryPayload, PlanbanRoadmap } from "../types";
-import { PlanbanConflictError } from "../boardOperations";
+import { PlanbanConflictError, PlanbanNotFoundError } from "../boardOperations";
 import { defaultPlanbanRoot } from "../paths";
 import { atomicWriteFile, withBoardWriteLock } from "../persistence";
 import { boardPath, onlineRequest } from "./client";
@@ -136,6 +136,17 @@ async function refreshOnce(url: string, boardId: string, root: string, options: 
           if (!after.unchanged) throw new PlanbanConflictError("The board changed while it was being backed up.");
         }
         await atomicWriteFile(join(staging, "roadmap.json"), JSON.stringify(roadmap, null, 2) + "\n");
+        // The goals as they are now (they're small, and every change to them is a new revision).
+        // If they can't be read, this refresh fails and the next one tries again: a backup is
+        // never saved at this revision without them. A service from before goals has none.
+        const read = await onlineRequest<{ goals?: unknown; revision?: number }>(url, boardPath(boardId, "/goals")).catch((error: unknown) => {
+          if (error instanceof PlanbanNotFoundError) return {} as { goals?: unknown; revision?: number };
+          throw error;
+        });
+        // Read after the roadmap: if the board moved on meanwhile, start again rather than save goals from a later revision.
+        if (read.revision !== undefined && read.revision !== roadmap.revision) throw new PlanbanConflictError("The board changed while it was being backed up.");
+        if (read.goals) await atomicWriteFile(join(staging, "goals.json"), JSON.stringify(read.goals, null, 2) + "\n");
+        else await rm(join(staging, "goals.json"), { force: true });
         const meta: BackupMeta = {
           version: 1, url: serviceUrl(url), boardId, revision: roadmap.revision,
           historyVersion: Math.max(complete ? previous!.historyVersion : 0, ...covered.map((entry) => entry.version)),
@@ -181,5 +192,6 @@ export async function readBackup(folder: string) {
     if (!match) continue;
     docs.push({ cardId: decodeURIComponent(match[1]!), kind: match[2] as "spec" | "plan", markdown: await readFile(join(folder, "docs", name), "utf8") });
   }
-  return { roadmap, docs };
+  const goals = await readFile(join(folder, "goals.json"), "utf8").then((raw) => JSON.parse(raw) as unknown, () => null);
+  return { roadmap, docs, goals };
 }

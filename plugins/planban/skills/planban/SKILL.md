@@ -64,7 +64,14 @@ the complete logical mutation sequence: take it from the last mutation result's
 `boardUrlVerified: false`. Make one bounded in-app presentation attempt through the
 host adapter unless the user requested headless behavior, and include the
 clickable verified URL in the final response. Do not reopen the Board after every
-individual write in a multi-step mutation.
+individual write in a multi-step mutation. Through the remote tools
+(`https://app.planban.ai/mcp`), `userReply` holds the board's web address, which is
+always verified, and there is no `planban_launch_board`. The protocol's **Tools on
+each surface** section lists what differs between the local and remote tools.
+
+On an online board, read the protocol's **Online authority** section before editing:
+it covers the two version numbers, merging after a document conflict, retries,
+refusals, Complete, accounts on this computer, and never editing the board's files.
 
 After `/planban` or `/pb` opens a board in the current thread, treat near-term
 ambiguous follow-ups like "work on this", "do the next thing", "start this card", or

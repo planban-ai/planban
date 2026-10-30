@@ -49,6 +49,8 @@ function listenerPids(port) {
   const result = spawnSync("lsof", [`-tiTCP:${port}`, "-sTCP:LISTEN"], {
     encoding: "utf8",
   });
+  // Without lsof (Windows), there is nothing to look up; the launched server is stopped by its own process.
+  if (result.error || typeof result.stdout !== "string") return [];
   if (result.status !== 0 && !result.stdout.trim()) return [];
   return result.stdout
     .split(/\s+/u)
@@ -225,6 +227,11 @@ async function main() {
       "planban_get_board",
       "planban_query_cards",
       "planban_get_card",
+      "planban_unresolved_changes",
+      "planban_drop_change",
+      "planban_history",
+      "planban_read_goals",
+      "planban_suggest_goal_change",
       "planban_create_card",
       "planban_create_group",
       "planban_create_cards",
@@ -232,6 +239,7 @@ async function main() {
       "planban_move_card",
       "planban_update_card",
       "planban_write_doc",
+      "planban_write_doc_section",
       "planban_move_files_out",
       "planban_launch_board",
     ]);
@@ -285,9 +293,11 @@ async function main() {
     assert.equal(assertNoError(responseById(responses, 10)).markdown, "# MCP Verification Plan\n\nThis was written through the Planban MCP server.\n");
     check("planban_write_doc", "plan document written");
 
+    // A refusal is a tool result that keeps its kind, not a protocol error.
     const completionResponse = responseById(responses, 11);
-    assert.equal(completionResponse.error.code, -32602);
-    assert.match(completionResponse.error.message, /completionConfirmed/);
+    assert.equal(completionResponse.result.isError, true);
+    assert.equal(completionResponse.result.structuredContent.error.category, "validation");
+    assert.match(completionResponse.result.content[0].text, /completionConfirmed/);
     check("completion guard", "complete without confirmation rejected");
 
     const launch = assertNoError(responseById(responses, 12));

@@ -89,17 +89,11 @@ if (findings.length > 0) {
   process.exit(1);
 }
 
+// First, as it takes seconds: a fresh build must leave the saved board page unchanged.
+run("node", ["scripts/check-web-build.mjs"]);
 run("npm", ["run", "typecheck"]);
 run("npm", ["test"]);
 run("npm", ["audit", "--audit-level=high"]);
-run("npm", ["run", "build"]);
-// The board page ships pre-built in dist/web, so a saved copy older than its
-// source ships old screens. A fresh build must leave the saved copy unchanged.
-const savedBuild = spawnSync("git", ["status", "--porcelain", "--", "dist/web"], { cwd: repoRoot, encoding: "utf8" });
-if (savedBuild.error || savedBuild.status !== 0 || savedBuild.stdout.trim()) {
-  process.stderr.write(`\nRelease preflight failed: dist/web does not match the source. Run npm run build and commit dist/web.\n${savedBuild.stdout ?? ""}`);
-  process.exit(1);
-}
 run("npm", ["run", "smoke"]);
 run("node", ["scripts/verify-planban-mcp.mjs"]);
 run("node", ["scripts/verify-cold-install.mjs"]);
@@ -113,11 +107,11 @@ process.stdout.write(JSON.stringify({
     "remote-owner Linux runner policy",
     "Codex and Claude Code upgrade rehearsals required for release readiness",
     "lockfile dependency install-script allowlist",
+    "build",
+    "saved board page matches its source",
     "typecheck",
     "tests",
     "high-severity dependency audit",
-    "build",
-    "saved board page matches its source",
     "HTTP smoke",
     "MCP verifier",
     "cold MCP, CLI, and board installation verifier",

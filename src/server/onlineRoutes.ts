@@ -8,10 +8,14 @@ import type express from "express";
 import { PlanbanValidationError } from "../core/boardOperations";
 import { requestedMemberRole } from "../core/memberRoles";
 import { readManifest, resolvePlanningRoot } from "../core/storage";
-import { boardPath, onlineRequest, requireCredentials } from "../core/online/client";
+import { boardCredentials, boardPath, onlineRequest, requireCredentials } from "../core/online/client";
 import { readCredentials, serviceUrl } from "../core/online/credentials";
 import { knownStaleCopy } from "../core/online/copyCheck";
 import { onlineLogin } from "../core/online/login";
+import { AccountInUseError, boardAccount, liveAccount, rememberIdentity } from "../core/online/accounts";
+
+/** Services this server has already asked for a missing email. */
+const askedWho = new Set<string>();
 import {
   attachOnline, keepSeparateBoard, moveState, previewTakeOnline, othersOnBoard, PlanbanConfirmationNeeded, PlanbanTakeOnlineStopped, takeLocal, takeOnline, type MoveProgress,
 } from "../core/online/transfers";
@@ -67,6 +71,8 @@ function describeOutcome(kind: MoveJob["kind"], state: Awaited<ReturnType<typeof
     if (location === "online") return { unchanged: false, location, message: "The board is online. The last step, refreshing this Mac's backup copy, did not finish; it happens again automatically.", retry: null };
     if (!unfinished) return { unchanged: true, location, message: "Nothing has changed. The board is still on this Mac, you and your agents can keep editing, and the partial online copy has been removed.", retry: "Take online" };
     if (unfinished.phase === "committed") return { unchanged: false, location, message: "The board reached your Planban account, but this Mac has not switched to it yet. Try again to finish; nothing is lost either way.", retry: "Finish taking it online" };
+    // Shut here before the commit: whether the commit landed is unknown, so nobody can edit it on this Mac.
+    if (unfinished.phase === "sealing" || unfinished.phase === "sealed") return { unchanged: false, location, message: "The board is paused on this Mac, so nobody can change it here. Planban could not confirm whether it reached your Planban account. Try again to finish the move, or stop it to put the board back on this Mac as it was.", retry: "Continue" };
     return { unchanged: false, location, message: "The board is still on this Mac and nothing on it has changed, but the partial online copy could not be removed yet. Try again to continue the move, or stop it to remove the partial copy.", retry: "Continue" };
   }
   if (location === "local") return { unchanged: false, location, message: "The board is on this Mac. The online copy was not told the move finished yet; that happens the next time this Mac reaches it.", retry: null };
@@ -100,9 +106,22 @@ export function registerOnlineRoutes(app: express.Express, deps: Deps) {
       const repoId = req.params.repoId;
       const cwd = await deps.resolveBoardCwd(repoId);
       const manifest = await readManifest(cwd);
-      const signedIn = Object.keys((await readCredentials()).services);
+      let services = (await readCredentials()).services;
+      // A sign-in from before emails were kept: for an online board (a local
+      // board never contacts the service), ask once per run of this server.
+      const online = manifest?.storage?.kind === "online" ? manifest.storage.url : null;
+      if (online && services[online] && !services[online].email && !askedWho.has(online)) {
+        askedWho.add(online);
+        await rememberIdentity(online, 1).catch(() => undefined);
+        services = (await readCredentials()).services;
+      }
+      const signedIn = Object.keys(services);
       const job = [...jobs.values()].filter((entry) => entry.repoId === repoId).at(-1);
-      const base = { signedIn, defaultService: await defaultService(), job: job ? publicJob(job) : null };
+      // Who each service is signed in as here, for "Signed in as" (owner request, 15 October 2026).
+      const accounts = Object.fromEntries(Object.entries(services).map(([url, credentials]) => [url, credentials.email ?? null]));
+      // An online board's own account (several can be signed in), from its link on this computer.
+      const link = manifest?.storage?.kind === "online" ? await boardAccount(manifest.storage.url, manifest.storage.boardId).catch(() => null) : null;
+      const base = { signedIn, accounts, ...(link ? { account: link.email ?? null } : {}), defaultService: await defaultService(), job: job ? publicJob(job) : null };
       if (manifest?.storage?.kind !== "online") {
         const stale = manifest?.enabled ? await knownStaleCopy(resolvePlanningRoot(manifest), cwd, manifest.repoId) : null;
         res.json({ ...base, location: running(repoId)?.kind === "take-online" ? "moving" : "local", stale });
@@ -111,10 +130,11 @@ export function registerOnlineRoutes(app: express.Express, deps: Deps) {
       const { url, boardId } = manifest.storage;
       // People on the board, for Board settings. A failure here (signed out,
       // offline) still shows where the board lives.
-      const people = await Promise.all([
-        onlineRequest<{ members: Array<{ userId: string; role: string }> }>(url, boardPath(boardId, "/members")),
-        onlineRequest<{ userId: string }>(url, "/api/v1/me"),
-      ]).then(([{ members }, me]) => members.map((member) => ({ ...member, you: member.userId === me.userId })), () => null);
+      // "You" is the board's own account, which may not be this computer's default.
+      const people = await boardCredentials(url, boardId).then((credentials) => Promise.all([
+        onlineRequest<{ members: Array<{ userId: string; role: string }> }>(url, boardPath(boardId, "/members"), undefined, { credentials }),
+        onlineRequest<{ userId: string }>(url, "/api/v1/me", undefined, { credentials }),
+      ])).then(([{ members }, me]) => members.map((member) => ({ ...member, you: member.userId === me.userId })), () => null);
       res.json({ ...base, location: "online", url, boardId, people });
     } catch (error) {
       next(error);
@@ -401,11 +421,21 @@ export function registerOnlineRoutes(app: express.Express, deps: Deps) {
         throw new PlanbanValidationError(`This board is on ${new URL(requested).host}, which this computer hasn't signed in to before. If you trust it, sign in from a terminal: ${planbanCommand()} online login ${requested}`);
       }
       const url = requested ?? await defaultService();
+      // Another account still signed in here: the page asks first (owner request, 15 October 2026).
+      if (req.body?.switchAccount !== true) {
+        const current = await liveAccount(url);
+        if (current) {
+          const refusal = new AccountInUseError(url, current);
+          res.status(409).json({ error: refusal.message, accountInUse: { url, email: current.email ?? null } });
+          return;
+        }
+      }
       const id = randomUUID();
       const entry = { link: null as string | null, done: false, error: null as string | null };
       signIns.set(id, entry);
       const linkReady = new Promise<void>((resolve) => {
         void onlineLogin(url, {
+          switchAccount: true,
           openBrowser: async (link) => {
             entry.link = link;
             resolve();

@@ -1,3 +1,4 @@
+import { PEOPLE_ONLY } from "../core/goals";
 import express from "express";
 import { spawn } from "node:child_process";
 import { urlOpener } from "../core/openUrl";
@@ -32,7 +33,9 @@ import {
   touchBoard,
 } from "../core/registry";
 import {
+  boardPlanningRoot,
   getStatus,
+  PlanbanBoardMovedError,
   initializeProject,
   loadState,
   readManifest,
@@ -57,11 +60,15 @@ import {
   createGroup,
   deleteArchivedCard,
   historyPayload,
+  readGoals,
+  editGoals,
+  decideGoalSuggestion,
   loadHistoryState,
   exportFlatVersion1,
   reconstructHierarchy,
 } from "../core/storage";
 import { boardPath, OnlineAuthenticationError, onlineRequest } from "../core/online/client";
+import { withRequestIdempotencyKey } from "../core/online/adapter";
 import { planbanCommand } from "../core/command";
 import type { LiveWatch } from "../core/online/live";
 import { registerOnlineRoutes } from "./onlineRoutes";
@@ -77,6 +84,8 @@ import { updatePreflight } from "../core/updatePreflight";
 import { runPlanbanUpdate, type UpdateRunSnapshot } from "../core/updateRunner";
 import { PlanbanActivityStore } from "../core/activity";
 import { collectStaleness } from "../core/stalenessSources";
+import { keptProgress } from "../core/boardOperations";
+import { PlanbanEditConflictError } from "../core/conflicts";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const WEB_ROOT = resolve(PACKAGE_ROOT, "src/web");
@@ -260,6 +269,7 @@ function updateItemCodexThreadMeta(
       },
     },
     updatedAt: new Date().toISOString(),
+    ...keptProgress(item),
   };
 }
 
@@ -585,20 +595,32 @@ export async function startServer(options: ServeOptions) {
     cwdForMutation: string,
     run: () => Promise<T>,
   ): Promise<{ replayed: boolean; value: T }> {
-    const status = await getStatus(cwdForMutation);
-    if (!status.initialized || !status.planningRoot) {
-      return { replayed: false, value: await run() };
+    const key = idempotencyKey(req);
+    for (;;) {
+      const status = await getStatus(cwdForMutation);
+      if (!status.initialized || !status.planningRoot) {
+        return { replayed: false, value: await withRequestIdempotencyKey(key, run) };
+      }
+      const planningRoot = status.planningRoot;
+      try {
+        return await runIdempotentBoardMutation({
+          planningRoot,
+          idempotencyKey: key,
+          scope: `${req.method} ${req.route?.path ?? req.path}`,
+          fingerprint: idempotencyFingerprint({
+            params: req.params,
+            body: req.body ?? null,
+          }),
+          // A board that moved while this request waited records the key where it lives now.
+          stillHere: async () => (await boardPlanningRoot(cwdForMutation)) === planningRoot,
+          // The online operation carries the same key, so the service also knows a retry.
+          run: () => withRequestIdempotencyKey(key, run),
+        });
+      } catch (error) {
+        if (error instanceof PlanbanBoardMovedError) continue;
+        throw error;
+      }
     }
-    return runIdempotentBoardMutation({
-      planningRoot: status.planningRoot,
-      idempotencyKey: idempotencyKey(req),
-      scope: `${req.method} ${req.route?.path ?? req.path}`,
-      fingerprint: idempotencyFingerprint({
-        params: req.params,
-        body: req.body ?? null,
-      }),
-      run,
-    });
   }
 
   app.get("/api/live", (req, res) => {
@@ -994,8 +1016,8 @@ export async function startServer(options: ServeOptions) {
     try {
       const state = await loadState(await boardCwd(req.params.repoId));
       // Advisory stale signals for the board chip; the git merge log and history index are cached in core.
-      const staleness = await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems });
-      res.json({ ...state, staleness: { cards: staleness.cards } });
+      const staleness = await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems, storage: state.manifest.storage });
+      res.json({ ...state, staleness: { cards: staleness.cards, ...(staleness.notes?.length ? { notes: staleness.notes } : {}) } });
     } catch (error) {
       next(error);
     }
@@ -1342,6 +1364,59 @@ export async function startServer(options: ServeOptions) {
       }));
       sendEvent("state", { repoId: req.params.repoId, doc: payload.path });
       res.json(payload);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Goals (owner decisions, 16 October 2026): the page reads them; people change them here.
+  // Only the board page in a browser may change them: it names itself, and the browser marks
+  // its requests same-origin. Agents use the suggestion tool instead (PEOPLE_ONLY).
+  const fromBoardPage = (req: express.Request) => req.header("X-Planban-Client") === "web"
+    && req.header("Sec-Fetch-Site")?.trim().toLowerCase() === "same-origin" && req.body?.actor !== "agent";
+  app.get("/api/boards/:repoId/goals", async (req, res, next) => {
+    try {
+      const { page, revision } = await readGoals({ cwd: await boardCwd(req.params.repoId) });
+      res.json({ ...page, revision });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/boards/:repoId/goals", async (req, res, next) => {
+    try {
+      if (!fromBoardPage(req)) {
+        res.status(403).json({ error: PEOPLE_ONLY });
+        return;
+      }
+      const cwdForBoard = await boardCwd(req.params.repoId, false);
+      const { value } = await runApiMutation(req, cwdForBoard, () => editGoals({
+        cwd: cwdForBoard, edit: req.body?.edit, baseRevision: optionalBaseRevision(req.body?.baseRevision), actor: "user",
+      }));
+      sendEvent("state", { repoId: req.params.repoId, revision: value.revision });
+      res.json({ ...value.page, revision: value.revision });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.post("/api/boards/:repoId/goals/suggestions/:id", async (req, res, next) => {
+    try {
+      if (!fromBoardPage(req)) {
+        res.status(403).json({ error: PEOPLE_ONLY });
+        return;
+      }
+      const decision = req.body?.decision;
+      if (decision !== "accept" && decision !== "dismiss") {
+        res.status(422).json({ error: "decision is accept or dismiss" });
+        return;
+      }
+      const cwdForBoard = await boardCwd(req.params.repoId, false);
+      const { value } = await runApiMutation(req, cwdForBoard, () => decideGoalSuggestion({
+        cwd: cwdForBoard, suggestionId: req.params.id, decision, baseRevision: optionalBaseRevision(req.body?.baseRevision), actor: "user",
+      }));
+      sendEvent("state", { repoId: req.params.repoId, revision: value.revision });
+      res.json({ ...value.page, revision: value.revision });
     } catch (error) {
       next(error);
     }
@@ -1750,7 +1825,9 @@ export async function startServer(options: ServeOptions) {
           : 500;
     // A missing or ended Online Board sign-in: the board page offers Sign in for this service.
     const signIn = error instanceof OnlineAuthenticationError ? error.signIn : undefined;
-    res.status(responseStatus).json({ error: message, ...(signIn ? { signInNeeded: signIn.url, signedOut: signIn.reason, signInCommand: `${planbanCommand()} online login ${signIn.url}` } : {}) });
+    // A refused edit on an online board: what changed, by whom, and the current value, for the page.
+    const conflict = error instanceof PlanbanEditConflictError ? error.conflict : undefined;
+    res.status(responseStatus).json({ error: message, ...(signIn ? { signInNeeded: signIn.url, signedOut: signIn.reason, signInCommand: `${planbanCommand()} online sign-in ${signIn.url}`, ...(signIn.account !== undefined ? { signInAccount: signIn.account } : {}) } : {}), ...(conflict ? { conflict, currentRevision: conflict.currentRevision } : {}) });
   });
 
   try {

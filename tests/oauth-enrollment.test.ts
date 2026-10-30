@@ -40,8 +40,8 @@ function fixture() {
   };
   const ctx: any = { db, scheduler: { runAfter: async (delay: number, fn: unknown, args: unknown) => { jobs.push({ at: Date.now() + delay, fn, args }); } } };
   const addMachine = (userId = "person", canAdminister = true) => db.insert("connections", { userId, kind: "machine", canAdminister, name: "Machine", clientName: "Machine", boards: "all", level: "complete", lastUsedAt: new Date().toISOString(), createdAt: new Date().toISOString() });
-  async function request(label: string, purpose = "oauth", callback: { clientId?: string; redirectUri?: string } = {}) {
-    const args = { requestHash: digest(`request-${label}`), browserHash: digest(`browser-${label}`), csrfHash: digest(`csrf-${label}`), clientId: "https://client.example/client.json", clientName: "Fixture app", redirectUri: "http://127.0.0.1:4444/callback", resource: "https://planban.example/mcp", scopes: ["planban:plan", "offline_access"], level: "plan", challenge: "a".repeat(43), state: `state-${label}`, purpose };
+  async function request(label: string, purpose = "oauth", callback: { clientId?: string; redirectUri?: string } = {}, userId = "person") {
+    const args = { userId, expiresAt: Date.now() + (purpose === "machine" ? oauth.MACHINE_REQUEST_MS : oauth.REQUEST_MS), requestHash: digest(`request-${label}`), browserHash: digest(`browser-${label}`), csrfHash: digest(`csrf-${label}`), clientId: "https://client.example/client.json", clientName: "Fixture app", redirectUri: "http://127.0.0.1:4444/callback", resource: "https://planban.example/mcp", scopes: ["planban:plan", "offline_access"], level: "plan", challenge: "a".repeat(43), state: `state-${label}`, purpose };
     if (purpose === "machine") { args.clientId = oauth.MACHINE_CLIENT_ID; args.scopes = ["planban:machine"]; args.level = "complete"; }
     Object.assign(args, callback);
     await handler(oauth.createRequest, ctx, args);
@@ -355,7 +355,8 @@ test("scheduled cleanup follows later bucket requests and late-approved deadline
   await f.runDueCleanup();
   assert.equal((await f.db.get(grant)).revokedAt, undefined, "the code is still valid at the first scheduled job");
   assert.ok(f.jobs.some((job) => job.at > Date.now() && getFunctionName(job.fn as any) === "oauth:cleanupRequests"));
-  t.mock.timers.tick(60_000);
+  // An approved request is kept until its sign-in note would have expired, so the note can't be approved twice.
+  t.mock.timers.tick(60_000 + oauth.CODE_MS);
   await f.runDueCleanup();
   assert.equal(f.rows.filter((row) => row.table === "oauthRequests").length, 0);
   assert.ok((await f.db.get(grant)).revokedAt);
@@ -367,7 +368,8 @@ test("continuous traffic uses one cleanup driver across client buckets and termi
   const f = fixture();
   const queued = () => f.jobs.filter((job) => getFunctionName(job.fn as any) === "oauth:cleanupRequests");
   for (let minute = 0; minute < 240; minute++) {
-    await f.request(`continuous-${minute}`);
+    // Each approval counts against its own person's hourly limit.
+    await f.request(`continuous-${minute}`, "oauth", {}, `person-${minute}`);
     await f.runDueCleanup();
     assert.equal(queued().length, 1, `one driver after minute ${minute}`);
     assert.ok(f.rows.filter((row) => row.table === "oauthRequests").length <= 12, "expired requests remain bounded");
@@ -388,22 +390,17 @@ test("continuous traffic uses one cleanup driver across client buckets and termi
 
 test("cleanup preserves a current rate counter until bucket rollover and removes it without more traffic", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2030-01-01T00:00:00Z") });
-  const f = fixture(), machine = await f.addMachine();
-  await f.request("previous-bucket-pending");
-  t.mock.timers.tick(oauth.REQUEST_MS);
-  const consumed = await f.request("current-bucket-consumed");
-  const grant = await f.approve(consumed, machine); await f.redeem(consumed);
-  t.mock.timers.tick(oauth.CODE_MS);
+  const f = fixture();
+  // Planban 1.x command lines still start a stored lease, metered against the shared budget.
+  await handler(oauth.startMachine, f.ctx, { launchHash: digest("legacy-launch"), requestHash: digest("legacy-request"), challenge: "a".repeat(43), state: "legacy", redirectUri: "http://127.0.0.1:53682/callback", resource: "https://planban.example" });
+  t.mock.timers.tick(oauth.MACHINE_REQUEST_MS + oauth.CODE_MS);
   await f.runDueCleanup();
   assert.equal(f.rows.filter((row) => row.table === "oauthRequests").length, 0);
   assert.equal(f.rows.filter((row) => row.table === "oauthUsage").length, 1, "the current quota cannot reset early");
-  assert.equal((await f.db.get(grant)).revokedAt, undefined);
-  assert.equal(f.jobs.filter((job) => getFunctionName(job.fn as any) === "oauth:cleanupRequests").length, 1);
   t.mock.timers.tick(oauth.REQUEST_MS);
   await f.runDueCleanup();
   assert.equal(f.rows.filter((row) => row.table === "oauthUsage").length, 0);
   assert.equal(f.jobs.filter((job) => getFunctionName(job.fn as any) === "oauth:cleanupRequests").length, 0);
-  assert.equal((await f.db.get(grant)).revokedAt, undefined);
 });
 
 test("token revocation is idempotent and closes its exact family without revoking another app installation", async () => {

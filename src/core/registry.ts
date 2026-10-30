@@ -9,6 +9,7 @@ import {
   detachedBoardCwd,
   eventsPath,
   expandHome,
+  hasLiveRoadmap,
   manifestPath,
   registryPath,
   resolveInsideRoot,
@@ -21,6 +22,7 @@ import { ensureHistoryBaseline, recordHistoryVersion } from "./history";
 import { atomicWriteFile, appendLineDurably, withBoardWriteLock } from "./persistence";
 import { buildAgentContext } from "./protocol";
 import { manifestSchema } from "./schema";
+import { PlanbanValidationError } from "./boardOperations";
 import { onlineCacheRoot, refuseOnline } from "./online/adapter";
 import type { PlanbanBoardRecord, PlanbanBoardRegistry, PlanbanProjectManifest, PlanbanResolvedState, PlanbanRoadmap } from "./types";
 
@@ -343,11 +345,32 @@ export async function duplicateBoard(input: {
   });
 }
 
-export async function deleteBoard(repoId: string): Promise<{ repoId: string; backupPath: string | null }> {
+export class PlanbanOnlineBoardDeleteRefused extends PlanbanValidationError {
+  constructor(readonly repoId: string, title: string) {
+    super(`"${title}" is an online board, so deleting it here would only remove it from this computer: it stays online for everyone on it. To delete the board itself, its owner takes it local (Board settings, Take local) and then deletes the online copy at app.planban.ai (Board settings, Delete online copy). To only stop showing it on this computer, use "remove from this computer" (planban delete-board ${repoId} --this-computer-only --yes).`);
+    this.name = "PlanbanOnlineBoardDeleteRefused";
+  }
+}
+
+/**
+ * Deletes a local board after keeping a backup. An online board isn't
+ * deleted from a computer (agent-surface audit, 15 October 2026): it is
+ * refused, or with `thisComputerOnly` only removed from this computer's list
+ * and cache, which never touches the board online.
+ */
+export async function deleteBoard(repoId: string, options: { thisComputerOnly?: boolean } = {}): Promise<{ repoId: string; backupPath: string | null; removedFromThisComputerOnly?: true }> {
   return withRegistryWriteLock(async () => {
   const registry = await readRegistryFile();
   const existing = registry.boards.find((board) => board.repoId === repoId);
   if (!existing) throw new Error(`Planban board not found: ${repoId}`);
+  const manifest = await readManifest(existing.cwd).catch(() => null);
+  if (manifest?.storage?.kind === "online") {
+    if (!options.thisComputerOnly) throw new PlanbanOnlineBoardDeleteRefused(repoId, existing.title);
+    // Only this computer's list and its cached copy; the automatic backup stays.
+    await rm(onlineCacheRoot(manifest.storage), { recursive: true, force: true });
+    await writeRegistryFile({ version: 1, boards: registry.boards.filter((board) => board.repoId !== repoId) });
+    return { repoId, backupPath: null, removedFromThisComputerOnly: true as const };
+  }
 
   const timestamp = nowIso();
   let backupPath: string | null = null;
@@ -377,7 +400,7 @@ export async function registerBoardFromCwd(cwdInput: string): Promise<PlanbanBoa
   }
   const planningRoot = resolvePlanningRoot(manifest);
   const liveRoadmapPath = roadmapPath(planningRoot);
-  if (!(await pathExists(liveRoadmapPath))) return null;
+  if (!(await hasLiveRoadmap(planningRoot))) return null;
   const raw = JSON.parse(await readFile(liveRoadmapPath, "utf8")) as { project?: { title?: unknown } };
   const timestamp = nowIso();
   const registry = await readRegistryFile();

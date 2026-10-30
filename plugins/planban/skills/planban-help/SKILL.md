@@ -59,10 +59,18 @@ Then list common actions:
 - start work from a named Planban roadmap item or card id
 - create Planban roadmap items from these notes
 - send Planban feedback
-- take this board online to share it, or bring it back to this computer
-- invite someone to an online board, or see who is on it
+- take this board online to share it, or bring it back to this computer (on a shared board, bringing it back removes everyone else, so Planban asks first)
+- invite someone to an online board, see who is on it, or join a board from an invitation link
+- open an online board in any browser or on a phone at app.planban.ai/boards/<board>
+- sign this computer in without a browser here: approve a link on your phone instead
+- see which Planban accounts are signed in here and which boards use each, add one, sign one out, or change the default for new boards (several can be signed in at once)
+- restore a board from this computer's automatic backup of an online board, as a separate copy
+- see the board's goals; an agent raises a goal that looks out of date in chat, and with your go-ahead leaves a suggested change for you to accept (only people change goals; open Goals above the board's columns to edit them)
 - check whether Planban has updates
-- archive/delete boards once available
+- archive or delete a local board (an online board is deleted by its owner at app.planban.ai, after taking it local)
+- delete a Planban account: email hello@planban.ai (the web page's profile menu, Delete account)
+
+The protocol's **Online lifecycle** section has the commands for each of these.
 
 ## Suggested Natural Prompts
 
@@ -76,6 +84,9 @@ Use specific Planban wording so the agent does not have to guess:
 - `Create Planban roadmap items from these notes: <notes>.`
 - `Send Planban feedback: <feedback>.`
 - `Take this Planban board online so Sam can work on it too.`
+- `Give me the web address of this online board.`
+- `Sign in to Planban Online with a link I can approve on my phone.`
+- `Which Planban account is this computer signed in as?`
 - `Check whether Planban has updates.`
 
 For update checks, inspect Planban's local update status endpoint or the board's update UI when available, and compare the installed version with the published latest metadata.

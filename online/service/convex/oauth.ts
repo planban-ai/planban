@@ -9,6 +9,7 @@ import { connectionIsUsable, liveConnection, registrationLive } from "./model/ac
 import { fail } from "./model/errors";
 import { agentLevel } from "./schema";
 import { MAX_REGISTRATIONS_PER_PERSON, metadataClientAllowed, REGISTERED_CLIENT_NAME, registeredClientId, type OAuthClient } from "./model/oauthClient";
+import { refuseDeletedAccount } from "./model/erasureGate";
 
 export const REQUEST_MS = 10 * 60_000;
 export const MACHINE_REQUEST_MS = 5 * 60_000;
@@ -173,18 +174,61 @@ export const registeredClient = internalQuery({
   },
 });
 
+/** Sign-in approvals one person may make in an hour (stateless sign-in start). */
+export const APPROVALS_PER_HOUR = 20;
+const HOUR_MS = 60 * 60_000;
+
+/** Counts one approval against the person's own hourly limit. */
+async function chargeApproval(ctx: MutationCtx, userId: string) {
+  const hour = Math.floor(Date.now() / HOUR_MS);
+  const row = await ctx.db.query("signInApprovals").withIndex("by_user_hour", (q) => q.eq("userId", userId).eq("hour", hour)).unique();
+  if ((row?.count ?? 0) >= APPROVALS_PER_HOUR) fail("rate_limited", `You've approved ${APPROVALS_PER_HOUR} sign-ins in the last hour. Try again later.`);
+  if (row) await ctx.db.patch(row._id, { count: row.count + 1 });
+  else await ctx.db.insert("signInApprovals", { userId, hour, count: 1 });
+}
+
+/** Hourly approval counts older than a day are removed, a bounded batch at a time. */
+export const pruneApprovals = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const old = await ctx.db.query("signInApprovals").withIndex("by_hour", (q) => q.lt("hour", Math.floor(Date.now() / HOUR_MS) - 24)).take(500);
+    for (const row of old) await ctx.db.delete(row._id);
+    return { removed: old.length };
+  },
+});
+
+/**
+ * Creates the sign-in record from a verified note, only once a signed-in
+ * person approves (stateless sign-in start). Each note is used once, a
+ * computer's launch is approved once, and approvals count against the
+ * person's own hourly limit, never a shared one.
+ */
 export const createRequest = internalMutation({
-  args: { requestHash: hash, browserHash: hash, csrfHash: hash, clientId: v.string(), clientName: v.string(), redirectUri: v.string(), resource: v.string(), scopes: v.array(v.string()), level: agentLevel, challenge: v.string(), state: v.string(), purpose: v.union(v.literal("oauth"), v.literal("machine")) },
+  args: { requestHash: hash, browserHash: hash, csrfHash: hash, clientId: v.string(), clientName: v.string(), redirectUri: v.string(), resource: v.string(), scopes: v.array(v.string()), level: agentLevel, challenge: v.string(), state: v.string(), purpose: v.union(v.literal("oauth"), v.literal("machine")), userId: v.string(), sessionId: v.optional(v.string()), expiresAt: v.number(), launchHash: v.optional(hash) },
   handler: async (ctx, args) => {
     if ([args.requestHash, args.browserHash, args.csrfHash].some((value) => !/^[a-f0-9]{64}$/.test(value)) || !/^[A-Za-z0-9_-]{43}$/.test(args.challenge)) fail("validation", "Invalid authorization request.");
     if (args.clientId.length > 2048 || args.redirectUri.length > 2048 || args.resource.length > 2048 || args.state.length > 2048 || args.clientName.length > 200 || args.scopes.length > 4) fail("validation", "Authorization request is too large.");
     if (args.purpose === "machine") {
       if (args.clientId !== MACHINE_CLIENT_ID || args.scopes.length !== 1 || args.scopes[0] !== "planban:machine" || args.level !== "complete") fail("validation", "Invalid machine authorization.");
     } else if (!args.scopes.some((scope) => scope.startsWith("planban:")) || args.scopes.some((scope) => !SCOPES.has(scope)) || args.level !== scopeLevel(args.scopes)) fail("validation", "Invalid authorization scopes.");
-    await meterRequest(ctx, args.clientId);
-    await ctx.db.insert("oauthRequests", { ...args, status: "pending", expiresAt: Date.now() + REQUEST_MS });
-    await scheduleCleanup(ctx, REQUEST_MS + CODE_MS);
+    if (args.expiresAt <= Date.now() || args.expiresAt > Date.now() + REQUEST_MS) fail("unauthorized", "Start a fresh authorization request.");
+    // A note is used once; a computer's launch link is approved once.
+    if (await requestRow(ctx, args.requestHash)) fail("unauthorized", "Start a fresh authorization request.");
+    if (args.launchHash && await ctx.db.query("oauthRequests").withIndex("by_launchHash", (q) => q.eq("launchHash", args.launchHash)).first()) fail("unauthorized", "Start a fresh authorization request.");
+    await refuseDeletedAccount(ctx, args.userId);
+    await chargeApproval(ctx, args.userId);
+    await ctx.db.insert("oauthRequests", { ...args, status: "pending" });
+    await scheduleCleanup(ctx, Math.max(0, args.expiresAt - Date.now()) + CODE_MS);
     return { created: true };
+  },
+});
+
+/** Whether a sign-in note (or its computer's launch) has already been approved. A read only. */
+export const noteUsed = internalQuery({
+  args: { requestHash: hash, launchHash: v.optional(hash) },
+  handler: async (ctx, { requestHash, launchHash }) => {
+    if (await ctx.db.query("oauthRequests").withIndex("by_requestHash", (q) => q.eq("requestHash", requestHash)).first()) return true;
+    return !!launchHash && !!await ctx.db.query("oauthRequests").withIndex("by_launchHash", (q) => q.eq("launchHash", launchHash)).first();
   },
 });
 
@@ -204,6 +248,7 @@ export const bindIdentity = internalMutation({
     const row = await requestRow(ctx, args.requestHash);
     if (!row || row.status !== "pending" || row.expiresAt <= Date.now() || row.browserHash !== args.browserHash || row.csrfHash !== args.csrfHash || (row.userId && row.userId !== args.userId)) fail("unauthorized", "Start a fresh authorization request.");
     if (row!.sessionId && row!.sessionId !== args.sessionId) fail("unauthorized", "The signed-in session changed. Start again.");
+    await refuseDeletedAccount(ctx, args.userId);
     await ctx.db.patch(row!._id, { userId: args.userId, ...(args.sessionId ? { sessionId: args.sessionId } : {}) });
     return { bound: true };
   },
@@ -245,6 +290,7 @@ export const approve = internalMutation({
         await ctx.db.patch(registration!._id, { userId: args.userId, expiresAt: undefined });
       }
     }
+    await refuseDeletedAccount(ctx, args.userId);
     const now = new Date().toISOString();
     // Pending grants are visible and revocable before code redemption; they
     // have no credential and cannot authorize resource work.
@@ -256,7 +302,8 @@ export const approve = internalMutation({
       ...(row!.purpose === "oauth" ? { expiresAt: new Date(Date.now() + GRANT_MS).toISOString() } : {}),
     });
     const codeExpiresAt = row!.purpose === "machine" ? Math.min(Date.now() + CODE_MS, row!.expiresAt) : Date.now() + CODE_MS;
-    await ctx.db.patch(row!._id, { status: "approved", connectionId, codeHash: args.codeHash, codeExpiresAt, expiresAt: row!.purpose === "machine" ? row!.expiresAt : codeExpiresAt, ...(args.approverConnectionId ? { approverConnectionId: args.approverConnectionId } : {}) });
+    await ctx.db.patch(row!._id, { status: "approved", connectionId, codeHash: args.codeHash, codeExpiresAt, // Kept until the note itself expires, so clean-up never makes an approved note usable again.
+      expiresAt: row!.purpose === "machine" ? row!.expiresAt : Math.max(row!.expiresAt, codeExpiresAt), ...(args.approverConnectionId ? { approverConnectionId: args.approverConnectionId } : {}) });
     return { denied: false, redirectUri: row!.redirectUri, state: row!.state };
   },
 });
@@ -398,5 +445,74 @@ export const refresh = internalMutation({
     await ctx.db.patch(row._id, { usedAt: Date.now() });
     await ctx.db.patch(connection._id, { lastUsedAt: new Date().toISOString() });
     return issueOAuth(ctx, connection, args.accessHash, args.refreshHash, row.scopes);
+  },
+});
+
+/**
+ * One-tap approval (Planban 2.0): a signed-in person allows or denies a
+ * waiting agent's request from any device. Nothing existed before this
+ * decision; it is recorded once per device code, and an approval counts
+ * against the person's own hourly limit.
+ */
+export const decideDevice = internalMutation({
+  args: {
+    connectionId: v.id("connections"), deviceHash: hash, allow: v.boolean(),
+    clientId: v.string(), clientName: v.string(), resource: v.string(), scopes: v.array(v.string()), level: agentLevel,
+    purpose: v.union(v.literal("oauth"), v.literal("machine")), expiresAt: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const approver = await liveConnection(ctx, args.connectionId);
+    if (!approver.canAdminister) fail("forbidden", "Approve sign-ins from your own sign-in.");
+    if (!/^[a-f0-9]{64}$/.test(args.deviceHash) || args.expiresAt <= Date.now() || args.expiresAt > Date.now() + REQUEST_MS) fail("unauthorized", "This request has ended. Ask for a new code.");
+    if (args.purpose !== "machine" || args.clientId !== MACHINE_CLIENT_ID || args.scopes.length !== 1 || args.scopes[0] !== "planban:machine" || args.level !== "complete") fail("validation", "Invalid sign-in request.");
+    if (await ctx.db.query("oauthRequests").withIndex("by_deviceHash", (q) => q.eq("deviceHash", args.deviceHash)).first()) fail("unauthorized", "This request was already answered.");
+    const base = {
+      requestHash: args.deviceHash, deviceHash: args.deviceHash, clientId: args.clientId, clientName: args.clientName, redirectUri: "", resource: args.resource,
+      scopes: args.scopes, level: args.level, challenge: "", state: "", purpose: args.purpose, userId: approver.userId, approverConnectionId: approver._id, expiresAt: args.expiresAt,
+    };
+    if (!args.allow) {
+      await ctx.db.insert("oauthRequests", { ...base, status: "denied" });
+      await scheduleCleanup(ctx, Math.max(0, args.expiresAt - Date.now()) + CODE_MS);
+      return { allowed: false };
+    }
+    await refuseDeletedAccount(ctx, approver.userId);
+    await chargeApproval(ctx, approver.userId);
+    const now = new Date().toISOString();
+    // Like any approval: a pending connection with no credential until the agent collects it.
+    const connectionId = await ctx.db.insert("connections", {
+      userId: approver.userId, kind: args.purpose, name: args.clientName, clientName: args.clientName, boards: "all", level: "complete",
+      canAdminister: true, createdAt: now, lastUsedAt: now, oauthClientId: args.clientId, oauthResource: args.resource, authorizationVersion: 2, oauthPending: true,
+    });
+    await ctx.db.insert("oauthRequests", { ...base, status: "approved", connectionId, codeExpiresAt: args.expiresAt });
+    await scheduleCleanup(ctx, Math.max(0, args.expiresAt - Date.now()) + CODE_MS);
+    return { allowed: true };
+  },
+});
+
+/** Whether a waiting agent's request has been answered yet. A read only. */
+export const deviceAnswered = internalQuery({
+  args: { deviceHash: hash },
+  handler: async (ctx, { deviceHash }) => !!await ctx.db.query("oauthRequests").withIndex("by_deviceHash", (q) => q.eq("deviceHash", deviceHash)).first(),
+});
+
+/**
+ * The waiting agent collects its sign-in with its device code. Until someone
+ * answers, nothing is read but the index and nothing is written.
+ */
+export const redeemDevice = internalMutation({
+  args: { deviceHash: hash, clientId: v.string(), resource: v.string(), accessHash: hash },
+  handler: async (ctx, args) => {
+    const row = await ctx.db.query("oauthRequests").withIndex("by_deviceHash", (q) => q.eq("deviceHash", args.deviceHash)).first();
+    if (!row) return { error: "authorization_pending" as const };
+    if (row.clientId !== args.clientId || row.resource !== args.resource) return { error: "invalid_grant" as const };
+    if (row.status === "denied") return { error: "access_denied" as const };
+    if (row.status !== "approved" || !row.connectionId || (row.codeExpiresAt ?? 0) <= Date.now()) return { error: "expired_token" as const };
+    const connection = await ctx.db.get(row.connectionId);
+    if (!connection || connection.revokedAt || !connection.oauthPending) return { error: "invalid_grant" as const };
+    if (!row.approverConnectionId || !connectionIsUsable(await ctx.db.get(row.approverConnectionId))) return { error: "invalid_grant" as const };
+    await ctx.db.patch(row._id, { status: "consumed" });
+    await ctx.db.patch(connection._id, { oauthPending: false, tokenHash: args.accessHash });
+    await ctx.scheduler.runAfter(0, internal.people.refresh, { userId: connection.userId });
+    return { machine: true as const, userId: connection.userId, scope: "planban:machine", expiresIn: REFRESH_IDLE_MS / 1000, refresh: false };
   },
 });

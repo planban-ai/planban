@@ -146,12 +146,48 @@ send-only key for the sending domain, and `PLANBAN_INVITE_FROM`, for example
 `Planban <invites@planban.ai>`. Without both, invitations work only as links
 the owner shares, and the invite form says so.
 
+## The web page at the public address
+
+The same Worker serves the web page (Planban 2.0) as Workers static assets
+from `dist/web`. Only the service's addresses run the Worker (`/api/`,
+`/oauth/`, `/mcp`, `/.well-known/`, `/web/`, and the favicon and brand
+files); every other address serves the page, falling back to its main page so
+it can route `/boards/...`, `/invite/...`, `/sign-in` and `/approve` itself.
+Page files don't count towards the Worker's daily requests. `WORKER_FIRST` in
+`edge/worker.ts` and `assets.run_worker_first` in `edge/wrangler.jsonc` must
+match; a test checks.
+
+The page's security headers come from `dist/web/_headers`, written for each
+deployment from its Clerk frontend address and Convex client address, so the
+Content Security Policy allows exactly Clerk's sign-in and Convex's live
+updates. The page also needs `PLANBAN_SIGNIN_NOTE_KEY` (at least 32 random
+characters) on the backend, or sign-in reports itself unavailable.
+
+### Deploying the web page
+
+Deploys to production need the owner's OK. In order, from a clean checkout of
+the commit being released:
+
+1. Build the page: `~/mac-mini-setup/dev24 npm run build`.
+2. Write its headers for the target deployment:
+   `~/mac-mini-setup/dev24 node --import tsx/esm online/edge/write-headers.ts --clerk <Clerk frontend API origin> --convex <https://<deployment>.convex.cloud>`.
+3. Deploy the backend first if its code changed (`convex deploy`), then the
+   Worker from `online/edge` with `wrangler deploy --var UPSTREAM:<https://<deployment>.convex.site>`.
+4. Read back: the Worker's bindings include `ASSETS`; `/` and
+   `/boards/<any>` answer 200 with the page and the exact
+   Content-Security-Policy; `/api/nothing` answers 404 JSON; `/web/config`
+   names the deployment's Clerk instance.
+
+Rollback: deploy the previous Worker (or this one without the `assets`
+block). The service's routes are unchanged either way, and every browser
+session can be ended at once by revoking web connections.
+
 ## claude.ai self-registration
 
 `POST /oauth/register` accepts RFC 7591 registrations only for Claude's own
 connector callbacks, as public clients using the authorization-code flow
 with PKCE. An unused registration expires after a day. The first person to
-approve one owns it; it appears on their connections page as Claude
+approve one owns it; it appears in their Connections (on the web page's account menu, or the board's menu on a computer) as Claude
 (claude.ai), and revoking it there ends the registration and every grant
 made through it. Other clients still register by published metadata
 documents from the reviewed list.

@@ -6,7 +6,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createCard, createGroup as createGroupCore, historyPayload, initializeProject, loadState, readDoc, writeDoc } from "../src/core/storage";
+import { createCard, createGroup as createGroupCore, editGoals, historyPayload, initializeProject, loadState, readDoc, writeDoc } from "../src/core/storage";
+import { GOALS_GUIDANCE } from "../src/core/goals";
 import { PLANBAN_MCP_VERSION } from "../src/core/version";
 
 const MCP_SERVER = join(process.cwd(), "plugins/planban/scripts/start-planban-mcp.mjs");
@@ -162,6 +163,11 @@ test("Planban MCP server registers focused tools", () => {
       "planban_get_board",
       "planban_query_cards",
       "planban_get_card",
+      "planban_unresolved_changes",
+      "planban_drop_change",
+      "planban_history",
+      "planban_read_goals",
+      "planban_suggest_goal_change",
       "planban_create_card",
       "planban_create_group",
       "planban_create_cards",
@@ -169,6 +175,7 @@ test("Planban MCP server registers focused tools", () => {
       "planban_move_card",
       "planban_update_card",
       "planban_write_doc",
+      "planban_write_doc_section",
       "planban_move_files_out",
       "planban_launch_board",
     ],
@@ -339,11 +346,29 @@ test("Planban MCP read tools inspect boards, cards, and docs", async () => {
     assert.equal(responses[1].result.structuredContent.initialized, true);
     assertUnverifiedBoardHandoff(responses[1].result, /^Planban is initialized for /u);
     assert.equal(Array.isArray(responses[4].result.structuredContent.roadmapItems), true, "get_board remains the deliberate full read");
+    // The fields every surface shares (the remote get_board has the same).
+    assert.equal(typeof responses[4].result.structuredContent.boardId, "string");
+    assert.equal(typeof responses[4].result.structuredContent.title, "string");
+    assert.equal(typeof responses[4].result.structuredContent.revision, "number");
     assert.equal(responses[4].result.structuredContent.roadmapItems[0].id, cardId);
     assertUnverifiedBoardHandoff(responses[4].result, /^Loaded Planban board mcp-test at revision \d+\.$/u);
     assert.equal("boardUrl" in responses[2].result.structuredContent, false, "get_card stays a focused read");
     assert.equal(responses[2].result.structuredContent.card.title, "Alpha Card");
     assert.match(responses[3].result.structuredContent.markdown, /Alpha Card Spec/);
+  });
+});
+
+test("Planban MCP Goals page carries its guidance in the structured part, which is all some agents see", async () => {
+  await withPlanbanProject(async ({ cwd, planbanHome }) => {
+    await editGoals({ cwd, edit: { kind: "add", statement: "Win clubs", notes: "" }, baseRevision: (await loadState(cwd)).roadmap.revision });
+    const responses = runMcpServer([
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "planban_read_goals", arguments: { cwd } } },
+    ], { PLANBAN_HOME: planbanHome });
+    const result = responses[1].result;
+    assert.equal(result.structuredContent.goals[0].statement, "Win clubs");
+    assert.equal(result.structuredContent.text, result.content[0].text);
+    assert.ok(result.structuredContent.text.includes(GOALS_GUIDANCE));
   });
 });
 
@@ -598,6 +623,22 @@ test("Planban MCP write doc uses stale protection and records agent history", as
   });
 });
 
+test("Planban MCP says rewrite, don't append, when a Spec or Plan passes 100 KB", async () => {
+  await withPlanbanProject(async ({ cwd, planbanHome, cardId }) => {
+    const before = await readDoc({ cwd, cardId, kind: "plan" });
+    const markdown = `# Plan\n\n${"Another appended update.\n".repeat(5000)}`;
+    const responses = runMcpServer([
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "planban_write_doc", arguments: { cwd, cardId, kind: "plan", markdown, expectedMtimeMs: before.mtimeMs } } },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "planban_read_doc", arguments: { cwd, cardId, kind: "plan" } } },
+      { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "planban_read_doc", arguments: { cwd, cardId, kind: "spec" } } },
+    ], { PLANBAN_HOME: planbanHome });
+    assert.match(responses[1].result.content[0].text, /^Wrote plan document for alpha-card\.\nPlan is 122 KB; rewrite it to the current state, don't append\./u);
+    assert.match(responses[2].result.content[0].text, /^Read plan document for alpha-card\.\nPlan is 122 KB; rewrite it to the current state, don't append\.$/u);
+    assert.equal(responses[3].result.content[0].text, "Read spec document for alpha-card.");
+  });
+});
+
 test("Planban MCP move card guards completion", async () => {
   await withPlanbanProject(async ({ cwd, planbanHome, cardId }) => {
     const responses = runMcpServer([
@@ -622,8 +663,10 @@ test("Planban MCP move card guards completion", async () => {
       },
     ], { PLANBAN_HOME: planbanHome });
 
-    assert.equal(responses[1].error.code, -32602);
-    assert.match(responses[1].error.message, /completionConfirmed/);
+    // A refusal is a tool result that keeps its kind, not a protocol error.
+    assert.equal(responses[1].result.isError, true);
+    assert.equal(responses[1].result.structuredContent.error.category, "validation");
+    assert.match(responses[1].result.content[0].text, /completionConfirmed/);
     assert.equal(responses[2].result.structuredContent.card.status, "complete");
   });
 });

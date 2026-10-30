@@ -9,6 +9,7 @@ import { connectionOrigin, publicOrigin } from "./model/auth";
 import { MAX_REGISTRATIONS_PER_PERSON, REGISTERED_CLIENT_NAME, registeredClientId } from "./model/oauthClient";
 import { fail } from "./model/errors";
 import { chargeAdmin } from "./model/limits";
+import { endWebSession } from "./webSessions";
 
 /** Bounds from the security review: active keys per person, and how many connections a listing reads. */
 export const MAX_ACTIVE_KEYS = 50;
@@ -20,6 +21,7 @@ async function notRevoked(ctx: QueryCtx, userId: string) {
   return ctx.db.query("connections").withIndex("by_user_revoked", (q) => q.eq("userId", userId).eq("revokedAt", undefined)).collect();
 }
 import { agentLevel } from "./schema";
+import { refuseDeletedAccount } from "./model/erasureGate";
 
 /** A connection is marked used at most this often, to avoid a write per request. */
 const TOUCH_INTERVAL_MS = 60 * 60 * 1000;
@@ -28,6 +30,8 @@ export const resolveToken = internalQuery({
   args: { tokenHash: v.string() },
   handler: async (ctx, { tokenHash }) => {
     const connection = await ctx.db.query("connections").withIndex("by_tokenHash", (q) => q.eq("tokenHash", tokenHash)).unique();
+    // A browser session's cookie is never a bearer credential.
+    if (connection?.kind === "web") return null;
     const resolved = connection ? await resolvedConnection(ctx, connection._id) : null;
     if (!connection || !resolved) return null;
     return {
@@ -59,6 +63,7 @@ export const createDevConnection = internalMutation({
     level: agentLevel,
   },
   handler: async (ctx, args) => {
+    await refuseDeletedAccount(ctx, args.userId);
     const now = new Date().toISOString();
     const id = await ctx.db.insert("connections", {
       userId: args.userId,
@@ -139,7 +144,10 @@ export const revokeAllOthers = internalMutation({
     const keep = new Set<string>([connection._id, ...(connection.oauthConnectionId ? [connection.oauthConnectionId] : [])]);
     const others = (await ctx.db.query("connections").withIndex("by_user_revoked", (q) => q.eq("userId", connection.userId).eq("revokedAt", undefined)).take(REVOKE_BATCH + keep.size + 1))
       .filter((row) => !keep.has(row._id));
-    for (const row of others.slice(0, REVOKE_BATCH)) await ctx.db.patch(row._id, { revokedAt: now });
+    for (const row of others.slice(0, REVOKE_BATCH)) {
+      if (row.kind === "web") await endWebSession(ctx, row);
+      else await ctx.db.patch(row._id, { revokedAt: now });
+    }
     let registrations = 0;
     for (const registration of await ctx.db.query("oauthRegistrations").withIndex("by_user", (q) => q.eq("userId", connection.userId)).take(REVOKE_BATCH)) {
       await ctx.db.delete(registration._id);
@@ -167,7 +175,9 @@ export const revoke = internalMutation({
     const allowed = target && !target.oauthConnectionId && (target._id === connection._id || (connection.canAdminister && target.userId === connection.userId));
     if (!allowed) fail("not_found", "Connection not found.");
     const now = new Date().toISOString();
-    if (!target!.revokedAt) await ctx.db.patch(target!._id, { revokedAt: now });
+    // A browser session also ends at Clerk, and its Clerk session can't enroll again.
+    if (target!.kind === "web") await endWebSession(ctx, target!);
+    else if (!target!.revokedAt) await ctx.db.patch(target!._id, { revokedAt: now });
     if (target!.oauthClientId && registeredClientId(target!.oauthClientId)) {
       // A claude.ai registration ends with its connection.
       const registration = await ctx.db.query("oauthRegistrations").withIndex("by_clientId", (q) => q.eq("clientId", target!.oauthClientId!)).unique();
@@ -219,6 +229,7 @@ export const createKey = internalMutation({
     if (held.filter((row) => row.kind === "key" && connectionIsUsable(row)).length >= MAX_ACTIVE_KEYS) {
       fail("rate_limited", `You have ${MAX_ACTIVE_KEYS} active personal access keys. Revoke one before creating another.`);
     }
+    await refuseDeletedAccount(ctx, connection.userId);
     await chargeAdmin(ctx, connection.userId, "keys");
     const now = new Date().toISOString();
     const id = await ctx.db.insert("connections", {

@@ -12,7 +12,8 @@ import { historyIndexPath } from "../paths";
 import { atomicWriteFile } from "../persistence";
 import { readBoardIdentity } from "../boardIdentity";
 import { onlineRequest } from "./client";
-import { readCredentials } from "./credentials";
+import { readCredentials, type OnlineCredentials } from "./credentials";
+import { boardAccount, recordBoardAccount } from "./boardLinks";
 import { planbanCommand } from "../command";
 
 export const STALE_MARKER = "STALE-COPY.json";
@@ -96,9 +97,16 @@ export async function readStaleMarker(planningRoot: string): Promise<StaleCopy |
   return readJsonFile<StaleCopy>(join(planningRoot, STALE_MARKER));
 }
 
-/** Online services this machine has signed in to; none means no network calls. */
-async function signedInServices(): Promise<string[]> {
-  return Object.keys((await readCredentials()).services);
+/** Every account signed in here, on each service; none means no network calls. */
+async function signedInServices(): Promise<Array<{ url: string; credentials: OnlineCredentials }>> {
+  return Object.entries((await readCredentials()).accounts).flatMap(([url, entry]) => Object.values(entry.accounts).map((credentials) => ({ url, credentials })));
+}
+
+/** Whether a board can be opened from here: its linked account is signed in, or (unlinked) any account on its service. */
+async function signedInFor(url: string, boardId: string) {
+  const link = await boardAccount(url, boardId).catch(() => null);
+  const entry = (await readCredentials()).accounts[url];
+  return link ? !!entry?.accounts[link.person] : !!entry;
 }
 
 interface HistoryIndexEntry {
@@ -127,16 +135,22 @@ async function ask(planningRoot: string): Promise<{ stale: StaleCopy | null; unr
   const fingerprints = [...chosen.values()].map(({ version, createdAt, operation }) => ({ version, createdAt, operation }));
   const uid = await readBoardIdentity(planningRoot);
   let unreachable = false;
-  for (const url of services) {
+  // Asked as each account signed in here: a copy of any of their boards is found.
+  for (const { url, credentials } of services) {
     let matches: Array<{ boardId: string; title: string; onlineSince: string; matchedVersions: number[] }>;
     try {
-      ({ matches } = await onlineRequest<{ matches: typeof matches }>(url, "/api/v1/copy-check", { fingerprints, ...(uid ? { uid } : {}) }, { signal: AbortSignal.timeout(CHECK_TIMEOUT_MS) }));
+      ({ matches } = await onlineRequest<{ matches: typeof matches }>(url, "/api/v1/copy-check", { fingerprints, ...(uid ? { uid } : {}) }, { signal: AbortSignal.timeout(CHECK_TIMEOUT_MS), credentials }));
     } catch {
       unreachable = true;
       continue;
     }
     const match = matches.find((candidate) => !ignored.has(`${url} ${candidate.boardId}`));
     if (!match) continue;
+    // The account that can see the online board is the one this board uses from now on.
+    // A damaged list of links is left for the board to report, never overwritten here.
+    if (credentials.person && !(await boardAccount(url, match.boardId).catch(() => true))) {
+      await recordBoardAccount(url, match.boardId, { person: credentials.person, ...(credentials.email ? { email: credentials.email } : {}) }).catch(() => undefined);
+    }
     const shared = match.matchedVersions.length ? Math.max(...match.matchedVersions) : 0;
     return {
       unreachable,
@@ -218,7 +232,7 @@ async function staleFromNote(planningRoot: string, cwd: string, repoId: string):
     url: note.url, boardId: note.boardId, title: note.title, onlineSince: note.onlineSince, detectedAt: new Date().toISOString(),
     // Without asking the service, changes made here after the board went online are the ones it cannot have.
     unsyncedChanges: history.filter((entry) => entry.createdAt > note.onlineSince).reverse().map(({ version, createdAt, summary }) => ({ version, createdAt, summary })),
-    signInNeeded: !(await signedInServices()).includes(note.url),
+    signInNeeded: !(await signedInFor(note.url, note.boardId)),
   };
   await atomicWriteFile(join(planningRoot, STALE_MARKER), JSON.stringify(stale, null, 2) + "\n");
   return stale;
@@ -228,7 +242,7 @@ async function staleFromNote(planningRoot: string, cwd: string, repoId: string):
 export async function knownStaleCopy(planningRoot: string, cwd: string, repoId: string): Promise<StaleCopy | null> {
   const marker = await readStaleMarker(planningRoot);
   const stale = marker ?? await staleFromNote(planningRoot, cwd, repoId);
-  return stale ? { ...stale, signInNeeded: !(await signedInServices()).includes(stale.url) } : null;
+  return stale ? { ...stale, signInNeeded: !(await signedInFor(stale.url, stale.boardId)) } : null;
 }
 
 /**
@@ -240,7 +254,7 @@ export async function knownStaleCopy(planningRoot: string, cwd: string, repoId: 
 export async function assertNotStaleCopy(planningRoot: string, cwd: string, repoId: string): Promise<void> {
   const marker = await readStaleMarker(planningRoot);
   if (marker) {
-    const signInNeeded = !(await signedInServices()).includes(marker.url);
+    const signInNeeded = !(await signedInFor(marker.url, marker.boardId));
     throw new PlanbanStaleCopyError({ ...marker, signInNeeded }, cwd, repoId);
   }
   const noted = await staleFromNote(planningRoot, cwd, repoId);

@@ -49,6 +49,12 @@ export interface PlanbanRoadmapItem {
   planDoc: string | null;
   completedAt: string | null;
   updatedAt: string | null;
+  /**
+   * When the card last noted progress: its summary or next action changed, or it was completed.
+   * A merged PR it names is flagged until then; touches and metadata edits leave it alone.
+   * Absent on cards written before Planban 2.0, where updatedAt stands in.
+   */
+  progressNotedAt?: string | null | undefined;
   isGroup: boolean;
   parentId: string | null;
   boardRank: number | null;
@@ -73,6 +79,11 @@ export interface PlanbanResolvedState {
    * the roadmap as it was right after the edit is no longer available.
    */
   onlineReplay?: { replayed: true; originalRevision?: number } | undefined;
+  /**
+   * Online Boards only: the board uses features this Planban can't show
+   * (16 October 2026). The notice is for people and agents alike.
+   */
+  planbanBehind?: { notice: string; features: string[] } | undefined;
   cwd: string;
   manifestPath: string;
   agentContextPath: string;
@@ -89,6 +100,9 @@ export interface PlanbanDocPayload {
   exists: boolean;
   markdown: string;
   mtimeMs: number | null;
+  /** An online write retried with the same idempotency key: applied once, earlier. */
+  replayed?: true | undefined;
+  originalRevision?: number | undefined;
 }
 
 export type PlanbanHistoryActor = "user" | "agent" | "import" | "system";

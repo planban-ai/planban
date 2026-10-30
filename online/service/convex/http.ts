@@ -11,10 +11,15 @@ import type { ServiceErrorData } from "./model/errors";
 import { liveTokensConfigured, publicJwks, signLiveToken } from "./model/liveToken";
 import { handleMcp, McpService } from "./model/mcp";
 import { INDEX_NOT_STORAGE } from "../../../src/core/contentRules";
+import { packJson, unpacked } from "./model/codec";
 import { requestedMemberRole } from "../../../src/core/memberRoles";
+import { PLANBAN_VERSION_HEADER, refusedForVersion, UPDATE_REQUIRED_CODE, UPDATE_REQUIRED_STATUS } from "../../../src/core/clientVersion";
 import { tokenResponse, revocationResponse } from "./model/oauthHttp";
-import { authorizationResponse, registrationResponse, consentResponse, approvalResponse, machineStartResponse, machineLaunchResponse, machineCancelResponse, consentValidityResponse, enrollmentConfigured, CLI_REDIRECT_PORTS, PLANBAN_SCOPES } from "./model/oauthConsent";
+import { webConfigResponse, authorizationResponse, registrationResponse, consentResponse, approvalResponse, machineStartResponse, machineLaunchResponse, machineCancelResponse, consentValidityResponse, enrollmentConfigured, CLI_REDIRECT_PORTS, PLANBAN_SCOPES } from "./model/oauthConsent";
 import { MACHINE_CLIENT_ID } from "./oauth";
+import { authenticateApiRequest, webSessionResponse, webSignOutResponse } from "./model/webAuth";
+import { deviceAuthorizationResponse, deviceDecision, devicePreview } from "./model/deviceFlow";
+import { clerkWebhookResponse } from "./model/signInEmail";
 
 const STATUS_FOR: Record<ServiceErrorData["code"], number> = {
   rate_limited: 429,
@@ -56,11 +61,24 @@ const unauthorized = () => json(
   { "WWW-Authenticate": 'Bearer realm="planban"' },
 );
 
+/**
+ * A computer's Planban too old for this request (owner decision, 16 October 2026): a
+ * plain message pointing at Update, never a raw error. The web page is served with the
+ * service, so it is always current.
+ */
+function tooOldFor(request: Request, op?: string): Response | null {
+  if (request.headers.get("X-Planban-Client") === "web") return null;
+  const refused = refusedForVersion(request.headers.get(PLANBAN_VERSION_HEADER), op);
+  return refused ? json({ error: { code: UPDATE_REQUIRED_CODE, message: refused } }, UPDATE_REQUIRED_STATUS) : null;
+}
+
 export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenticated): Promise<Response> {
   const url = new URL(request.url);
   const parts = url.pathname.replace(/^\/api\/v1\/?/, "").split("/").filter(Boolean).map(decodeURIComponent);
   const method = request.method;
   const { connectionId } = auth;
+  const outdated = tooOldFor(request, parts[0] === "boards" && parts[2] === "ops" ? parts[3] : undefined);
+  if (outdated) return outdated;
 
   if (parts[0] === "me" && parts.length === 1 && method === "GET") return json(await ctx.runQuery(internal.boards.me, { connectionId }));
   if (parts[0] === "live-token" && parts.length === 1 && method === "POST") {
@@ -71,24 +89,32 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
   if (parts[0] === "transfers" && method === "POST") {
     // Take Online in parts: begin (with the roadmap), parts, commit; or abort.
     const input = await body(request);
+    // The board's content travels to the mutation as packed bytes: a card's fields can be
+    // shaped in ways Convex values don't allow (over 1,024 metadata keys in Revival's history).
     if (parts.length === 1) {
       return json(await ctx.runMutation(internal.transfers.begin, {
-        connectionId, transferId: String(input.transferId ?? ""), roadmap: input.roadmap,
-        ...(typeof input.uid === "string" ? { uid: input.uid } : {}),
-        ...(input.retention === undefined ? {} : { retention: input.retention }),
-        ...(Array.isArray(input.retiredIds) ? { retiredIds: input.retiredIds.map(String) } : {}),
+        connectionId, transferId: String(input.transferId ?? ""),
+        payload: packJson({
+          roadmap: input.roadmap,
+          ...(typeof input.uid === "string" ? { uid: input.uid } : {}),
+          ...(input.retention === undefined ? {} : { retention: input.retention }),
+          ...(Array.isArray(input.retiredIds) ? { retiredIds: input.retiredIds.map(String) } : {}),
+          ...(input.goals === undefined ? {} : { goals: input.goals }),
+        }),
       }));
     }
     const transferId = parts[1]!;
     if (parts[2] === "parts" && parts.length === 3) {
       return json(await ctx.runMutation(internal.transfers.part, {
         connectionId, transferId, seq: Number(input.seq),
-        ...(input.docs === undefined ? {} : { docs: input.docs }),
-        ...(input.history === undefined ? {} : { history: input.history }),
-        ...(input.historyDocs === undefined ? {} : { historyDocs: input.historyDocs }),
+        payload: packJson({
+          ...(input.docs === undefined ? {} : { docs: input.docs }),
+          ...(input.history === undefined ? {} : { history: input.history }),
+          ...(input.historyDocs === undefined ? {} : { historyDocs: input.historyDocs }),
+        }),
       }));
     }
-    if (parts[2] === "commit" && parts.length === 3) return json(await ctx.runMutation(internal.transfers.commit, { connectionId, transferId, partCount: Number(input.partCount) }));
+    if (parts[2] === "commit" && parts.length === 3) return json(unpacked(await ctx.runMutation(internal.transfers.commit, { connectionId, transferId, partCount: Number(input.partCount) })));
     if (parts[2] === "abort" && parts.length === 3) return json(await ctx.runMutation(internal.transfers.abort, { connectionId, transferId }));
   }
   if (parts[0] === "copy-check" && parts.length === 1 && method === "POST") {
@@ -129,6 +155,29 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
     // The key is shown once; only its hash is stored.
     return json({ ...created, key: token }, 201);
   }
+  if (parts[0] === "device" && parts.length === 2 && method === "POST" && (parts[1] === "preview" || parts[1] === "decide")) {
+    // One-tap approval of a waiting agent, from the person's own sign-in on any device.
+    const me = await ctx.runQuery(internal.boards.me, { connectionId });
+    if (!me.canAdminister) return json({ error: { code: "forbidden", message: "Approve sign-ins from your own sign-in." } }, 403);
+    const input = await body(request);
+    const note = String(input.request ?? "");
+    if (parts[1] === "preview") return json(await devicePreview(ctx, note));
+    if (input.decision !== "allow" && input.decision !== "deny") return json({ error: { code: "validation", message: "decision must be allow or deny." } }, 400);
+    return json(await deviceDecision(ctx, connectionId, note, input.decision === "allow"));
+  }
+  if (parts[0] === "invites" && parts.length === 1 && method === "GET") {
+    // Email invitations waiting for this person's verified addresses (the dashboard's banner).
+    const verifiedEmails = await verifiedEmailsOf((await ctx.runQuery(internal.boards.me, { connectionId })).userId);
+    return json(await ctx.runQuery(internal.invites.waitingFor, { connectionId, verifiedEmails }));
+  }
+  if (parts[0] === "invites" && parts.length === 3 && parts[2] === "accept" && method === "POST") {
+    const verifiedEmails = await verifiedEmailsOf((await ctx.runQuery(internal.boards.me, { connectionId })).userId);
+    return json(await ctx.runMutation(internal.invites.acceptById, { connectionId, inviteId: parts[1]!, verifiedEmails }));
+  }
+  if (parts[0] === "invites" && parts[1] === "membership" && parts.length === 2 && method === "POST") {
+    const input = await body(request);
+    return json(await ctx.runQuery(internal.invites.membership, { connectionId, tokenHash: await sha256Hex(inviteToken(String(input.token ?? ""))) }));
+  }
   if (parts[0] === "invites" && parts[1] === "accept" && parts.length === 2 && method === "POST") {
     const input = await body(request);
     const tokenHash = await sha256Hex(inviteToken(String(input.token ?? "")));
@@ -138,32 +187,41 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
   }
   if (parts[0] !== "boards") return json({ error: { code: "not_found", message: "Unknown endpoint." } }, 404);
   if (parts.length === 1 && method === "GET") return json({ boards: await ctx.runQuery(internal.boards.listBoards, { connectionId }) });
+  if (parts.length === 1 && method === "POST") {
+    const input = await body(request);
+    return json(await ctx.runMutation(internal.transfers.createBoard, { connectionId, title: String(input.title ?? "") }), 201);
+  }
   if (parts[1] === "import" && parts.length === 2 && method === "POST") {
-    return json(await ctx.runMutation(internal.transfers.importBundle, { connectionId, transferId: crypto.randomUUID(), bundle: await body(request) }), 201);
+    return json(unpacked(await ctx.runMutation(internal.transfers.importBundle, { connectionId, transferId: crypto.randomUUID(), payload: packJson(await body(request)) })), 201);
   }
 
   const boardId = parts[1]!;
   const rest = parts.slice(2);
   if (rest.length === 0 && method === "GET") {
     const since = url.searchParams.get("since");
-    return json(await ctx.runQuery(internal.boards.getBoard, { connectionId, boardId, ...(since === null ? {} : { since: Number(since) }) }));
+    return json(unpacked(await ctx.runQuery(internal.boards.getBoard, { connectionId, boardId, ...(since === null ? {} : { since: Number(since) }) })));
   }
-  if (rest[0] === "export" && rest.length === 1 && method === "GET") return json(await ctx.runQuery(internal.boards.exportBoard, { connectionId, boardId }));
+  if (rest[0] === "export" && rest.length === 1 && method === "GET") return json(unpacked(await ctx.runQuery(internal.boards.exportBoard, { connectionId, boardId })));
   const transfer = url.searchParams.get("transferId");
   const bound = transfer === null ? {} : { transferId: transfer };
-  if (rest[0] === "export" && rest[1] === "meta" && method === "GET") return json(await ctx.runQuery(internal.boards.exportMeta, { connectionId, boardId, ...bound }));
+  if (rest[0] === "export" && rest[1] === "meta" && method === "GET") return json(unpacked(await ctx.runQuery(internal.boards.exportMeta, { connectionId, boardId, ...bound })));
   if (rest[0] === "export" && rest[1] === "docs" && method === "GET") {
     const atRevision = url.searchParams.get("revision");
-    return json(await ctx.runQuery(internal.boards.exportDocs, {
+    return json(unpacked(await ctx.runQuery(internal.boards.exportDocs, {
       connectionId, boardId, offset: Number(url.searchParams.get("offset") ?? 0), limit: Number(url.searchParams.get("limit") ?? 100), ...bound,
       ...(atRevision === null ? {} : { revision: Number(atRevision) }),
-    }));
+    })));
   }
   if (rest[0] === "export" && rest[1] === "history" && method === "GET") {
-    return json(await ctx.runQuery(internal.boards.exportHistory, { connectionId, boardId, after: Number(url.searchParams.get("after") ?? 0), limit: Number(url.searchParams.get("limit") ?? 8), ...bound }));
+    const docsOf = url.searchParams.get("docsOf");
+    const docsCursor = url.searchParams.get("docsCursor");
+    return json(unpacked(await ctx.runQuery(internal.boards.exportHistory, {
+      connectionId, boardId, after: Number(url.searchParams.get("after") ?? 0), limit: Number(url.searchParams.get("limit") ?? 8), ...bound,
+      ...(docsOf === null ? {} : { docsOf: Number(docsOf) }), ...(docsCursor === null ? {} : { docsCursor }),
+    })));
   }
   if (rest[0] === "history" && rest.length === 2 && method === "GET") {
-    return json(await ctx.runQuery(internal.boards.historyVersion, { connectionId, boardId, version: Number(rest[1]) }));
+    return json(unpacked(await ctx.runQuery(internal.boards.historyVersion, { connectionId, boardId, version: Number(rest[1]) })));
   }
   if (rest[0] === "history" && rest.length === 6 && rest[2] === "cards" && rest[4] === "docs" && method === "GET") {
     const kind = rest[5] === "spec" || rest[5] === "plan" ? rest[5] : null;
@@ -201,7 +259,7 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
     if (rest[2] === "role" && !role) return json({ error: { code: "validation", message: "role must be viewer or editor." } }, 400);
     return json({ members: await ctx.runMutation(internal.members.update, { connectionId, boardId, userId: decodeURIComponent(rest[1]!), ...(rest[2] === "remove" ? { remove: true } : role ? { role } : {}) }) });
   }
-  if (rest[0] === "people" && rest.length === 1 && method === "GET") return json(await ctx.runQuery(internal.people.forBoard, { connectionId, boardId }));
+  if (rest[0] === "people" && rest.length === 1 && method === "GET") return json(unpacked(await ctx.runQuery(internal.people.forBoard, { connectionId, boardId })));
   if (rest[0] === "people" && rest[1] === "me" && rest[2] === "agents" && method === "POST") {
     const input = await body(request);
     const level = input.level === "read" || input.level === "plan" || input.level === "complete" ? input.level : null;
@@ -214,6 +272,10 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
     const role = requestedMemberRole(input.role, "editor");
     if (!role) return json({ error: { code: "validation", message: "role must be viewer or editor." } }, 400);
     return json({ members: await ctx.runMutation(internal.members.add, { connectionId, boardId, userId: String(input.userId ?? ""), role }) });
+  }
+  if (rest[0] === "delete-copy" && rest.length === 1 && method === "POST") {
+    const input = await body(request);
+    return json(await ctx.runMutation(internal.erasure.deleteBoardCopy, { connectionId, boardId, confirmTitle: String(input.confirmTitle ?? "") }));
   }
   if (rest[0] === "take-local" && rest[1] === "fence" && method === "POST") {
     const input = await body(request);
@@ -237,10 +299,29 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
       return json({ error: { code: "validation", message: "The request body must be JSON." } }, 400);
     }
     const idempotencyKey = request.headers.get("Idempotency-Key");
-    return json(await ctx.runMutation(internal.boards.run, {
-      connectionId, boardId, op: rest[1]!, input,
+    // Completing a card states that a person confirmed it, in the body as on MCP.
+    const completionConfirmed: boolean = typeof input === "object" && input !== null && (input as { completionConfirmed?: unknown }).completionConfirmed === true;
+    const ran = unpacked<{ refused?: ServiceErrorData } & Record<string, unknown>>(await ctx.runMutation(internal.boards.run, {
+      connectionId, boardId, op: rest[1]!, payload: packJson(input), ...(completionConfirmed ? { completionConfirmed } : {}),
       ...(idempotencyKey ? { idempotencyKey, requestHash: await sha256Hex(`${boardId}\n${rest[1]}\n${raw}`) } : {}),
     }));
+    // A refused agent edit, kept as an unresolved change: a conflict, like any other.
+    if ("refused" in ran && ran.refused) return json({ error: ran.refused }, 409);
+    return json(ran);
+  }
+  if (rest[0] === "presence" && rest.length === 1 && method === "POST") {
+    const input = await body(request);
+    return json(await ctx.runMutation(internal.boards.notePresence, { connectionId, boardId, cardId: String(input.cardId ?? ""), ...(typeof input.agentName === "string" ? { agentName: input.agentName } : {}) }));
+  }
+  if (rest[0] === "presence" && rest.length === 1 && method === "GET") {
+    const cardId = url.searchParams.get("card") ?? undefined;
+    const agentName = url.searchParams.get("agent") ?? undefined;
+    return json(await ctx.runQuery(internal.boards.working, { connectionId, boardId, ...(cardId ? { cardId } : {}), ...(agentName ? { agentName } : {}) }));
+  }
+  if (rest[0] === "goals" && rest.length === 1 && method === "GET") return json(unpacked(await ctx.runQuery(internal.boards.goals, { connectionId, boardId })));
+  if (rest[0] === "unresolved" && rest.length === 1 && method === "GET") {
+    const cardId = url.searchParams.get("card") ?? undefined;
+    return json(unpacked(await ctx.runQuery(internal.boards.unresolved, { connectionId, boardId, ...(cardId ? { cardId } : {}) })));
   }
   // Owner decision 18: Planban is an index, not storage. Online boards hold
   // text only; files stay where they live and cards refer to them.
@@ -253,15 +334,18 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
   return json({ error: { code: "not_found", message: "Unknown endpoint." } }, 404);
 }
 
-const api = httpAction(async (ctx, request) => {
+/** Every /api/v1 request: a bearer credential or the browser's session, then the route. */
+export async function apiResponse(ctx: ActionCtx, request: Request): Promise<Response> {
   try {
-    const auth = await authenticate(ctx, request);
+    const auth = await authenticateApiRequest(ctx, request);
     if (!auth) return unauthorized();
     return await handleApi(ctx, request, auth);
   } catch (error) {
     return errorResponse(error);
   }
-});
+}
+
+const api = httpAction(apiResponse);
 
 /** Development sign-in for local backends only: returns a bearer token for a named test person. */
 export const devTokenResponse: RouteHandler = async (ctx, request) => {
@@ -370,6 +454,18 @@ async function verifiedEmailsOf(userId: string): Promise<string[]> {
 
 const escapeHtml = (text: string) => text.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
 
+/**
+ * The web page's invitation preview. The token comes in the body, never the
+ * address, so it stays out of logs; nothing is shown for an invitation that
+ * can't be used beyond its state.
+ */
+export const invitePreviewResponse: RouteHandler = async (ctx, request) => {
+  const input = await body(request).catch(() => ({} as Record<string, unknown>));
+  const token = inviteToken(String(input.token ?? ""));
+  const preview = token ? await ctx.runQuery(internal.invites.previewState, { tokenHash: await sha256Hex(token) }) : { state: "unknown" as const };
+  return json(preview);
+};
+
 /** The page an invite link opens: what it is for, and how to join. */
 const invitePageResponse: RouteHandler = async (ctx, request) => {
   const token = inviteToken(new URL(request.url).pathname);
@@ -387,7 +483,7 @@ const invitePageResponse: RouteHandler = async (ctx, request) => {
   if (!invite) return page("This invite has expired", "<p>Invite links work for 7 days. Ask the board owner for a new one.</p>");
   const link = `${publicOrigin()}/invite/${token}`;
   return page(`Join ${invite.boardTitle} on Planban`,
-    `<p>You've been invited as ${invite.role === "editor" ? "an editor: you can change cards, specs and plans, and mark work complete" : "a viewer: you can read the board and its history"}.${invite.forEmail ? " This invite is for one email address; sign in with it." : ""}</p>`
+    `<p>${escapeHtml(invite.inviterName)} invited you as ${invite.role === "editor" ? "an editor: you can change cards, specs and plans, and mark work complete" : "a viewer: you can read the board and its history"}.${invite.forEmail ? " This invite is for one email address; sign in with it." : ""}</p>`
     + `<p>To join, run this in a terminal on your computer. Planban opens your browser to sign in with your own account:</p>`
     + `<pre style="background:#f4f4f5;padding:12px;border-radius:8px;white-space:pre-wrap;word-break:break-all">planban online join ${escapeHtml(link)}</pre>`
     + `<p style="color:#666">The link works until ${escapeHtml(new Date(invite.expiresAt).toUTCString())}.</p>`);
@@ -413,9 +509,11 @@ export const authorizationServerDiscovery = httpAction(async () => enrollmentCon
   planban_machine_start_endpoint: `${publicOrigin()}/oauth/machine/start`,
   planban_machine_cancel_endpoint: `${publicOrigin()}/oauth/machine/cancel`,
   token_endpoint: `${publicOrigin()}/oauth/token`, revocation_endpoint: `${publicOrigin()}/oauth/revoke`,
+  // One-tap approval for the Planban command line on machines without a browser callback.
+  device_authorization_endpoint: `${publicOrigin()}/oauth/device`,
   // Self-registration is for claude.ai only (owner decision 22).
   registration_endpoint: `${publicOrigin()}/oauth/register`,
-  response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"],
+  response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
   code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none"],
   revocation_endpoint_auth_methods_supported: ["none"], scopes_supported: [...PLANBAN_SCOPES, "planban:machine"],
   authorization_response_iss_parameter_supported: true, client_id_metadata_document_supported: true,
@@ -437,6 +535,12 @@ export function atServiceOnly(handler: RouteHandler): RouteHandler {
 
 for (const method of ["GET", "POST", "PUT"] as const) http.route({ pathPrefix: "/api/v1/", method, handler: api });
 http.route({ path: "/dev/token", method: "POST", handler: httpAction(atServiceOnly(devTokenResponse)) });
+// The web page's browser session: started from a Clerk sign-in, ended by signing out.
+http.route({ path: "/web/session", method: "POST", handler: httpAction(atServiceOnly((ctx, request) => webSessionResponse(ctx, request))) });
+http.route({ path: "/web/signout", method: "POST", handler: httpAction(atServiceOnly(webSignOutResponse)) });
+http.route({ path: "/web/config", method: "GET", handler: httpAction(atServiceOnly(async () => webConfigResponse())) });
+http.route({ path: "/web/invite", method: "POST", handler: httpAction(atServiceOnly(invitePreviewResponse)) });
+http.route({ path: "/oauth/device", method: "POST", handler: httpAction(atServiceOnly(deviceAuthorizationResponse)) });
 for (const method of ["GET", "POST", "DELETE"] as const) http.route({ path: "/mcp", method, handler: mcp });
 http.route({ path: "/api/v1/auth/machine", method: "POST", handler: machineSignIn });
 http.route({ path: "/oauth/token", method: "POST", handler: httpAction(atServiceOnly(tokenResponse)) });
@@ -449,6 +553,8 @@ http.route({ path: "/oauth/machine/launch", method: "GET", handler: httpAction(a
 http.route({ path: "/oauth/machine/cancel", method: "POST", handler: httpAction(atServiceOnly(machineCancelResponse)) });
 http.route({ path: "/oauth/validity", method: "POST", handler: httpAction(atServiceOnly(consentValidityResponse)) });
 http.route({ path: "/oauth/approve", method: "POST", handler: httpAction(atServiceOnly(approvalResponse)) });
+// Clerk's email.created webhook, straight to the service (signed through Svix): Planban's own sign-in emails.
+http.route({ path: "/clerk/webhook", method: "POST", handler: httpAction(async (_ctx, request) => clerkWebhookResponse(request)) });
 http.route({ path: "/.well-known/planban.json", method: "GET", handler: serviceDiscovery });
 http.route({ path: "/.well-known/oauth-authorization-server", method: "GET", handler: authorizationServerDiscovery });
 http.route({ pathPrefix: "/invite/", method: "GET", handler: httpAction(atServiceOnly(invitePageResponse)) });

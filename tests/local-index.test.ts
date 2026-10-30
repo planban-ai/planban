@@ -372,8 +372,10 @@ test("MCP tools teach the rule, flag cards holding files, refuse writes to them,
     assert.match(tools.find((tool) => tool.name === "planban_move_files_out")!.description, /never overwriting or deleting anything/u);
     assert.match(responses[2].result.content[0].text, new RegExp(`\\nThis card holds 2 files in its folder \\(evidence\\/run\\.log, shot\\.png\\); changes are refused until they are moved out with \`${CMD} move-files-out alpha --to <folder>\` or planban_move_files_out\\. Planban is an index, not file storage\\.`, "u"));
     assert.match(responses[3].result.content[0].text, /\n1 card holds files in its folder \(alpha\)\./u);
-    assert.match(responses[4].error.message, /holds 2 files in its folder.*planban_move_files_out/su);
-    assert.match(responses[5].error.message, /^Not saved: the Spec of card Beta contains (?:an embedded file|a picture stored in the text)/u);
+    assert.equal(responses[4].result.isError, true);
+    assert.match(responses[4].result.content[0].text, /holds 2 files in its folder.*planban_move_files_out/su);
+    assert.equal(responses[5].result.isError, true);
+    assert.match(responses[5].result.content[0].text, /^Not saved: the Spec of card Beta contains (?:an embedded file|a picture stored in the text)/u);
     assert.match(responses[6].result.content[0].text, /^Dry run: nothing changed\. 2 files would move from card alpha to /u);
     assert.match(responses[7].result.content[0].text, /^Moved 2 files from card alpha to .* and added a Files section to its Spec\./u);
     assert.ok(existsSync(join(destination, "evidence", "run.log")));

@@ -27,6 +27,18 @@ export class PlanbanConflictError extends Error {
   }
 }
 
+/**
+ * A write waited for the board while it moved (Take Online or Take Local),
+ * so it was not made where it was headed. Nothing was written. Writes that
+ * can go to the board's new home are sent there again (againIfMoved).
+ */
+export class PlanbanBoardMovedError extends PlanbanConflictError {
+  constructor() {
+    super("This board moved online while this change was waiting for it, so nothing was written to the copy on this computer. Make the change again: it will go to the online board.");
+    this.name = "PlanbanBoardMovedError";
+  }
+}
+
 export class PlanbanValidationError extends Error {
   constructor(message: string) {
     super(message);
@@ -81,9 +93,49 @@ export function assertBaseRevision(roadmap: PlanbanRoadmap, baseRevision?: numbe
   }
 }
 
+/** Cards an edit would newly put in complete (current versus candidate roadmap). */
+export function newlyCompleted(before: PlanbanRoadmap, after: PlanbanRoadmap) {
+  const previous = new Map(before.roadmapItems.map((item) => [item.id, item.status]));
+  return after.roadmapItems.filter((item) => item.status === "complete" && previous.get(item.id) !== "complete");
+}
+
+export const COMPLETION_CONFIRMATION_MESSAGE = "completionConfirmed must be true when this would put a card in complete (on the command line, --completion-confirmed). Only do this when a person on the board explicitly asks, confirms it after review or testing, or clearly waives review.";
+
+/**
+ * Complete is person-controlled: an agent's edit that would complete a card,
+ * by any route (move, create, reorder, restore), states that a person
+ * confirmed it. A person's own edits need no confirmation.
+ */
+export function assertCompletionConfirmed(before: PlanbanRoadmap, after: PlanbanRoadmap, actor: string | undefined, completionConfirmed: unknown) {
+  if (actor !== "agent" || completionConfirmed === true) return;
+  if (newlyCompleted(before, after).length) throw new PlanbanValidationError(COMPLETION_CONFIRMATION_MESSAGE);
+}
+
 export function defaultColumns() {
   return PLANBAN_STATUSES.map((id) => ({ id, label: STATUS_LABELS[id] }));
 }
+
+/**
+ * The progressNotedAt to keep when a card changes without noting progress. Cards from before it
+ * existed keep their last update time, so a touch now doesn't hide a merged PR they name.
+ */
+export function keptProgress(item: PlanbanRoadmapItem): Pick<PlanbanRoadmapItem, "progressNotedAt"> {
+  const at = item.progressNotedAt ?? item.updatedAt;
+  return at ? { progressNotedAt: at } : {};
+}
+
+/** A metadata patch applied to a card's metadata: each key set, a key set to null removed, null clearing all. */
+export function patchedMetadata(current: Record<string, unknown> | undefined, patch: Record<string, unknown> | null): Record<string, unknown> | undefined {
+  if (patch === null) return undefined;
+  const next = { ...(current ?? {}) };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete next[key];
+    else next[key] = value;
+  }
+  return Object.keys(next).length ? next : undefined;
+}
+
+const sameValue = (a: unknown, b: unknown) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 export function normalizeRoadmap(input: unknown): PlanbanRoadmap {
   const parsed = roadmapSchema.parse(input);
@@ -105,6 +157,7 @@ export function normalizeRoadmap(input: unknown): PlanbanRoadmap {
       planDoc: item.planDoc,
       completedAt: item.completedAt,
       updatedAt: item.updatedAt,
+      ...(item.progressNotedAt ? { progressNotedAt: item.progressNotedAt } : {}),
       isGroup: parsed.version === 2
         ? parsed.writerVersion >= 6
           ? "isGroup" in item && item.isGroup === true
@@ -387,6 +440,8 @@ export function planMoveCard(roadmap: PlanbanRoadmap, input: MoveCardInput, ctx:
     parentId,
     completedAt: status === "complete" ? item.completedAt ?? ctx.now : null,
     updatedAt: ctx.now,
+    // Completing a card settles any merged PR it names; other moves leave that warning alone.
+    ...(status === "complete" && item.status !== "complete" ? { progressNotedAt: ctx.now } : keptProgress(item)),
   };
   const result: PlanbanRoadmapItem[] = [];
   let inserted = false;
@@ -439,15 +494,25 @@ export function planUpdateCard(roadmap: PlanbanRoadmap, input: UpdateCardInput, 
   const title = input.title === undefined ? undefined : input.title.trim();
   if (title !== undefined && !title) throw new PlanbanValidationError("title is required");
 
-  const updatedItem: PlanbanRoadmapItem = {
+  const changed: PlanbanRoadmapItem = {
     ...item,
     ...(title !== undefined ? { title } : {}),
     ...(input.summary !== undefined ? { summary: input.summary?.trim() || null } : {}),
     ...(input.nextAction !== undefined ? { nextAction: input.nextAction?.trim() || null } : {}),
     ...(input.tags !== undefined ? { tags: input.tags.map((tag) => tag.trim()).filter(Boolean) } : {}),
     ...(input.blockedBy !== undefined ? { blockedBy: input.blockedBy?.trim() || null } : {}),
-    ...(input.metadata !== undefined ? (input.metadata === null ? {} : { metadata: input.metadata }) : {}),
-    updatedAt: ctx.now,
+  };
+  // Metadata is a patch: the keys given are set, a key given as null is removed, and null clears it all.
+  const metadata = input.metadata === undefined ? item.metadata : patchedMetadata(item.metadata, input.metadata);
+  delete changed.metadata;
+  if (metadata) changed.metadata = metadata;
+  const progressed = changed.summary !== item.summary || changed.nextAction !== item.nextAction;
+  // An update that changes nothing leaves the card's times alone, so it doesn't read as activity.
+  const real = progressed || (["title", "tags", "blockedBy", "metadata"] as const).some((field) => !sameValue(changed[field], item[field]));
+  const updatedItem: PlanbanRoadmapItem = {
+    ...changed,
+    ...(real ? { updatedAt: ctx.now } : {}),
+    ...(progressed ? { progressNotedAt: ctx.now } : real ? keptProgress(item) : {}),
   };
 
   if (input.blockedBy !== undefined) {
@@ -462,8 +527,6 @@ export function planUpdateCard(roadmap: PlanbanRoadmap, input: UpdateCardInput, 
     });
   }
 
-  if (input.metadata === null) delete updatedItem.metadata;
-
   return {
     roadmap: {
       ...roadmap,
@@ -472,10 +535,13 @@ export function planUpdateCard(roadmap: PlanbanRoadmap, input: UpdateCardInput, 
     history: {
       actor: input.actor ?? "user",
       operation: "card.update",
-      summary: title !== undefined && title !== item.title
-        ? `Renamed ${item.title} to ${title}`
-        : `Updated ${item.title}`,
-      affectedCards: [item.id],
+      summary: !real
+        ? `Saved ${item.title} unchanged`
+        : title !== undefined && title !== item.title
+          ? `Renamed ${item.title} to ${title}`
+          : `Updated ${item.title}`,
+      // An edit that changes nothing touches no card, so freshness checks never count it as activity.
+      affectedCards: real ? [item.id] : [],
     },
     docWrites: [],
   };
@@ -518,10 +584,11 @@ export function planReorderCards(
     if (!existing) throw new Error(`Unknown card in reorder payload: ${entry.id}`);
     if (seen.has(entry.id)) throw new Error(`Duplicate card in reorder payload: ${entry.id}`);
     seen.add(entry.id);
-    reordered.push({
+    reordered.push(existing.status === entry.status ? existing : {
       ...existing,
       status: entry.status,
-      updatedAt: existing.status === entry.status ? existing.updatedAt : ctx.now,
+      updatedAt: ctx.now,
+      ...(entry.status === "complete" ? { progressNotedAt: ctx.now } : keptProgress(existing)),
     });
   }
 
@@ -689,7 +756,7 @@ export function planCreateGroup(
   const rootsBeforeAnchor = roadmap.roadmapItems.slice(0, anchorIndex).filter((item) => !itemIdSet.has(item.id)).length;
   const ownedItems = roadmap.roadmapItems
     .filter((item) => itemIdSet.has(item.id))
-    .map((item) => ({ ...item, parentId: id, boardRank: null, groupRank: 1, updatedAt: ctx.now }));
+    .map((item) => ({ ...item, parentId: id, boardRank: null, groupRank: 1, updatedAt: ctx.now, ...keptProgress(item) }));
   const arranged = [...remaining];
   arranged.splice(rootsBeforeAnchor, 0, group);
   arranged.push(...ownedItems);
@@ -809,7 +876,7 @@ export function planWriteDoc(
         ...roadmap,
         roadmapItems: roadmap.roadmapItems.map((entry) =>
           entry.id === item.id
-            ? { ...entry, ...(input.kind === "spec" ? { specDoc: path } : { planDoc: path }), updatedAt: ctx.now }
+            ? { ...entry, ...(input.kind === "spec" ? { specDoc: path } : { planDoc: path }), updatedAt: ctx.now, ...keptProgress(entry) }
             : entry,
         ),
       };

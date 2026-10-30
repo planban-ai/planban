@@ -173,7 +173,11 @@ const ascii85Payload = (text: string) => ascii85Frames(text).reduce((sum, frame)
 function payloadLines(text: string) {
   const lines: Array<{ index: number; payload: number; weak: number; hash?: number }> = [];
   text.split(/\r?\n/).forEach((raw, index) => {
-    const line = raw.replace(/^[\s>*+-]*(?:\d+[.)]\s+)?/, "");
+    // The encodings guarded against (base64, base85, hex, uuencode) are ASCII. Text in
+    // other scripts, many written without spaces (Chinese, Japanese, Thai), stands in
+    // for a space, so prose leaves little behind and an ASCII payload, padded or not,
+    // is judged on what remains.
+    const line = raw.replace(/[^\x00-\x7F]+/g, " ").replace(/^[\s>*+-]*(?:\d+[.)]\s+)?/, "");
     if (!line.trim()) return;
     if (isUuencodeLine(raw)) {
       lines.push({ index, payload: raw.length, weak: 0 });

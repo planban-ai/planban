@@ -3,7 +3,60 @@ import { makeFunctionReference } from "convex/server";
 import { internalAction, internalMutation, internalQuery, type ActionCtx, type MutationCtx } from "./_generated/server";
 import { USAGE_POLICY, USAGE_CLOUD, collectionFailure, usageEnabled, mailEnabled, parseUsage, emptyMonitor, observeUsage, expiryNoticeDue, expiryNoticePayload, claimExpiryNotice, finishUsage, canSend, monitorStale, type MonitorState, type Reading, type Batch } from "./model/providerUsage";
 
+import { emptyWorkerUsage, noteWorkerWarning, observeWorkerUsage, parseWorkerRequests, workerUsageConfigured, workerUsageRequest, type WorkerUsageState } from "./model/workerUsage";
+
 const observeRef = makeFunctionReference<"mutation">("providerUsage:observe");
+const observeWorkerRef = makeFunctionReference<"mutation">("providerUsage:observeWorker");
+const noteWorkerRef = makeFunctionReference<"mutation">("providerUsage:noteWorker");
+/** The Worker's requests are watched in their own row. */
+const WORKER_POLICY = `${USAGE_POLICY}/worker`;
+
+export const observeWorker = internalMutation({
+  args: { requests: v.union(v.number(), v.null()), status: v.string(), now: v.number() },
+  handler: async (ctx, { requests, status, now }): Promise<{ day: string; level: 70 | 90; payload: string } | null> => {
+    if (!workerUsageConfigured(process.env)) return null;
+    const row = await ctx.db.query("providerUsageMonitors").withIndex("by_policy", q => q.eq("policy", WORKER_POLICY)).unique();
+    const state: WorkerUsageState = row?.state ?? emptyWorkerUsage();
+    const warning = observeWorkerUsage(state, requests, status, now);
+    if (row) await ctx.db.patch(row._id, { state }); else await ctx.db.insert("providerUsageMonitors", { policy: WORKER_POLICY, state });
+    return warning;
+  },
+});
+export const noteWorker = internalMutation({
+  args: { day: v.string(), level: v.union(v.literal(70), v.literal(90)) },
+  handler: async (ctx, { day, level }) => {
+    const row = await ctx.db.query("providerUsageMonitors").withIndex("by_policy", q => q.eq("policy", WORKER_POLICY)).unique();
+    if (!row) return;
+    noteWorkerWarning(row.state as WorkerUsageState, day, level);
+    await ctx.db.patch(row._id, { state: row.state });
+  },
+});
+
+/** Reads today's Worker requests from Cloudflare and warns once per level per day. */
+export async function runWorkerUsagePoll(ctx: Pick<ActionCtx, "runMutation">, now = Date.now()): Promise<string> {
+  if (!workerUsageConfigured(process.env)) return "disabled";
+  let requests: number | null = null; let status = "unavailable";
+  try {
+    const response = await fetch("https://api.cloudflare.com/client/v4/graphql", { method: "POST", redirect: "error",
+      headers: { Authorization: `Bearer ${process.env.PLANBAN_WORKER_USAGE_TOKEN}`, "Content-Type": "application/json" },
+      body: workerUsageRequest(process.env.PLANBAN_WORKER_USAGE_ACCOUNT!, now), signal: AbortSignal.timeout(10000) });
+    if (!response.ok) { await response.body?.cancel(); throw new Error([401, 403].includes(response.status) ? "worker_usage_unauthorized" : "worker_usage_unavailable"); }
+    requests = parseWorkerRequests(await boundedJson(response)); status = "complete";
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("worker_usage_")) status = error.message;
+    else if (error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name)) status = "timeout";
+  }
+  // The warning's body was stored before this send, so a retry repeats it exactly under the same key.
+  const warning = await ctx.runMutation(observeWorkerRef, { requests, status, now }) as { day: string; level: 70 | 90; payload: string } | null;
+  if (warning === null || !mailEnabled(process.env)) return status;
+  const { day, level } = warning;
+  const response = await fetch("https://api.resend.com/emails", { method: "POST", redirect: "error",
+    headers: { Authorization: `Bearer ${process.env.PLANBAN_USAGE_EMAIL_KEY}`, "Content-Type": "application/json", "Idempotency-Key": `planban-worker-requests-${day}-${level}` },
+    body: warning.payload, signal: AbortSignal.timeout(10000) }).catch(() => null);
+  if (!response?.ok) { await response?.body?.cancel(); return "retry"; }
+  await ctx.runMutation(noteWorkerRef, { day, level });
+  return "sent";
+}
 const finishRef = makeFunctionReference<"mutation">("providerUsage:finish");
 
 export const observe = internalMutation({
@@ -103,6 +156,8 @@ export async function boundedJson(response: Response): Promise<unknown> {
 
 export async function runUsagePoll(ctx: Pick<ActionCtx, "runMutation">): Promise<string> {
   if (!usageEnabled(process.env)) return "disabled";
+  // The Worker's daily requests are checked on their own; a failure there never stops the included-usage check.
+  await runWorkerUsagePoll(ctx).catch(() => undefined);
   const credentialFailure = collectionFailure(process.env, Date.now());
   if (credentialFailure) {
     await ctx.runMutation(observeRef, { reading: null, status: credentialFailure, now: Date.now() });

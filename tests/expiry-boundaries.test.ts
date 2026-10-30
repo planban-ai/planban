@@ -85,6 +85,8 @@ test("an invitation lasts exactly seven days", async () => {
     const owner = await ctx.db.insert("connections", { userId: "u1", kind: "machine", boards: "all", canAdminister: true, level: "complete", lastUsedAt: new Date(START).toISOString() });
     await ctx.db.insert("boards", { boardId: "expiry-board", title: "Expiry board", authority: "online" });
     await ctx.db.insert("members", { boardId: "expiry-board", userId: "u1", role: "owner" });
+    // Someone not yet on the board; a member opening any invitation is told they're already on it.
+    const guest = await ctx.db.insert("connections", { userId: "u2", kind: "machine", boards: "all", canAdminister: true, level: "complete", lastUsedAt: new Date(START).toISOString() });
     const made = await handler(invites.create, ctx, { connectionId: owner, boardId: "expiry-board", tokenHash: "invite-hash", role: "viewer" });
     const invite = await ctx.db.get(made.id);
     assert.equal(invites.INVITE_LIFETIME_MS, 7 * DAY_MS);
@@ -95,11 +97,11 @@ test("an invitation lasts exactly seven days", async () => {
     assert.deepEqual((await handler(invites.list, ctx, { connectionId: owner, boardId: "expiry-board" })).invites, []);
     for (const offset of [0, 1]) {
       clock.now = START + invites.INVITE_LIFETIME_MS + offset;
-      await assert.rejects(handler(invites.accept, ctx, { connectionId: owner, tokenHash: "invite-hash" }), /expired or was cancelled/);
+      await assert.rejects(handler(invites.accept, ctx, { connectionId: guest, tokenHash: "invite-hash" }), /expired or was cancelled/);
     }
 
     clock.now = START + invites.INVITE_LIFETIME_MS - 1;
     assert.ok(await handler(invites.preview, ctx, { tokenHash: "invite-hash" }));
-    assert.equal((await handler(invites.accept, ctx, { connectionId: owner, tokenHash: "invite-hash" })).boardId, "expiry-board");
+    assert.equal((await handler(invites.accept, ctx, { connectionId: guest, tokenHash: "invite-hash" })).boardId, "expiry-board");
   });
 });

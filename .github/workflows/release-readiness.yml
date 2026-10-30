@@ -7,6 +7,10 @@ on:
         description: Exact commit SHA to verify
         required: true
         type: string
+      target_ref:
+        description: Branch or tag whose head is that commit (people update from it)
+        required: true
+        type: string
       version:
         description: Expected Planban version
         required: true
@@ -73,3 +77,13 @@ jobs:
         run: |
           echo "### Verified Planban v$EXPECTED_VERSION" >> "$GITHUB_STEP_SUMMARY"
           echo "Commit: \`$(git rev-parse HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # The full seven-machine updater rehearsal, on the exact commit. Pull requests run
+  # it only when opened or marked ready, so this is where the final commit gets it.
+  updater-rehearsal:
+    name: Updater rehearsal
+    uses: ./.github/workflows/updater-rehearsal.yml
+    with:
+      from_version: ${{ inputs.from_version }}
+      target_ref: ${{ inputs.target_ref }}
+      expected_commit: ${{ inputs.ref }}

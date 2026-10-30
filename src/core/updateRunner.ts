@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { platformInvocation } from "../../scripts/platform-invocation.mjs";
+import { platformInvocation, stopInvocation } from "../../scripts/platform-invocation.mjs";
 import { updatePreflight, type PlanbanUpdatePreflight } from "./updatePreflight";
 import type { PlanbanUpdateManifest } from "./version";
 
@@ -271,7 +271,7 @@ function runStep(step: UpdateCommandStep) {
     let stderr = "";
     const timeout = step.timeoutMs
       ? setTimeout(() => {
-        child.kill("SIGTERM");
+        stopInvocation(child);
         rejectRun(new Error(`${step.label} timed out`));
       }, step.timeoutMs)
       : null;

@@ -18,6 +18,8 @@ export interface Env {
   SIGNIN_LIMITER?: Limiter;
   /** Per-caller limit on claude.ai registrations, which arrive from Anthropic's shared addresses. */
   REGISTER_LIMITER?: Limiter;
+  /** The web page's files (Workers static assets), answering every address that isn't the service's. */
+  ASSETS?: { fetch(request: Request): Promise<Response> };
 }
 type Limiter = { limit(options: { key: string }): Promise<{ success: boolean }> };
 
@@ -29,6 +31,11 @@ const LIMITED: Record<string, keyof Pick<Env, "SIGNIN_LIMITER" | "REGISTER_LIMIT
   "POST /oauth/machine/start": "SIGNIN_LIMITER",
   "GET /oauth/authorize": "SIGNIN_LIMITER",
   "POST /oauth/register": "REGISTER_LIMITER",
+  "POST /web/session": "SIGNIN_LIMITER",
+  "POST /web/invite": "SIGNIN_LIMITER",
+  "POST /oauth/device": "SIGNIN_LIMITER",
+  // New boards on the web: account quotas bound success; this stops refused requests reaching the service.
+  "POST /api/v1/boards": "SIGNIN_LIMITER",
 };
 
 export const EDGE_PROOF_HEADER = "Planban-Edge-Proof";
@@ -50,7 +57,11 @@ const ROUTES: readonly Route[] = [
   { path: "/oauth/machine/cancel", methods: ["POST"] },
   { path: "/oauth/validity", methods: ["POST"] },
   { path: "/oauth/approve", methods: ["POST"] },
-  { path: "/invite/", prefix: true, methods: ["GET"] },
+  { path: "/web/session", methods: ["POST"] },
+  { path: "/web/signout", methods: ["POST"] },
+  { path: "/web/invite", methods: ["POST"] },
+  { path: "/web/config", methods: ["GET"] },
+  { path: "/oauth/device", methods: ["POST"] },
   { path: "/.well-known/planban.json", methods: ["GET"] },
   { path: "/.well-known/oauth-authorization-server", methods: ["GET"] },
   { path: "/.well-known/oauth-protected-resource", methods: ["GET"] },
@@ -61,6 +72,19 @@ const ROUTES: readonly Route[] = [
   { path: "/brand/icon-light.png", methods: ["GET"] },
   { path: "/brand/icon-dark.png", methods: ["GET"] },
 ];
+
+/**
+ * The addresses the Worker answers itself (wrangler.jsonc assets.run_worker_first
+ * must list exactly these): the service's. Everything else is the web page,
+ * served from static assets with its own address handling (/boards/...,
+ * /invite/..., /sign-in, /approve), so page requests never count as Worker
+ * requests. "*" covers the rest of the path.
+ */
+export const WORKER_FIRST = ["/api/*", "/oauth/*", "/mcp", "/.well-known/*", "/web/*", "/favicon.svg", "/favicon.ico", "/brand/*"] as const;
+
+export function isServicePath(pathname: string): boolean {
+  return WORKER_FIRST.some((pattern) => pattern.endsWith("/*") ? pathname.startsWith(pattern.slice(0, -1)) || pathname === pattern.slice(0, -2) : pathname === pattern);
+}
 
 /** The only redirect the backend issues: authorization and machine launch hand over to consent. */
 const CONSENT_PATH = "/oauth/consent";
@@ -119,6 +143,11 @@ export default {
     if (!config) return refuse(503, "temporarily_unavailable");
     const url = new URL(request.url);
     if (url.protocol !== "https:" || url.host !== config.host) return refuse(421, "misdirected_request");
+    // The web page, if the Worker is asked for it at all (static assets normally answer first).
+    if (!isServicePath(url.pathname) && env.ASSETS && !/%2f|%5c|\/\.\.?(\/|$)|\/\//i.test(url.pathname)) {
+      if (request.method !== "GET" && request.method !== "HEAD") return refuse(405, "method_not_allowed");
+      return env.ASSETS.fetch(request);
+    }
     const route = routed(url.pathname, request.method);
     if (route === "none") return refuse(404, "not_found");
     if (route === "method") return refuse(405, "method_not_allowed");
@@ -163,6 +192,8 @@ export default {
     // Headers pass through as separate fields, including each Set-Cookie.
     const out = new Headers(upstream.headers);
     out.delete(EDGE_PROOF_HEADER);
+    // Never cross-site: no response through the front door grants another site access.
+    for (const name of [...out.keys()]) if (name.startsWith("access-control-")) out.delete(name);
     return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: out });
   },
 };

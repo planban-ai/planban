@@ -8,6 +8,7 @@ import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { platformInvocation } from "./platform-invocation.mjs";
+import { isTransientInstallFailure, retryOnce } from "./rehearsal-retry.mjs";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const PLUGIN_ID = "planban@planban";
@@ -119,8 +120,14 @@ try {
   await Promise.all([home, claudeConfig, planbanHome, projectRoot].map((path) => mkdir(path)));
 
   // Install the previous public release the way a Claude Code user does.
-  run("git", ["clone", "--quiet", "--branch", `v${options.fromVersion}`, sourceUrl, checkout]);
-  run("npm", ["install", "--no-audit", "--no-fund"], { cwd: checkout });
+  // Setup gets one retry for a failed clone or a dropped download; the checks below don't.
+  const removeCheckout = () => rm(checkout, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+  await retryOnce("Cloning the previous public release", () => run("git", ["clone", "--quiet", "--branch", `v${options.fromVersion}`, sourceUrl, checkout]), { beforeRetry: removeCheckout });
+  const installDependencies = () => retryOnce("Installing dependencies", () => run("npm", ["install", "--no-audit", "--no-fund"], { cwd: checkout }), {
+    shouldRetry: isTransientInstallFailure,
+    beforeRetry: () => rm(join(checkout, "node_modules"), { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
+  });
+  await installDependencies();
   run("claude", ["plugin", "marketplace", "add", checkout], { env, cwd: home });
   run("claude", ["plugin", "install", PLUGIN_ID], { env, cwd: home });
   const before = installedPlugin(env);
@@ -137,7 +144,7 @@ try {
   run("git", ["remote", "set-url", "origin", candidateRemote], { cwd: checkout });
   run("git", ["fetch", "--quiet", "origin", "release-candidate"], { cwd: checkout });
   run("git", ["checkout", "--quiet", "--detach", candidateSha], { cwd: checkout });
-  run("npm", ["install", "--no-audit", "--no-fund"], { cwd: checkout });
+  await installDependencies();
   run("claude", ["plugin", "marketplace", "add", checkout], { env, cwd: home });
   run("claude", ["plugin", "update", PLUGIN_ID], { env, cwd: home });
 

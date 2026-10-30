@@ -4,6 +4,7 @@ import { v } from "convex/values";
 import { internalMutation, internalQuery } from "./_generated/server";
 import { boardAccess, memberAgentLevel } from "./model/access";
 import { fail } from "./model/errors";
+import { accountBeingDeleted } from "./model/erasureGate";
 
 export const list = internalQuery({
   args: { connectionId: v.id("connections"), boardId: v.string() },
@@ -21,6 +22,10 @@ export const add = internalMutation({
     if (!access.canAdminister) fail("forbidden", "Inviting people is kept for the board owner's own connection.");
     // A board on its way to, or back from, Local Mode takes nobody new: they would keep reading the retained copy.
     if (access.board.authority !== "online" || access.board.localTransfer) fail("conflict", "People can only be added while the board is online.");
+    // Only someone who has used Planban (a profile or a sign-in) can be added: never an id of a deleted account.
+    const known = (await ctx.db.query("people").withIndex("by_userId", (q) => q.eq("userId", userId)).take(1)).length
+      || (await ctx.db.query("connections").withIndex("by_user", (q) => q.eq("userId", userId)).take(1)).length;
+    if (!known || await accountBeingDeleted(ctx, userId)) fail("not_found", "That Planban account doesn't exist.");
     if (!userId.trim()) fail("validation", "userId is required.");
     const existing = await ctx.db.query("members").withIndex("by_board_user", (q) => q.eq("boardId", boardId).eq("userId", userId)).unique();
     if (existing?.role === "owner") fail("validation", "The owner's role cannot be changed here.");

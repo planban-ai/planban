@@ -53,6 +53,21 @@ function auditReleaseRehearsals(source) {
   return findings;
 }
 
+const UPDATER_REHEARSAL_WORKFLOW = "./.github/workflows/updater-rehearsal.yml";
+
+// Release readiness must run the full updater rehearsal on the exact commit it verifies:
+// pull requests skip it after their first push.
+function auditUpdaterRehearsal(source) {
+  let workflow;
+  try { workflow = parseYaml(source); } catch { return []; }
+  const runsOnCommit = Object.values(workflow?.jobs ?? {}).some((job) => job
+    && job.uses === UPDATER_REHEARSAL_WORKFLOW
+    && job.if === undefined
+    && (job["continue-on-error"] ?? false) === false
+    && String(job.with?.expected_commit ?? "").replace(/\s+/gu, "") === "${{inputs.ref}}");
+  return runsOnCommit ? [] : [`${RELEASE_READINESS_WORKFLOW} must run ${UPDATER_REHEARSAL_WORKFLOW} with expected_commit: \${{ inputs.ref }} in a job that always runs`];
+}
+
 export function githubRemoteOwner(remoteUrl) {
   const match = remoteUrl.trim().match(/github\.com(?::|\/)([^/]+)\//iu);
   return match?.[1]?.toLowerCase() ?? null;
@@ -93,7 +108,7 @@ export function auditReleasePolicy({ remoteUrl, workflows, packageJson, packageL
 
   const readiness = workflows[RELEASE_READINESS_WORKFLOW];
   if (readiness === undefined) findings.push(`${RELEASE_READINESS_WORKFLOW} is missing`);
-  else findings.push(...auditReleaseRehearsals(readiness));
+  else findings.push(...auditReleaseRehearsals(readiness), ...auditUpdaterRehearsal(readiness));
 
   const reviewed = Object.entries(packageJson.allowScripts ?? {})
     .filter(([, allowed]) => allowed === true)

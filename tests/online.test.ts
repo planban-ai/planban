@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
@@ -13,7 +14,7 @@ import { historyDocPath, historyIndexPath, historyRoadmapPath, manifestPath } fr
 import { manifestSchema } from "../src/core/schema";
 import { listBoards, registerBoardFromCwd, duplicateBoard } from "../src/core/registry";
 import { credentialsRoot, onlineStatus, readCredentials, saveCredentials, serviceUrl } from "../src/core/online/credentials";
-import { onlineRequest, OnlineAuthenticationError } from "../src/core/online/client";
+import { onlineRequest, OnlineAuthenticationError, PlanbanForbiddenError } from "../src/core/online/client";
 import { revokeToken as revokeServiceToken } from "../online/service/convex/oauth";
 import { onlineLogin } from "../src/core/online/login";
 import { attachOnline, buildLocalBundle, exportOnline, keepLocalCopy, keepSeparateBoard, PlanbanConfirmationNeeded, PlanbanNotReadyForOnline, PlanbanTakeOnlineStopped, restoreBackup, stopTakeOnline, takeLocal, takeOnline, type BoardBundle } from "../src/core/online/transfers";
@@ -27,6 +28,9 @@ import { planbanCommand } from "../src/core/command";
 import { listHistory } from "../src/core/history";
 import { checkIndexCard, checkIndexDocument, checkIndexValue } from "../src/core/contentRules";
 import type { PlanbanDocPayload, PlanbanRoadmap } from "../src/core/types";
+import { clearStalenessCaches, collectStaleness, projectStaleness } from "../src/core/stalenessSources";
+import { useGitHubRunner } from "../src/core/githubMerges";
+import { planbanStalenessLine } from "../plugins/planban/scripts/claude-session-context.mjs";
 const CMD = planbanCommand().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const execFileAsync = promisify(execFile);
@@ -411,12 +415,12 @@ test.beforeEach(async () => {
   fake = await fakeService();
   await storage.initializeProject({ cwd, repoId: "demo", title: "Demo board", updateAgents: false });
   await storage.createCard({ cwd, title: "Alpha", specMarkdown: "# Original spec", planMarkdown: "# Original plan" });
-  await saveCredentials(fake.url, { clientId: "cli", accessToken: "access-0", refreshToken: "refresh-0", expiresAt: new Date(Date.now() + 3600_000).toISOString(), person: "owner" });
+  await saveCredentials(fake.url, { clientId: "cli", accessToken: "access-0", refreshToken: "refresh-0", expiresAt: new Date(Date.now() + 3600_000).toISOString(), person: "dev-owner" });
 });
 
 test.afterEach(async () => {
   await fake.close();
-  await rm(root, { recursive: true, force: true });
+  await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   process.env.PLANBAN_HOME = originalHome;
   delete process.env.PLANBAN_ONLINE_TEST_PASSWORD;
   assert.deepEqual(fake.errors, []);
@@ -472,7 +476,7 @@ test("machine wait closes a hanging opener and sends PKCE-owned cancellation wit
 test("failed credential save invokes real machine revocation and preserves existing file and independent machine", async () => {
   const file = join(credentialsRoot(), "credentials.json"), original = "malformed existing private fixture file";
   await writeFile(file, original);
-  await assert.rejects(onlineLogin(fake.url, { openBrowser: async (url) => { await fetch((await fetch(url, { redirect: "manual" })).headers.get("location")!); } }));
+  await assert.rejects(onlineLogin(fake.url, { switchAccount: true, openBrowser: async (url) => { await fetch((await fetch(url, { redirect: "manual" })).headers.get("location")!); } }));
   assert.equal(await readFile(file, "utf8"), original);
   assert.ok(fake.issuedMachines.find(r => r._id === "issued").revokedAt);
   assert.equal(fake.issuedMachines.find(r => r._id === "unrelated").revokedAt, undefined);
@@ -483,7 +487,7 @@ test("actual hung browser-opening child does not keep the CLI process alive afte
   const pidFile = join(root, "owned-opener.pid");
   const script = `import cp from 'node:child_process'; import {syncBuiltinESMExports} from 'node:module'; import {writeFileSync} from 'node:fs';
     const actualSpawn=cp.spawn; cp.spawn=()=>{ const child=actualSpawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'}); writeFileSync(process.env.OPENER_PID_FILE,String(child.pid)); return child; }; syncBuiltinESMExports();
-    const {onlineLogin}=await import('./src/core/online/login.ts'); try { await onlineLogin(process.env.FIXTURE_URL); process.exitCode=3; } catch(error) { if(!String(error).includes('timed out')) throw error; }`;
+    const {onlineLogin}=await import('./src/core/online/login.ts'); try { await onlineLogin(process.env.FIXTURE_URL, { switchAccount: true }); process.exitCode=3; } catch(error) { if(!String(error).includes('timed out')) throw error; }`;
   try {
     await execFileAsync(process.execPath, ["--import", "tsx/esm", "--input-type=module", "-e", script], { env: { ...process.env, FIXTURE_URL: fake.url, OPENER_PID_FILE: pidFile }, timeout: 4000 });
     const pid = Number(await readFile(pidFile, "utf8"));
@@ -496,7 +500,7 @@ test("actual hung browser-opening child does not keep the CLI process alive afte
 
 test("malformed machine lease fails before browser opening and leaves existing credentials untouched", async () => {
   const before = await readCredentials(); fake.setMachineLease(300001);
-  await assert.rejects(onlineLogin(fake.url, { openBrowser: async () => assert.fail("invalid lease opened browser") }), /valid bounded/);
+  await assert.rejects(onlineLogin(fake.url, { switchAccount: true, openBrowser: async () => assert.fail("invalid lease opened browser") }), /valid bounded/);
   assert.deepEqual(await readCredentials(), before);
 });
 
@@ -522,7 +526,7 @@ test("CLI refuses provider, wrong-purpose or refreshing tokens before saving cre
 
 test("the sign-in server's endpoints must belong to it", async () => {
   fake.setMetadataOrigin("https://other.example");
-  await assert.rejects(onlineLogin(fake.url, { openBrowser: async () => assert.fail("no browser should open") }), /must belong to it/);
+  await assert.rejects(onlineLogin(fake.url, { switchAccount: true, openBrowser: async () => assert.fail("no browser should open") }), /must belong to it/);
   assert.equal(fake.requests.some((req) => req.path === "/oauth/token"), false);
 });
 
@@ -565,7 +569,7 @@ test("documents preserve online stamps and stale roadmap or document edits confl
 });
 
 test("hosted errors retain domain classes, access status and revision details", async () => {
-  for (const [status, type] of [[400, storage.PlanbanValidationError], [404, storage.PlanbanNotFoundError], [409, storage.PlanbanConflictError], [403, OnlineAuthenticationError]] as const) {
+  for (const [status, type] of [[400, storage.PlanbanValidationError], [404, storage.PlanbanNotFoundError], [409, storage.PlanbanConflictError], [403, PlanbanForbiddenError]] as const) {
     await assert.rejects(onlineRequest(fake.url, `/error/${status}`), (error: any) => error instanceof type && (status !== 409 || error.currentRevision === 19));
   }
 });
@@ -593,7 +597,8 @@ test("take-online sends every retained roadmap and current and historical docume
   assert.ok(expected.historyDocs!.some((doc) => doc.markdown === "# Second spec"));
   for (const version of expected.history) assert.deepEqual(version.roadmap, JSON.parse(await readFile(historyRoadmapPath(before.planningRoot, version.entry.version), "utf8")));
   assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
-  assert.equal(await storage.pathExists(before.roadmapPath), false);
+  // The live board is set aside; what is left there stops older Planban versions using it.
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
   assert.equal((await storage.loadState(cwd)).roadmap.revision, before.roadmap.revision + 1);
 });
 
@@ -715,6 +720,89 @@ test("Board HTTP API reads and edits online state and signals changes from anoth
   } finally { await server.close(); }
 });
 
+test("an Online Board shows freshness warnings everywhere a local one does, with merges from GitHub", async () => {
+  // This project's origin is on GitHub; a stand-in gh answers for it.
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["remote", "add", "origin", "git@github.com:example/demo.git"], { cwd });
+  // A stand-in for gh, recording what it was asked; a real spawn is covered by the "not installed" check below.
+  const ghCalls: string[][] = [];
+  const fakeGh = async (answer: () => string) => {
+    useGitHubRunner(async (command, args) => {
+      assert.equal(command, "gh");
+      ghCalls.push(args);
+      return answer();
+    });
+    clearStalenessCaches();
+    await rm(join(process.env.PLANBAN_HOME!, "online", "github"), { recursive: true, force: true });
+  };
+  try {
+    await storage.setCardStatus(cwd, "alpha", "in-progress");
+    await storage.updateCard({ cwd, cardId: "alpha", nextAction: "Merge PR 41, then deploy." });
+    await storage.createCard({ cwd, title: "Sign off", status: "in-progress", nextAction: "Owner: approve the copy." });
+    await takeOnline(fake.url, cwd);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const mergedAt = new Date(Date.now() - 5).toISOString();
+    await fakeGh(() => JSON.stringify({ number: 41, merged_at: mergedAt }));
+
+    // planban_status and the session-start hook read the board from the service, not a local file.
+    const board = await projectStaleness(cwd);
+    assert.deepEqual(board?.staleness.cards.alpha?.map((signal) => signal.kind), ["merged"]);
+    assert.deepEqual(board?.staleness.cards["sign-off"]?.map((signal) => signal.kind), ["awaiting-owner"]);
+    assert.equal(board?.staleness.notes, undefined);
+    assert.deepEqual(ghCalls.map((args) => args.slice(0, 4)), [["api", "--method", "GET", "repos/example/demo/pulls/41"]], "only the PR a card names is asked about");
+    clearStalenessCaches();
+    assert.equal(await planbanStalenessLine({ projectDir: cwd }), "1 active card looks stale (alpha); fix any you touch.");
+
+    // planban_get_board and the board page use the same sources for a loaded Online Board.
+    const state = await storage.loadState(cwd);
+    const loaded = await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems, storage: state.manifest.storage });
+    assert.deepEqual(loaded.cards.alpha?.map((signal) => signal.kind), ["merged"]);
+    assert.ok(fake.requests.some((req) => req.path === "/api/v1/boards/demo/history"), "quiet and first-seen times come from the board's own history");
+
+    // A metadata-only touch doesn't settle the merge; changing the next action does.
+    await storage.updateCard({ cwd, cardId: "alpha", metadata: { checked: true }, baseRevision: state.roadmap.revision });
+    clearStalenessCaches();
+    assert.deepEqual((await projectStaleness(cwd))?.staleness.cards.alpha?.map((signal) => signal.kind), ["merged"]);
+
+    // GitHub out of reach: no error, the merges already seen here, and a note saying why.
+    await fakeGh(() => { throw Object.assign(new Error("gh exited 4"), { stderr: "To get started with GitHub CLI, please run:  gh auth login" }); });
+    const degraded = await projectStaleness(cwd);
+    assert.equal(degraded?.staleness.cards.alpha, undefined);
+    assert.deepEqual(degraded?.staleness.cards["sign-off"]?.map((signal) => signal.kind), ["awaiting-owner"]);
+    assert.match(degraded?.staleness.notes?.[0] ?? "", /isn't signed in here/u);
+    clearStalenessCaches();
+    assert.match(await planbanStalenessLine({ projectDir: cwd }) ?? "", /^Merged-PR warnings may be missing merges: the GitHub CLI \(gh\) isn't signed in here\./u);
+
+    // The board itself out of reach: a note, not a board with nothing stale.
+    fake.failNextBoardRead();
+    assert.deepEqual((await projectStaleness(cwd))?.staleness.notes, ["Planban couldn't reach the Online Board to check which cards look stale."]);
+
+    // planban_get_card through the real MCP server keeps why warnings may be missing, in its text
+    // and its result. With no GitHub origin, a bare #41 can only be checked against this computer's git.
+    await execFileAsync("git", ["remote", "remove", "origin"], { cwd });
+    const requests = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "planban_get_card", arguments: { cwd, cardId: "alpha" } } },
+    ];
+    const child = spawn(process.execPath, [join(process.cwd(), "plugins/planban/scripts/start-planban-mcp.mjs")], {
+      env: { ...process.env, PLANBAN_REPO_ROOT: process.cwd(), PLANBAN_ACTIVITY_URL: "http://127.0.0.1:9" }, stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+    child.stdin.end(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
+    await exited;
+    const card = stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line)).find((response) => response.id === 2).result;
+    const note = "Merged-PR warnings for pull requests named as #123 use only this computer's git history: this project has no GitHub origin remote.";
+    assert.deepEqual(card.structuredContent.stalenessNotes, [note]);
+    assert.ok(card.content[0].text.includes(note), card.content[0].text);
+
+  } finally {
+    useGitHubRunner();
+    clearStalenessCaches();
+  }
+});
+
 test("an Online Board without a sign-in tells the page which service to sign in to, signed out or expired", async () => {
   await takeOnline(fake.url, cwd);
   const reservation = createServer();
@@ -737,8 +825,9 @@ test("an Online Board without a sign-in tells the page which service to sign in 
     const missingBody = await missing.json();
     assert.deepEqual([missingBody.signInNeeded, missingBody.signedOut], [serviceUrl(fake.url), "missing"]);
     // Agents and terminals still get the command in the message.
-    assert.match(missingBody.error, /online login/);
-    assert.equal(missingBody.signInCommand, `${planbanCommand()} online login ${serviceUrl(fake.url)}`);
+    // The board names the account it uses (here one whose email this test sign-in never learned).
+    assert.match(missingBody.error, /online sign-in/);
+    assert.equal(missingBody.signInCommand, `${planbanCommand()} online sign-in ${serviceUrl(fake.url)}`);
     // The page can only start sign-in for a service this computer already trusts, never one a board's files name.
     const untrusted = await fetch(`${server.url}/api/online/sign-in`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: "https://planban-login.example" }) });
     assert.equal(untrusted.status, 422);
@@ -826,21 +915,35 @@ test("take-online killed mid-upload leaves the board local, and running it again
   assert.equal(await storage.pathExists(join(before.planningRoot, "online-transfer.json")), false);
 });
 
-test("take-online killed after the upload committed finishes on retry and reports later local edits", async () => {
+test("take-online killed right after the commit leaves this machine's board shut to every writer; the retry finishes and nothing is lost", async () => {
   const before = await storage.loadState(cwd);
   await killedAt("take-online:after-commit", ["online", "take-online", fake.url, "--cwd", cwd]);
   assert.equal(fake.authority, "online");
   assert.equal((await storage.readManifest(cwd))?.storage?.kind ?? "local", "local");
-  // An edit made on this machine after the upload, before the retry.
-  await storage.createCard({ cwd, title: "Made after the upload" });
+  // The board is online but this project has not switched yet: a local edit now would be lost, so it is refused.
+  await assert.rejects(storage.createCard({ cwd, title: "Made after the upload" }), /moving online/);
+  // Planban 1.x, which reads roadmap.json itself, cannot use it either.
+  assert.throws(() => JSON.parse(readFileSync(before.roadmapPath, "utf8")), /Restart: Planban 2\.0/);
   const result = await takeOnline(fake.url, cwd);
   assert.equal([...fake.transfers.values()].filter((transfer) => transfer.state === "committed").length, 1);
-  assert.deepEqual(result.unsyncedLocalChanges?.map((change) => change.summary), ["Created Made after the upload"]);
-  assert.equal(fake.bundle.roadmap.roadmapItems.some((item) => item.title === "Made after the upload"), false);
-  // The local edit is kept as recovery evidence.
-  assert.ok(JSON.parse(await readFile(result.localSnapshot, "utf8")).roadmapItems.some((item: { title: string }) => item.title === "Made after the upload"));
+  assert.equal(result.unsyncedLocalChanges, undefined);
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
   assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
-  assert.equal(await storage.pathExists(before.roadmapPath), false);
+  // The live board is set aside; what is left there stops older Planban versions using it.
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+});
+
+test("a roadmap that appears while a committed move is unfinished is set aside and reported, never taken for the board", async () => {
+  const before = await storage.loadState(cwd);
+  await killedAt("take-online:after-commit", ["online", "take-online", fake.url, "--cwd", cwd]);
+  // Something put a board back where the marker was (Planban 1.x init after the file was removed, say).
+  const stray = JSON.stringify({ version: 2, writerVersion: 6, revision: 0, roadmapItems: [] });
+  await writeFile(before.roadmapPath, stray);
+  const result: any = await takeOnline(fake.url, cwd);
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap, "the snapshot is the board as it was");
+  assert.equal(await readFile(result.strayRoadmap, "utf8"), stray, "the stray roadmap is kept, aside, and named");
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+  assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
 });
 
 test("take-local killed mid-download keeps the online board intact, and running it again finishes", async () => {
@@ -859,15 +962,52 @@ test("take-local killed mid-download keeps the online board intact, and running 
   assert.equal(await storage.pathExists(join(onlineCacheRoot({ kind: "online", url: fake.url, boardId: "demo" }), "online-transfer.json")), false);
 });
 
-test("take-online killed between setting the local roadmap aside and switching the project finishes on retry", async () => {
+test("a shut board whose marker was deleted gets it back on resume, and the move finishes from the snapshot", async () => {
   const before = await storage.loadState(cwd);
-  await killedAt("take-online:after-rename", ["online", "take-online", fake.url, "--cwd", cwd]);
-  assert.equal(await storage.pathExists(before.roadmapPath), false);
+  await killedAt("take-online:after-seal", ["online", "take-online", fake.url, "--cwd", cwd]);
+  await rm(before.roadmapPath);
+  const result = await takeOnline(fake.url, cwd);
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+  assert.deepEqual(fake.bundle.roadmap.roadmapItems.map((item) => item.id), before.roadmap.roadmapItems.map((item) => item.id));
+});
+
+for (const point of ["take-online:before-restore", "take-online:after-restore", "take-online:after-snapshot-removed"]) {
+  test(`a stop killed while putting the board back (${point}) never undoes edits made after it`, async () => {
+    const before = await storage.loadState(cwd);
+    await killedAt("take-online:after-seal", ["online", "take-online", fake.url, "--cwd", cwd]);
+    await killedAt(point, ["online", "stop-take-online", "--cwd", cwd]);
+    // Running stop again (or take-online) finishes putting it back; then the board is live, and an edit is acknowledged.
+    if (point === "take-online:before-restore") assert.equal((await stopTakeOnline(cwd)).stopped, true);
+    await storage.updateCard({ cwd, cardId: "alpha", summary: "kept after the stop", baseRevision: (await storage.loadState(cwd)).roadmap.revision });
+    await takeOnline(fake.url, cwd);
+    assert.equal(fake.bundle.roadmap.roadmapItems.find((item) => item.id === "alpha")?.summary, "kept after the stop", "the edit went online, not an older snapshot");
+    assert.equal((await readdir(before.planningRoot)).filter((name) => name.startsWith("roadmap.stray-")).length, 0, "the restored board is not stray");
+  });
+}
+
+test("take-online killed after copying the snapshot, before shutting the local board, finishes on retry with one snapshot", async () => {
+  const before = await storage.loadState(cwd);
+  await killedAt("take-online:after-snapshot", ["online", "take-online", fake.url, "--cwd", cwd]);
+  assert.deepEqual(JSON.parse(await readFile(before.roadmapPath, "utf8")), before.roadmap, "never a moment without a roadmap file");
   assert.equal((await storage.readManifest(cwd))?.storage?.kind ?? "local", "local");
   const result = await takeOnline(fake.url, cwd);
   assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
   assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
+  assert.equal((await readdir(before.planningRoot)).filter((name) => name.startsWith("roadmap.local-before-online-")).length, 1);
   assert.equal([...fake.transfers.values()].filter((transfer) => transfer.state === "committed").length, 1);
+});
+
+test("take-online killed after shutting the local board, before the commit, keeps it shut and finishes on retry", async () => {
+  const before = await storage.loadState(cwd);
+  await killedAt("take-online:after-seal", ["online", "take-online", fake.url, "--cwd", cwd]);
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+  await assert.rejects(storage.createCard({ cwd, title: "Lost?" }), /moving online/);
+  const result = await takeOnline(fake.url, cwd);
+  // The retry never takes the marker for the board: the snapshot still holds the board as it was.
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
+  assert.equal((await readdir(before.planningRoot)).filter((name) => name.startsWith("roadmap.local-before-online-")).length, 1);
+  assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
 });
 
 test("take-local killed after writing the local copy resumes into the same folder", async () => {
@@ -1089,7 +1229,7 @@ test("Take Online leaves a note in the project folder; a machine with the note k
 
 test("a take-online killed before writing its note writes it when run again; a damaged note says how to fix it", async () => {
   const { second } = await secondMachineCopy();
-  await killedAt("take-online:after-rename", ["online", "take-online", fake.url, "--cwd", cwd]);
+  await killedAt("take-online:after-seal", ["online", "take-online", fake.url, "--cwd", cwd]);
   const notePath = join(cwd, ".planban", "online-board.json");
   assert.equal(await storage.pathExists(notePath), false);
   await killedAt("take-online:after-note", ["online", "take-online", fake.url, "--cwd", cwd]);
@@ -1128,7 +1268,7 @@ test("signing in checks the machine's local boards for stale copies", async () =
   // On the second machine, its own registry lists its local copy.
   await registerBoardFromCwd(second);
   resetCopyChecks();
-  const result: any = await onlineLogin(fake.url, { openBrowser: async (authorizeUrl) => {
+  const result: any = await onlineLogin(fake.url, { switchAccount: true, openBrowser: async (authorizeUrl) => {
     await fetch((await fetch(authorizeUrl, { redirect: "manual" })).headers.get("location")!);
   } });
   assert.ok(result.staleLocalCopies?.some((copy: { repoId: string; onlineBoard: string }) => copy.repoId === "demo" && copy.onlineBoard === "demo"));
@@ -1394,16 +1534,16 @@ test("a take-local resumed before its freeze asks again about people who joined 
 test("an earlier upload is replaced only once the service confirms it is gone", async () => {
   const before = await storage.loadState(cwd);
   const journalPath = join(before.planningRoot, "online-transfer.json");
-  await killedAt("take-online:after-commit", ["online", "take-online", fake.url, "--cwd", cwd]);
+  await killedAt("take-online:after-part", ["online", "take-online", fake.url, "--cwd", cwd]);
   const recorded = JSON.parse(await readFile(journalPath, "utf8"));
   await storage.updateCard({ cwd, cardId: "alpha", summary: "edited after the upload", baseRevision: (await storage.loadState(cwd)).roadmap.revision });
   fake.failAbort(true);
   await assert.rejects(takeOnline(fake.url, cwd));
-  assert.equal(JSON.parse(await readFile(journalPath, "utf8")).transferId, recorded.transferId, "the record of the committed upload is kept");
+  assert.equal(JSON.parse(await readFile(journalPath, "utf8")).transferId, recorded.transferId, "the record of the earlier upload is kept");
   fake.failAbort(false);
-  const result: any = await takeOnline(fake.url, cwd);
+  await takeOnline(fake.url, cwd);
   assert.equal((await storage.readManifest(cwd))?.storage?.kind, "online");
-  assert.equal(result.unsyncedLocalChanges.length, 1);
+  assert.equal(fake.bundle.roadmap.roadmapItems.find((item) => item.id === "alpha")?.summary, "edited after the upload", "the current board went online");
 });
 
 test("an upload started by another account is never cancelled or forgotten by this one", async () => {
@@ -1593,6 +1733,6 @@ test("taking a shared board local says who loses access, and only goes ahead whe
 
 test("a sign-in the service no longer accepts asks the person to sign in again", async () => {
   fake.rejectAccess();
-  await assert.rejects(onlineRequest(fake.url, "/api/v1/me"), (error: any) => error instanceof OnlineAuthenticationError && error.message.includes("online login"));
+  await assert.rejects(onlineRequest(fake.url, "/api/v1/me"), (error: any) => error instanceof OnlineAuthenticationError && error.message.includes("online sign-in"));
   assert.equal(fake.requests.filter((req) => req.path === "/api/v1/me").length, 1, "no retry loop");
 });

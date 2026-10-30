@@ -26,7 +26,7 @@ test("a cwd with its own manifest resolves to itself", async () => {
   const { root, main } = await fixture();
   try {
     assert.deepEqual(resolvePlanbanProjectDir(main), { projectDir: main, requestedCwd: main, via: "cwd" });
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("a linked git worktree resolves to the main checkout that owns the board", async () => {
@@ -36,7 +36,7 @@ test("a linked git worktree resolves to the main checkout that owns the board", 
     assert.deepEqual(resolvePlanbanProjectDir(linked), { projectDir: main, requestedCwd: linked, via: "worktree", worktreeDir: linked });
     const nested = join(linked, "src/deep");
     assert.deepEqual(resolvePlanbanProjectDir(nested), { projectDir: main, requestedCwd: nested, via: "worktree", worktreeDir: linked });
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("discovery stops at the repository top and never leaks to unrelated parents", async () => {
@@ -48,7 +48,7 @@ test("discovery stops at the repository top and never leaks to unrelated parents
     const inside = join(plain, "packages/app");
     await mkdir(inside, { recursive: true });
     assert.deepEqual(resolvePlanbanProjectDir(inside), { projectDir: inside, requestedCwd: inside, via: "none" });
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("a subdirectory of an initialized repo resolves to the repo root", async () => {
@@ -57,7 +57,7 @@ test("a subdirectory of an initialized repo resolves to the repo root", async ()
     const sub = join(main, "packages/web");
     await mkdir(sub, { recursive: true });
     assert.deepEqual(resolvePlanbanProjectDir(sub), { projectDir: main, requestedCwd: sub, via: "ancestor" });
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("status and the session hook report the main checkout board from a linked worktree", async () => {
@@ -76,5 +76,5 @@ test("status and the session hook report the main checkout board from a linked w
     assert.ok(context.includes(join(main, ".planban/agent-context.md")), "the hook names the exact agent-context file to read");
     const own = planbanSessionContext({ projectDir: main }) ?? "";
     assert.doesNotMatch(own, /linked git worktree/u);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });

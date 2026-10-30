@@ -2,12 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- No page request ever carries this address as its Referer, and an invitation's token or a sign-in request leaves the address before anything else loads. -->
+    <meta name="referrer" content="no-referrer" />
+    <script>(function(){try{var p=location.pathname,m=/^\/invite\/([^\/?#]+)/.exec(p);if(m&&m[1]!=="pending"){sessionStorage.setItem("planban.web.invite",decodeURIComponent(m[1]));history.replaceState(null,"","/invite/pending")}if(p==="/approve"&&location.hash.indexOf("#request=")===0){sessionStorage.setItem("planban.web.approve",decodeURIComponent(location.hash.slice(9)));history.replaceState(null,"","/approve")}}catch(e){}})();</script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content" />
     <link rel="icon" type="image/svg+xml" href="/assets/card-stack-black.svg" media="(prefers-color-scheme: light)" />
     <link rel="icon" type="image/svg+xml" href="/assets/card-stack-white.svg" media="(prefers-color-scheme: dark)" />
     <title>Planban</title>
-    <script type="module" crossorigin src="/assets/index-BS3h0pAh.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CtJfi0-U.css">
+    <script type="module" crossorigin src="/assets/index-CirV1v1E.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-D-eoN-Jh.css">
   </head>
   <body>
     <div id="root"></div>

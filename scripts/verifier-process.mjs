@@ -89,14 +89,14 @@ export async function runVerifierStage(stage, script, args = [], options = {}) {
 
 /** Every cleanup is attempted. A cleanup error must not replace the original
  * verification failure or permit an otherwise failing check to report success. */
-export async function withVerifierCleanup(work, cleanups) {
+export async function withVerifierCleanup(work, cleanups, log = (line) => process.stderr.write(line)) {
   let result, primary;
   try { result = await work(); } catch (error) { primary = error; }
   const errors = [];
   for (const [label, cleanup] of cleanups) {
     try { await cleanup(); } catch (error) {
       errors.push(error);
-      process.stderr.write(`[cold install] cleanup ${label}: ${error.stack ?? error}\n`);
+      log(`[cold install] cleanup ${label}: ${error.stack ?? error}\n`);
     }
   }
   if (primary) throw primary;

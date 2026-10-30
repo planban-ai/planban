@@ -43,7 +43,7 @@ export default defineSchema({
     retention: v.optional(v.any()),
     createdAt: v.string(),
     updatedAt: v.string(),
-  }).index("by_boardId", ["boardId"]).index("by_uid", ["uid"]),
+  }).index("by_boardId", ["boardId"]).index("by_uid", ["uid"]).index("by_owner", ["ownerId"]),
 
   /**
    * Fingerprints ("version|createdAt|operation") of every history entry a
@@ -61,7 +61,55 @@ export default defineSchema({
     boardId: v.string(),
     generation: v.number(),
     roadmap: v.bytes(),
+    /** The board's goals (src/core/goals.ts), when it has any. */
+    goals: v.optional(v.bytes()),
   }).index("by_board_generation", ["boardId", "generation"]),
+
+  /**
+   * Agents' edits that were refused because something they touched changed
+   * since they read it (Spec point 20). Each stays until an agent saves a
+   * reconsidered version or drops it with a reason. Shown to agents only.
+   */
+  /**
+   * Who is working on a card (Spec point 20): a heads-up, not a lock. An
+   * agent's reads and edits of a card mark it, until 15 minutes after its
+   * last activity.
+   */
+  presence: defineTable({
+    boardId: v.string(),
+    generation: v.number(),
+    cardId: v.string(),
+    connectionId: v.id("connections"),
+    userId: v.string(),
+    /** The app, as people know it: "Claude", "Codex", "ChatGPT". */
+    app: v.string(),
+    startedAt: v.number(),
+    lastActiveAt: v.number(),
+  }).index("by_board_card", ["boardId", "generation", "cardId"]).index("by_agent", ["boardId", "generation", "cardId", "connectionId", "app"])
+    .index("by_board_active", ["boardId", "generation", "lastActiveAt"]).index("by_card_active", ["boardId", "generation", "cardId", "lastActiveAt"]).index("by_connection_active", ["connectionId", "lastActiveAt"]).index("by_active", ["lastActiveAt"]).index("by_user", ["userId"]),
+
+  unresolvedChanges: defineTable({
+    boardId: v.string(),
+    generation: v.number(),
+    cardId: v.string(),
+    changeId: v.string(),
+    userId: v.string(),
+    clientName: v.string(),
+    createdAt: v.string(),
+    op: v.string(),
+    /** What the refused edit asked for (its input, without bookkeeping). */
+    /** Older rows; new ones keep the proposal packed (proposedPacked). */
+    proposed: v.optional(v.any()),
+    proposedPacked: v.optional(v.bytes()),
+    /** The fields it touched that had changed ("spec"/"plan" for a document; "*" for the whole card). */
+    fields: v.array(v.string()),
+    /** The board revision when it was refused. */
+    refusedAtRevision: v.number(),
+    /** Plain words for the clash, as the refusal said it. */
+    message: v.string(),
+    /** Its stored size, counted toward the board's limit while it waits. */
+    bytes: v.optional(v.number()),
+  }).index("by_board_card", ["boardId", "generation", "cardId"]).index("by_changeId", ["changeId"]).index("by_user", ["userId"]),
 
   docs: defineTable({
     boardId: v.string(),
@@ -73,7 +121,11 @@ export default defineSchema({
     stamp: v.number(),
     updatedAt: v.string(),
     updatedBy: v.string(),
-  }).index("by_board_card_kind", ["boardId", "generation", "cardId", "kind"]),
+    /** The last write, for a conflict answer: by an agent, which app, and what it did. */
+    updatedByAgent: v.optional(v.boolean()),
+    updatedByClient: v.optional(v.string()),
+    updateSummary: v.optional(v.string()),
+  }).index("by_board_card_kind", ["boardId", "generation", "cardId", "kind"]).index("by_updatedBy", ["updatedBy"]),
 
   /**
    * One small row per history version: what happened, who and when. Its
@@ -144,7 +196,7 @@ export default defineSchema({
     clientName: v.union(v.string(), v.null()),
     at: v.string(),
     summary: v.string(),
-  }).index("by_board_generation_card", ["boardId", "generation", "cardId"]),
+  }).index("by_board_generation_card", ["boardId", "generation", "cardId"]).index("by_user", ["userId"]),
 
   /** Stored text per board generation, history included, in bytes as stored (see model/limits.ts). */
   boardSizes: defineTable({
@@ -166,6 +218,8 @@ export default defineSchema({
     invites: v.optional(v.number()),
     inviteEmails: v.optional(v.number()),
     keys: v.optional(v.number()),
+    /** Boards that came online today: new on the web, or taken online from a computer. */
+    boards: v.optional(v.number()),
   }).index("by_user_day", ["userId", "day"]).index("by_day", ["day"]),
 
   /** How a person appears to others on shared boards (name and picture from the sign-in account). */
@@ -175,7 +229,7 @@ export default defineSchema({
     imageUrl: v.optional(v.string()),
     email: v.optional(v.string()),
     updatedAt: v.string(),
-  }).index("by_userId", ["userId"]),
+  }).index("by_userId", ["userId"]).index("by_email", ["email"]),
 
   /**
    * Every credential (a machine sign-in, a remote agent's OAuth grant, a
@@ -184,7 +238,7 @@ export default defineSchema({
    */
   connections: defineTable({
     userId: v.string(),
-    kind: v.union(v.literal("dev"), v.literal("machine"), v.literal("oauth"), v.literal("key")),
+    kind: v.union(v.literal("dev"), v.literal("machine"), v.literal("oauth"), v.literal("key"), v.literal("web")),
     name: v.string(),
     clientName: v.string(),
     /** SHA-256 of the bearer secret, for kinds Planban issues itself. */
@@ -207,9 +261,25 @@ export default defineSchema({
     serviceOrigin: v.optional(v.string()),
     /** Access credentials are aliases of an independently revocable grant. */
     oauthConnectionId: v.optional(v.id("connections")),
-  }).index("by_tokenHash", ["tokenHash"]).index("by_user", ["userId"]).index("by_user_client", ["userId", "oauthClientId"])
+    /** A browser session (kind web): the Clerk session it was enrolled from, and when Clerk last confirmed it. */
+    clerkSessionId: v.optional(v.string()),
+    clerkCheckedAt: v.optional(v.string()),
+    /** When Clerk will end that session (milliseconds), so its barrier can outlast it. */
+    clerkExpiresAt: v.optional(v.number()),
+  }).index("by_tokenHash", ["tokenHash"]).index("by_clerkSession", ["clerkSessionId"]).index("by_user", ["userId"]).index("by_user_client", ["userId", "oauthClientId"])
     // Every credential a person hasn't revoked, however much revoked history they have.
     .index("by_user_revoked", ["userId", "revokedAt"]),
+
+  /**
+   * Clerk sessions whose browser session was signed out or revoked. Enrolling
+   * from one again is refused, so getting back in needs a fresh sign-in.
+   */
+  webSessionBarriers: defineTable({
+    clerkSessionId: v.string(),
+    createdAt: v.number(),
+    /** Removed after this moment (milliseconds), once the Clerk session can no longer be live. */
+    until: v.number(),
+  }).index("by_clerkSession", ["clerkSessionId"]).index("by_until", ["until"]),
 
   /** Explicit consent, frozen client/redirect/resource/PKCE and one-use code. */
   oauthRequests: defineTable({
@@ -221,13 +291,15 @@ export default defineSchema({
     expiresAt: v.number(), userId: v.optional(v.string()), sessionId: v.optional(v.string()),
     approverConnectionId: v.optional(v.id("connections")),
     connectionId: v.optional(v.id("connections")), codeHash: v.optional(v.string()), codeExpiresAt: v.optional(v.number()),
-  }).index("by_requestHash", ["requestHash"]).index("by_launchHash", ["launchHash"]).index("by_codeHash", ["codeHash"]).index("by_expiry", ["expiresAt"]),
+    /** One-tap approval: SHA-256 of the device code the waiting agent polls with. */
+    deviceHash: v.optional(v.string()),
+  }).index("by_requestHash", ["requestHash"]).index("by_deviceHash", ["deviceHash"]).index("by_launchHash", ["launchHash"]).index("by_codeHash", ["codeHash"]).index("by_expiry", ["expiresAt"]).index("by_user", ["userId"]),
 
   /** Rotating refresh family, including spent hashes for replay detection. */
   oauthRefresh: defineTable({
     tokenHash: v.string(), connectionId: v.id("connections"), clientId: v.string(), resource: v.string(),
     scopes: v.array(v.string()), expiresAt: v.number(), usedAt: v.optional(v.number()),
-  }).index("by_tokenHash", ["tokenHash"]),
+  }).index("by_tokenHash", ["tokenHash"]).index("by_connection", ["connectionId"]),
 
   /**
    * A reviewed client's metadata document, already validated, kept for an
@@ -238,6 +310,13 @@ export default defineSchema({
   }).index("by_clientId", ["clientId"]),
 
   /** Bounded authorization request creation per client and time bucket. */
+  /**
+   * Sign-in approvals per person per hour (the stateless sign-in start): a
+   * person's own limit, which no one else can use up.
+   */
+  signInApprovals: defineTable({ userId: v.string(), hour: v.number(), count: v.number() })
+    .index("by_user_hour", ["userId", "hour"]).index("by_hour", ["hour"]),
+
   oauthUsage: defineTable({ clientId: v.string(), bucket: v.number(), requests: v.number(), fetches: v.optional(v.number()) })
     .index("by_client_bucket", ["clientId", "bucket"]).index("by_bucket", ["bucket"]),
 
@@ -289,7 +368,7 @@ export default defineSchema({
     uid: v.optional(v.string()),
     createdAt: v.string(),
     updatedAt: v.string(),
-  }).index("by_transferId", ["transferId"]).index("by_board_state", ["boardId", "state"]).index("by_state_updated", ["state", "updatedAt"]),
+  }).index("by_transferId", ["transferId"]).index("by_board_state", ["boardId", "state"]).index("by_state_updated", ["state", "updatedAt"]).index("by_user", ["userId"]),
 
   transferParts: defineTable({
     transferId: v.string(),
@@ -309,6 +388,26 @@ export default defineSchema({
     outcome: v.bytes(),
     createdAt: v.string(),
   }).index("by_user_key", ["userId", "key"]).index("by_createdAt", ["createdAt"]),
+
+  /**
+   * Deletions still being carried out (owner decisions, 15 October 2026): a
+   * board's online copy, or a whole account. Removed once nothing is left;
+   * a daily sweep finishes any that stalled. See erasure.ts.
+   */
+  erasures: defineTable({
+    kind: v.union(v.literal("board"), v.literal("account")),
+    /** A board: its id, reserved until every row under it is gone. */
+    boardId: v.optional(v.string()),
+    /** An account: whose, the boards they owned, and whether their sign-in account (Clerk) is deleted. */
+    userId: v.optional(v.string()),
+    ownedBoards: v.optional(v.array(v.string())),
+    clerkDeleted: v.optional(v.boolean()),
+    /** Where the removal has got to, and a page cursor within that step. */
+    stage: v.string(),
+    cursor: v.optional(v.union(v.string(), v.null())),
+    requestedAt: v.string(),
+    doneAt: v.optional(v.string()),
+  }).index("by_kind", ["kind"]).index("by_user", ["userId"]).index("by_board", ["boardId"]),
 
   /** Counters shared across boards. Generations are numbered globally so rows of a deleted and re-created board never collide. */
   counters: defineTable({

@@ -7,7 +7,18 @@ import { spawn } from "node:child_process";
 import { urlOpener } from "../openUrl";
 import { serviceUrl, saveCredentials } from "./credentials";
 import { onlineRequest } from "./client";
+import { rememberIdentity } from "./accounts";
+import { readCredentials } from "./credentials";
 import { PlanbanValidationError } from "../boardOperations";
+import { PLANBAN_VERSION_HEADER } from "../clientVersion";
+import { PLANBAN_VERSION } from "../version";
+
+// Sign-in requests name this Planban's version too, like every other request (16 October 2026).
+const fetch: typeof globalThis.fetch = (input, init = {}) => {
+  const headers = new Headers(init.headers);
+  headers.set(PLANBAN_VERSION_HEADER, PLANBAN_VERSION);
+  return globalThis.fetch(input, { ...init, headers });
+};
 
 export interface LoginOptions {
   /** Development sign-in only: a connection limited to one board. */
@@ -18,6 +29,20 @@ export interface LoginOptions {
   devUser?: string | undefined;
   /** Sign in with a personal access key held in this environment variable. */
   keyEnv?: string | undefined;
+  /**
+   * One-tap approval: show a link (and the code to compare) that a signed-in
+   * person approves on any device. The link opens in this computer's browser
+   * unless printOnly is set.
+   */
+  device?: boolean | undefined;
+  printOnly?: boolean | undefined;
+  /**
+   * Sign in even though another account is signed in to this service on this
+   * computer: that account is signed out here (owner request, 15 October 2026).
+   */
+  switchAccount?: boolean | undefined;
+  /** Tests only: how long to wait between checks, instead of the service's interval (at least 5 seconds). */
+  pollIntervalMs?: number | undefined;
 }
 
 async function keyLogin(url: string, variable: string) {
@@ -26,7 +51,7 @@ async function keyLogin(url: string, variable: string) {
   if (!/^pbk_[A-Za-z0-9_-]{20,}$/.test(key)) throw new PlanbanValidationError(`Environment variable ${variable} does not hold a Planban personal access key.`);
   // Keys do not refresh; they last until revoked or until their expiry.
   await saveCredentials(url, { clientId: "key", accessToken: key, refreshToken: "", expiresAt: "9999-12-31T00:00:00.000Z" });
-  return { url, signedIn: true, identity: await onlineRequest<unknown>(url, "/api/v1/me") };
+  return { url, signedIn: true, identity: await rememberIdentity(url) };
 }
 
 /**
@@ -68,7 +93,7 @@ async function devLogin(url: string, options: LoginOptions) {
   const { token } = await response.json() as { token: string };
   // Development tokens do not expire or refresh; signing out revokes them.
   await saveCredentials(url, { clientId: "dev", accessToken: token, refreshToken: "", expiresAt: "9999-12-31T00:00:00.000Z", person: options.devUser });
-  return { url, signedIn: true, identity: await onlineRequest<unknown>(url, "/api/v1/me"), ...await staleCopiesAfterSignIn() };
+  return { url, signedIn: true, identity: await rememberIdentity(url), ...await staleCopiesAfterSignIn() };
 }
 
 async function openBrowser(url: string, signal: AbortSignal) {
@@ -134,6 +159,7 @@ async function signInEndpoints(url: string) {
   return {
     issuer, clientId: config.cliClientId, ports: config.redirectPorts, scope: config.scope,
     start: endpoint("planban_machine_start_endpoint")!, cancel: endpoint("planban_machine_cancel_endpoint")!, authorize: endpoint("authorization_endpoint")!, token: endpoint("token_endpoint")!, revoke: endpoint("revocation_endpoint", false),
+    device: endpoint("device_authorization_endpoint", false),
   };
 }
 
@@ -184,7 +210,27 @@ async function callbackListener(ports: number[], state: string, issuer: string, 
  * independently revoked on sign-out or after 90 days unused. No provider
  * access or refresh credentials are exchanged or retained.
  */
+/**
+ * Signs this computer in as an account. Several accounts can be signed in at
+ * once (owner decision, 15 October 2026): a new one is added beside the
+ * others and becomes the default for boards taken online or attached from
+ * now on; boards already linked keep their own account.
+ */
 export async function onlineLogin(urlInput: string, options: LoginOptions = {}) {
+  const url = serviceUrl(urlInput);
+  // Only for the note below; a damaged credentials file is reported by the sign-in itself.
+  const before = (await readCredentials().catch(() => null))?.accounts[url];
+  const result = await signIn(url, options) as { identity?: { account?: { email?: string; person?: string } } } & Record<string, unknown>;
+  const added = result.identity?.account;
+  const others = Object.entries(before?.accounts ?? {}).filter(([id]) => id !== added?.person).map(([, credentials]) => credentials.email ?? "another account");
+  if (!others.length) return result;
+  return {
+    ...result,
+    note: `Added ${added?.email ?? "this account"} beside ${others.join(", ")}, which ${others.length === 1 ? "stays" : "stay"} signed in here. Boards linked to ${others.length === 1 ? "it" : "them"} keep using ${others.length === 1 ? "it" : "them"}; boards you take online or attach from now on use ${added?.email ?? "this account"} (change with planban online switch).`,
+  };
+}
+
+async function signIn(urlInput: string, options: LoginOptions) {
   const url = serviceUrl(urlInput);
   if (options.access === "board" && !options.boards?.trim()) throw new PlanbanValidationError("Board access requires --boards.");
   if (!options.devUser && (options.access === "board" || options.boards)) {
@@ -193,6 +239,7 @@ export async function onlineLogin(urlInput: string, options: LoginOptions = {}) 
   if (options.devUser) return devLogin(url, options);
   if (options.keyEnv) return keyLogin(url, options.keyEnv);
   const server = await signInEndpoints(url);
+  if (options.device || options.printOnly) return deviceLogin(url, server, options);
   const verifier = randomBytes(32).toString("base64url");
   const state = randomBytes(32).toString("base64url");
   let deadline = 0, launch = "", redeemedToken = "", saved = false;
@@ -210,11 +257,13 @@ export async function onlineLogin(urlInput: string, options: LoginOptions = {}) 
     const start = await within(fetch(server.start, {
       method: "POST", redirect: "error", signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
       body: new URLSearchParams({ client_id: server.clientId, redirect_uri: callback.redirectUri, scope: server.scope,
-        code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256", resource: url, state }),
+        code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256", resource: url, state,
+        // Ask for the stateless start (a signed launch note, stored nowhere); an older service ignores this.
+        stateless: "1" }),
     }));
     const lease = await within(boundedJson(start)) as { launch?: string; launchUrl?: string; serverNow?: number; expiresAt?: number };
     const remaining = Number(lease.expiresAt) - Number(lease.serverNow);
-    if (!start.ok || !Number.isSafeInteger(lease.expiresAt) || !Number.isSafeInteger(lease.serverNow) || !(remaining > 0 && remaining <= 300_000) || !/^pbl_[A-Za-z0-9_-]{43}$/.test(lease.launch ?? "") || lease.launchUrl !== `${server.issuer}/oauth/machine/launch?launch=${lease.launch}`) throw new Error("The service did not issue a valid bounded sign-in request.");
+    if (!start.ok || !Number.isSafeInteger(lease.expiresAt) || !Number.isSafeInteger(lease.serverNow) || !(remaining > 0 && remaining <= 300_000) || !(/^pbl_[A-Za-z0-9_-]{43}$/.test(lease.launch ?? "") || (/^pbn_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(lease.launch ?? "") && lease.launch!.length <= 7000)) || lease.launchUrl !== `${server.issuer}/oauth/machine/launch?launch=${lease.launch}`) throw new Error("The service did not issue a valid bounded sign-in request.");
     launch = lease.launch!;
     // The reply arrives after serverNow. Waiting its remaining duration from receipt
     // is an upper bound on service expiry, independent of the local wall clock.
@@ -233,7 +282,7 @@ export async function onlineLogin(urlInput: string, options: LoginOptions = {}) 
     checkDeadline();
     await saveCredentials(url, { clientId: "machine", accessToken: redeemedToken, refreshToken: "", expiresAt: "9999-12-31T00:00:00.000Z", ...(tokens.user_id ? { person: tokens.user_id } : {}) });
     saved = true;
-    return { url, signedIn: true, identity: await onlineRequest<unknown>(url, "/api/v1/me"), ...await staleCopiesAfterSignIn() };
+    return { url, signedIn: true, identity: await rememberIdentity(url), ...await staleCopiesAfterSignIn() };
   } finally {
     clearTimeout(timeout);
     controller.abort(new Error("The sign-in attempt ended."));
@@ -247,4 +296,46 @@ export async function onlineLogin(urlInput: string, options: LoginOptions = {}) 
       await fetch(server.revoke, { method: "POST", redirect: "error", signal: AbortSignal.timeout(2000), body: new URLSearchParams({ client_id: server.clientId, token: redeemedToken }) }).catch(() => undefined);
     }
   }
+}
+
+/**
+ * One-tap approval (Planban 2.0): ask for a code, show the approval link and
+ * the code to compare, open the link in this computer's browser unless asked
+ * not to, and wait while the person approves on any signed-in device.
+ */
+async function deviceLogin(url: string, server: Awaited<ReturnType<typeof signInEndpoints>>, options: LoginOptions) {
+  if (!server.device) throw new PlanbanValidationError("This Online Board service can't approve sign-ins by link yet. Update it, or sign in on a computer with a browser.");
+  const asked = await fetch(server.device, {
+    method: "POST", redirect: "error", signal: AbortSignal.timeout(10_000),
+    body: new URLSearchParams({ client_id: server.clientId, scope: server.scope, resource: url }),
+  });
+  const code = await boundedJson(asked).catch(() => ({})) as { device_code?: string; user_code?: string; verification_uri_complete?: string; expires_in?: number; interval?: number };
+  const link = code.verification_uri_complete ?? "";
+  if (!asked.ok || !/^pbv_[A-Za-z0-9_-]{43}$/.test(code.device_code ?? "") || !/^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(code.user_code ?? "")
+    || !link.startsWith(`${server.issuer}/approve#request=`) || !Number.isSafeInteger(code.expires_in) || !(code.expires_in! > 0 && code.expires_in! <= 600)) {
+    throw new Error("The service did not issue a valid sign-in link.");
+  }
+  process.stderr.write(`To sign this computer in to Planban, open this link on any device where you're signed in, check the code is ${code.user_code}, and choose Allow:\n${link}\n`);
+  if (!options.printOnly) {
+    const opening = options.openBrowser ? options.openBrowser(link) : openBrowser(link, AbortSignal.timeout(10_000));
+    await opening.catch(() => undefined);
+  }
+  const deadline = Date.now() + code.expires_in! * 1000;
+  let interval = options.pollIntervalMs ?? Math.max(5, Number(code.interval) || 5) * 1000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, interval));
+    const polled = await fetch(server.token, {
+      method: "POST", redirect: "error", signal: AbortSignal.timeout(30_000),
+      body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: code.device_code!, client_id: server.clientId, resource: url }),
+    }).catch(() => null);
+    if (!polled) continue;
+    const tokens = await boundedJson(polled).catch(() => ({})) as { access_token?: string; token_type?: string; scope?: string; user_id?: string; error?: string };
+    if (tokens.error === "authorization_pending") continue;
+    if (tokens.error === "slow_down") { interval += 5000; continue; }
+    if (tokens.error === "access_denied") throw new Error("The sign-in was denied.");
+    if (!polled.ok || !/^pbm_[A-Za-z0-9_-]{43}$/.test(tokens.access_token ?? "") || tokens.token_type !== "Bearer" || tokens.scope !== "planban:machine") throw new Error("The sign-in link expired or failed. Run login again.");
+    await saveCredentials(url, { clientId: "machine", accessToken: tokens.access_token!, refreshToken: "", expiresAt: "9999-12-31T00:00:00.000Z", ...(tokens.user_id ? { person: tokens.user_id } : {}) });
+    return { url, signedIn: true, identity: await rememberIdentity(url), ...await staleCopiesAfterSignIn() };
+  }
+  throw new Error("The sign-in link expired before anyone approved it. Run login again.");
 }

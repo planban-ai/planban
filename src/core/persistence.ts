@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { PlanbanConflictError } from "./boardOperations";
+import { PlanbanBoardMovedError, PlanbanConflictError } from "./boardOperations";
 
 export const LOCK_DIR = ".planban-write.lock";
 const IDEMPOTENCY_FILE = ".idempotency.json";
@@ -404,14 +404,61 @@ function pruneIdempotencyRecords(records: IdempotencyRecord[]) {
     .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
 }
 
+/**
+ * The board's retry records merged into those where it will be kept next
+ * (Take Online), each with the meaning it has here: a completed record
+ * returns its saved answer, and a pending one (its writer may have died
+ * after making the change) refuses a retry until it expires, as here.
+ * For the same scope and key on both sides, a completed record beats a
+ * pending one and two completed ones count as one; records of different
+ * requests are listed as clashes.
+ */
+function mergeIdempotencyRecords(target: IdempotencyRecord[], incoming: IdempotencyRecord[]) {
+  const records = [...target];
+  const clashes: IdempotencyRecord[] = [];
+  for (const record of incoming) {
+    const index = records.findIndex((existing) => existing.scope === record.scope && existing.key === record.key);
+    if (index < 0) records.push(record);
+    else if (records[index]!.fingerprint !== record.fingerprint) clashes.push(record);
+    else if (!("response" in records[index]!) && "response" in record) records[index] = record;
+  }
+  return { records: pruneIdempotencyRecords(records), clashes };
+}
+
+/** Refuses a Take Online, before anything changes, if a retry key here and where the board goes next names different requests. */
+export async function checkIdempotencyCarry(fromRoot: string, toRoot: string) {
+  const { clashes } = mergeIdempotencyRecords((await readIdempotencyStore(toRoot)).records, (await readIdempotencyStore(fromRoot)).records);
+  if (clashes.length) {
+    throw new PlanbanConflictError(`This board can't be taken online yet: the retry key ${clashes.map((record) => `"${record.key}" (${record.scope})`).join(", ")} was used for a different request on this board and on this computer's copy of the online board. Nothing has changed, and the board is still on this computer. Try again once that key has expired, within a day.`);
+  }
+}
+
+/** Carries the board's retry records to where it will be kept next (see mergeIdempotencyRecords). Safe to repeat. */
+export async function carryIdempotencyRecords(fromRoot: string, toRoot: string) {
+  const incoming = (await readIdempotencyStore(fromRoot)).records;
+  if (!incoming.length) return;
+  await withBoardWriteLock(toRoot, async () => {
+    // A clash found only now (after the check, before the switch) keeps the record already there.
+    const { records } = mergeIdempotencyRecords((await readIdempotencyStore(toRoot)).records, incoming);
+    await writeIdempotencyStore(toRoot, { version: 1, records });
+  });
+}
+
 export async function runIdempotentBoardMutation<T>(input: {
   planningRoot: string;
   idempotencyKey?: string | undefined;
   scope: string;
   fingerprint: string;
+  /**
+   * Checked once the board is held, before the key is looked up or claimed:
+   * false when the board moved while this waited, so the key belongs with the
+   * board's new home (PlanbanBoardMovedError; nothing is recorded here).
+   */
+  stillHere?: () => Promise<boolean>;
   run: () => Promise<T>;
 }): Promise<{ replayed: boolean; value: T }> {
   return withBoardWriteLock(input.planningRoot, async () => {
+    if (input.stillHere && !(await input.stillHere())) throw new PlanbanBoardMovedError();
     const key = input.idempotencyKey?.trim();
     if (!key) return { replayed: false, value: await input.run() };
 

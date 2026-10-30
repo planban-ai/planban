@@ -12,7 +12,11 @@ test("the accepted board and detail simplification remains visible in the produc
     readFile(stylesPath, "utf8"),
   ]);
 
-  assert.match(web, /label="All Boards"/u);
+  // One-line board header (owner decision, 16 October 2026): the card stack back to all
+  // boards, no breadcrumb and no separate row with a house button.
+  assert.match(web, /label="Your boards" tooltipPlacement="bottom" className="board-home-mark"[\s\S]*?<CardStackMark \/>/u);
+  assert.doesNotMatch(web, /web-crumb|board-home-row|<Home size/u);
+  assert.match(web, /!capabilities\.hosted && updateStatus\?\.updateAvailable/u);
   assert.match(web, /"See all Items"/u);
   assert.match(web, /"Return to Main Board"/u);
   assert.match(web, /function BoardMoreMenu/u);
@@ -31,7 +35,9 @@ test("the accepted board and detail simplification remains visible in the produc
   assert.match(styles, /\.board-screen > \.app-header\s*\{[^}]*padding-left:\s*16px;/su);
   assert.match(styles, /button\.content-edit-action\s*\{[^}]*width:\s*28px;[^}]*height:\s*28px;/su);
   assert.doesNotMatch(styles, /button\.content-edit-action:hover\s*\{[^}]*border-color:/su);
-  assert.match(styles, /\.group-placement-modal \.version-change-trigger\.label-outside\s*\{[^}]*width:\s*100%;/su);
+  // One Planban dropdown everywhere (Planban 2.0, approved mockup section 11).
+  assert.match(web, /function PlanbanSelectMenu[\s\S]*?<Dropdown/u);
+  assert.doesNotMatch(web, /<select\b/u);
   assert.match(web, /className="empty-drop hidden-cards-state"/u);
   assert.match(styles, /\.hidden-cards-state > span\s*\{[^}]*border-radius:\s*999px;/su);
   assert.match(styles, /\.update-available-button\s*\{[^}]*border-radius:\s*999px;[^}]*background:\s*var\(--accent\);[^}]*color:\s*#fff;/su);

@@ -2,6 +2,8 @@
 // card showing who last changed it, with a small robot when their agent did,
 // and the people list with what each person's agents may do. Names and
 // pictures come from the person's sign-in account at Clerk.
+import { packed } from "./model/codec";
+import { workingOn } from "./model/presence";
 import { v } from "convex/values";
 import { internal } from "./_generated/api";
 import { internalAction, internalMutation, internalQuery } from "./_generated/server";
@@ -10,6 +12,7 @@ import { agentLevel } from "./schema";
 import { boardAccess, memberAgentLevel, roleLevel } from "./model/access";
 import { fail } from "./model/errors";
 import type { CardChange } from "./model/cardChanges";
+import { accountBeingDeleted } from "./model/erasureGate";
 
 /** Fetches a person's name and picture from Clerk. Development sign-ins have none. */
 export const refresh = internalAction({
@@ -36,8 +39,10 @@ export const refresh = internalAction({
 export const store = internalMutation({
   args: { userId: v.string(), name: v.string(), imageUrl: v.optional(v.string()), email: v.optional(v.string()) },
   handler: async (ctx, profile) => {
+    // A profile is never written back for an account being deleted.
+    if (await accountBeingDeleted(ctx, profile.userId)) return;
     const existing = await ctx.db.query("people").withIndex("by_userId", (q) => q.eq("userId", profile.userId)).unique();
-    const row = { ...profile, imageUrl: profile.imageUrl, email: profile.email, updatedAt: new Date().toISOString() };
+    const row = { ...profile, imageUrl: profile.imageUrl, email: profile.email?.toLowerCase(), updatedAt: new Date().toISOString() };
     if (existing) await ctx.db.patch(existing._id, row);
     else await ctx.db.insert("people", row);
   },
@@ -73,7 +78,13 @@ export const forBoard = internalQuery({
     for (const row of await ctx.db.query("cardChanges").withIndex("by_board_generation_card", (q) => q.eq("boardId", boardId).eq("generation", access.board.generation)).collect()) {
       cards[row.cardId] = { userId: row.userId, agent: row.agent, clientName: row.clientName, at: row.at, summary: row.summary };
     }
-    return { shared: members.length > 1, people, cards };
+    // Agents working on each card now: a quiet sign for people (Spec point 20).
+    const working: Record<string, Array<{ userId: string; app: string; startedAt: string }>> = {};
+    for (const [cardId, entries] of Object.entries(await workingOn(ctx, { boardId, generation: access.board.generation }))) {
+      working[cardId] = entries.map(({ userId, app, startedAt }) => ({ userId, app, startedAt }));
+    }
+    // Keyed by card: a board can have more than Convex's 1,024 fields per object, so it travels packed.
+    return packed({ shared: members.length > 1, people, cards, working });
   },
 });
 

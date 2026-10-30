@@ -22,9 +22,12 @@ import {
   resolveInsideRoot,
   slugify,
   protocolDir,
+  hasLiveRoadmap,
+  isRetiredRoadmap,
   roadmapPath,
 } from "./paths";
-import { appendLineDurably, atomicWriteFile, withBoardWriteLock } from "./persistence";
+import { planbanCommand } from "./command";
+import { appendLineDurably, atomicWriteFile, idempotencyFingerprint, runIdempotentBoardMutation, withBoardWriteLock } from "./persistence";
 import { buildAgentContext, PLANBAN_INSTALL_URL } from "./protocol";
 import { resolvePlanbanProjectDir } from "../../plugins/planban/scripts/project-dir.mjs";
 import { registerBoardFromState } from "./registry";
@@ -43,20 +46,25 @@ import { currentVersionInfo } from "./version";
 import { flattenRoadmapForVersion1, hierarchyRecoveryManifest } from "./hierarchyMigration";
 import { loadOnlineState, onlineCacheRoot, onlineOperation, onlineState, refuseOnline } from "./online/adapter";
 import { boardPath, onlineRequest } from "./online/client";
+import { cardSubject, changesSince, conflictMessage, lastDocChange, MAX_CONFLICT_DOCUMENT_CHARS, PlanbanEditConflictError, RECONCILE, type ConflictDetails } from "./conflicts";
+import { editSection, sectionList } from "./docSections";
 import { assertNotStaleCopy, checkInBackground, ONLINE_NOTE, STALE_MARKER } from "./online/copyCheck";
 import { credentialsPath } from "./online/credentials";
 import { ensureBoardIdentity } from "./boardIdentity";
 import type { PlanbanHistoryPayload } from "./types";
 import { assertCardsHoldNoFiles, cardFolder, cardsHoldingFiles, PlanbanCardHoldsFilesError } from "./cardFiles";
 import { checkIndexCard, checkIndexDocument, checkIndexText, checkIndexValue, MAX_DETAILS_BYTES } from "./contentRules";
+import { appName } from "./agentNames";
+import { addSuggestion, applyGoalEdit, assertGoalsSize, decideSuggestion, emptyGoals, goalsBlock, goalsPage, normalizeGoals, PEOPLE_ONLY, type GoalsFile, type GoalsPage } from "./goals";
 
-import {
+import { assertCompletionConfirmed,
   assertBaseRevision as assertRoadmapBaseRevision,
   assertCommittable,
   committedRoadmap,
   createEmptyRoadmap as createEmptyRoadmapAt,
   normalizeColumnPriorities,
   normalizeRoadmap,
+  PlanbanBoardMovedError,
   PlanbanConflictError,
   PlanbanNotFoundError,
   PlanbanValidationError,
@@ -77,6 +85,7 @@ export {
   cardAncestry,
   defaultColumns,
   normalizeRoadmap,
+  PlanbanBoardMovedError,
   PlanbanConflictError,
   PlanbanNotFoundError,
   PlanbanValidationError,
@@ -92,8 +101,36 @@ export async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function assertBaseRevision(state: PlanbanResolvedState, baseRevision?: number) {
-  assertRoadmapBaseRevision(state.roadmap, baseRevision);
+/**
+ * A stale edit is refused with what changed since, who changed it on this
+ * computer, and the card as it is now, as on an online board (owner
+ * requirement, 15 October 2026).
+ */
+async function assertBaseRevision(state: PlanbanResolvedState, baseRevision?: number, cardId?: string, actor?: string) {
+  if (baseRevision === undefined || baseRevision === state.roadmap.revision) return assertRoadmapBaseRevision(state.roadmap, baseRevision);
+  // An invalid number is still a validation error.
+  assertRoadmapBaseRevision({ ...state.roadmap, revision: baseRevision }, baseRevision);
+  const { listHistory } = await import("./history");
+  const entries = (await listHistory(state).catch(() => null))?.entries ?? [];
+  const conflict: ConflictDetails = {
+    currentRevision: state.roadmap.revision, yourRevision: baseRevision,
+    changes: changesSince(entries, baseRevision, localAuthor),
+    ...(cardId ? { card: state.roadmap.roadmapItems.find((item) => item.id === cardId) ?? null } : {}),
+  };
+  throw new PlanbanEditConflictError(conflictMessage(cardSubject(state.roadmap, cardId), conflict, actor === "agent"), conflict);
+}
+
+/** A Spec or Plan changed since it was read: the document as it is now, and who last changed it. */
+async function documentConflict(state: PlanbanResolvedState, cardId: string, kind: "spec" | "plan", document: NonNullable<ConflictDetails["document"]>, actor?: string) {
+  const { listHistory } = await import("./history");
+  const entries = (await listHistory(state).catch(() => null))?.entries ?? [];
+  const conflict: ConflictDetails = { currentRevision: state.roadmap.revision, changes: changesSince(lastDocChange(entries, cardId, kind), undefined, localAuthor), document };
+  return new PlanbanEditConflictError(conflictMessage(`the ${kind === "spec" ? "Spec" : "Plan"} of ${cardSubject(state.roadmap, cardId)}`, conflict, actor === "agent"), conflict);
+}
+
+/** Who made a change on a local board, as a person would say it. */
+function localAuthor(entry: { actor: string }) {
+  return entry.actor === "agent" ? "an agent on this computer" : entry.actor === "user" ? "someone on this computer" : "Planban";
 }
 
 // Fields that only record a card's place or the time it was touched. Renumbering
@@ -207,17 +244,44 @@ export async function refuseForOnline(cwd: string, operation: string) {
   if (await onlineManifest(cwd)) refuseOnline(operation);
 }
 
+export { RETIRED_ROADMAP } from "./paths";
+
+/** Sends a write that met PlanbanBoardMovedError again, to wherever the board lives now. */
+export const againIfMoved = <T>(again: () => Promise<T>) => (error: unknown): Promise<T> =>
+  error instanceof PlanbanBoardMovedError ? again() : Promise.reject(error);
+
 export async function withRoadmapWriteLock<T>(cwdInput: string, callback: () => Promise<T>): Promise<T> {
   const cwd = resolveProjectCwd(cwdInput);
   const manifest = await readManifest(cwd);
   if (!manifest || !manifest.enabled) {
     throw new Error(`Planban is not initialized in ${cwd}`);
   }
+  // Every caller is a local write. A project that points online now moved
+  // after the caller chose the local path: nothing may run against the
+  // online board's cache folder.
+  if (manifest.storage?.kind === "online") throw new PlanbanBoardMovedError();
   const planningRoot = resolvePlanningRoot(manifest);
-  if (manifest.storage?.kind !== "online") await guardLocalCopy(planningRoot, cwd, manifest.repoId);
+  await guardLocalCopy(planningRoot, cwd, manifest.repoId);
   // A card write takes the board first, before writing anything, so it can
   // give up cleanly if another process is stuck holding the board.
-  return withBoardWriteLock(planningRoot, callback, { giveUp: true });
+  return withBoardWriteLock(planningRoot, async () => {
+    // The board may have moved while this write waited for it: the project
+    // now points elsewhere, so nothing is written here.
+    if (!(await stillLocalAt(cwd, planningRoot))) throw new PlanbanBoardMovedError();
+    return callback();
+  }, { giveUp: true });
+}
+
+/** Where this project's board is kept on this computer (an online board's cache folder), or null. */
+export async function boardPlanningRoot(cwdInput: string): Promise<string | null> {
+  const manifest = await readManifest(resolveProjectCwd(cwdInput));
+  return manifest?.enabled ? resolvePlanningRoot(manifest) : null;
+}
+
+/** True while this project's board is a local board kept at planningRoot. */
+export async function stillLocalAt(cwd: string, planningRoot: string): Promise<boolean> {
+  const now = await readManifest(cwd);
+  return !!now?.enabled && now.storage?.kind !== "online" && resolvePlanningRoot(now) === planningRoot;
 }
 
 /**
@@ -251,8 +315,8 @@ export async function loadState(cwdInput: string): Promise<PlanbanResolvedState>
 
   const planningRoot = resolvePlanningRoot(manifest);
   const liveRoadmapPath = roadmapPath(planningRoot);
-  if (!(await pathExists(liveRoadmapPath))) {
-    throw new Error(`Planban roadmap is missing at ${liveRoadmapPath}`);
+  if (!(await hasLiveRoadmap(planningRoot))) {
+    throw new Error(await missingRoadmapMessage(cwd, planningRoot));
   }
 
   const state = {
@@ -267,6 +331,21 @@ export async function loadState(cwdInput: string): Promise<PlanbanResolvedState>
   await ensureHistoryBaseline(state);
   void checkLocalCopyInBackground(planningRoot).catch(() => undefined);
   return state;
+}
+
+/** Why a local board has no live roadmap; for one that moved online, where it went and how to follow it. */
+async function missingRoadmapMessage(cwd: string, planningRoot: string) {
+  const missing = `Planban roadmap is missing at ${roadmapPath(planningRoot)}`;
+  // A Take Online that has not finished: the board here is shut until it is finished or stopped.
+  const moving = await readFile(join(planningRoot, "online-transfer.json"), "utf8").then((text) => JSON.parse(text) as { direction?: string; url?: string }, () => null);
+  if (moving?.direction === "online" && await isRetiredRoadmap(roadmapPath(planningRoot))) {
+    return `This board is partway through moving online${moving.url ? ` to ${moving.url}` : ""}, so it can't be changed on this computer: a change here would not reach the online board. Nothing was written. To finish the move, run: ${planbanCommand()} online take-online ${moving.url ?? "<url>"} --cwd "${cwd}". To cancel it instead: ${planbanCommand()} online stop-take-online --cwd "${cwd}".`;
+  }
+  const note = await readFile(join(planningRoot, "ONLINE-BOARD.txt"), "utf8").catch(() => null);
+  if (note === null && !(await isRetiredRoadmap(roadmapPath(planningRoot)))) return missing;
+  const moved = /Authority moved to (\S+), board ([^\s.]+)\./.exec(note ?? "");
+  const attach = moved ? ` To use it from this folder, run: ${planbanCommand()} online attach ${moved[1]} ${moved[2]} --cwd "${cwd}"` : "";
+  return `${missing}: this board moved online${moved ? ` to ${moved[1]}` : ""}, and the files here are kept only for recovery.${attach}`;
 }
 
 const AGENTS_BLOCK_START = "<!-- BEGIN PLANBAN -->";
@@ -286,13 +365,29 @@ If Planban tools (names ending in \`planban_<operation>\`) are unavailable in th
 ${AGENTS_BLOCK_END}`;
 }
 
+/**
+ * Brings an existing Planban block in AGENTS.md up to date, keeping everything
+ * around it; called when a board moves between local and online. A project
+ * without the block (never initialised with it, or opted out) is left alone.
+ */
+export async function refreshAgentsBlock(cwd: string): Promise<boolean> {
+  const agentsPath = join(cwd, "AGENTS.md");
+  if (!(await pathExists(agentsPath))) return false;
+  const existing = await readFile(agentsPath, "utf8");
+  if (!existing.includes(AGENTS_BLOCK_START) || !existing.includes(AGENTS_BLOCK_END)) return false;
+  const next = upsertManagedBlock(existing, buildAgentsBlock());
+  if (next === existing) return false;
+  await atomicWriteFile(agentsPath, next);
+  return true;
+}
+
 function upsertManagedBlock(existing: string, block: string): string {
   const start = existing.indexOf(AGENTS_BLOCK_START);
   const end = existing.indexOf(AGENTS_BLOCK_END);
   if (start >= 0 && end >= start) {
     const suffix = end + AGENTS_BLOCK_END.length;
     const before = existing.slice(0, start).trimEnd();
-    const after = existing.slice(suffix).trimStart();
+    const after = existing.slice(suffix).trim();
     return [before, block, after].filter(Boolean).join("\n\n") + "\n";
   }
   return existing.trimEnd().length > 0 ? `${existing.trimEnd()}\n\n${block}\n` : `${block}\n`;
@@ -367,16 +462,23 @@ export async function saveRoadmap(
     summary: "Saved roadmap",
     affectedCards: roadmap.roadmapItems.map((item) => item.id),
   },
+  /** Set only by a goals change, whose own pending file this write commits. */
+  options: { goalsChange?: boolean } = {},
 ) {
   if (state.manifest.storage?.kind === "online") refuseOnline("Raw roadmap saving");
   await guardLocalCopy(state.planningRoot, state.cwd, state.manifest.repoId);
   return withBoardWriteLock(state.planningRoot, async () => {
+  // A goals change that stopped part way is settled before any other write moves the
+  // board on, while its history entry is certainly still there to say whether it happened.
+  if (!options.goalsChange) await settleGoals(state.planningRoot, await readRoadmapRevision(state.planningRoot).catch(() => state.roadmap.revision));
   assertCommittable(roadmap);
   await assertIndexWrite(state, roadmap);
   if (history !== false) await ensureHistoryBaseline(state);
   const updated = committedRoadmap(roadmap, nowIso());
   await mkdir(dirname(state.roadmapPath), { recursive: true });
-  const originalRoadmap = await readFile(state.roadmapPath, "utf8");
+  const originalRoadmap = await readFile(state.roadmapPath, "utf8").catch(() => null);
+  // Read before the board moved online: its local copy is retired, so nothing is saved there.
+  if (originalRoadmap === null || await isRetiredRoadmap(state.roadmapPath)) throw new PlanbanBoardMovedError();
   await atomicWriteFile(state.roadmapPath, JSON.stringify(updated, null, 2) + "\n");
   try {
     if (history !== false) await recordHistoryVersion({ ...state, roadmap: updated }, updated, history);
@@ -424,29 +526,35 @@ async function commitWithDocs(state: PlanbanResolvedState, change: PlannedChange
 
 export async function moveCard(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   cardId: string;
   status?: PlanbanStatus | undefined;
   parentId?: string | null | undefined;
   afterId?: string | null | undefined;
   baseRevision?: number | undefined;
   actor?: PlanbanHistoryActor | undefined;
+  completionConfirmed?: boolean | undefined;
 }): Promise<PlanbanResolvedState> {
   const online = await onlineManifest(input.cwd);
   if (online) return (await onlineOperation(resolveProjectCwd(input.cwd), online, "moveCard", input)).state;
   return withRoadmapWriteLock(input.cwd, async () => {
   const state = await loadState(input.cwd);
-  assertBaseRevision(state, input.baseRevision);
+  await assertBaseRevision(state, input.baseRevision, (input as { cardId?: string }).cardId, (input as { actor?: string }).actor);
   const item = state.roadmap.roadmapItems.find((entry) => entry.id === input.cardId);
   if (!item) throw new PlanbanNotFoundError(`Card not found: ${input.cardId}`);
   await assertCardsHoldNoFiles(state.planningRoot, [item]);
   const change = planMoveCard(state.roadmap, input, { now: nowIso() });
+  assertCompletionConfirmed(state.roadmap, change.roadmap, input.actor, input.completionConfirmed);
   const roadmap = await saveRoadmap(state, change.roadmap, change.history);
   return { ...state, roadmap };
-  });
+  }).catch(againIfMoved(() => moveCard(input)));
 }
 
 export async function updateCard(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   cardId: string;
   baseRevision?: number | undefined;
   title?: string | undefined;
@@ -461,16 +569,18 @@ export async function updateCard(input: {
   if (online) return (await onlineOperation(resolveProjectCwd(input.cwd), online, "updateCard", input)).state;
   return withRoadmapWriteLock(input.cwd, async () => {
   const state = await loadState(input.cwd);
-  assertBaseRevision(state, input.baseRevision);
+  await assertBaseRevision(state, input.baseRevision, (input as { cardId?: string }).cardId, (input as { actor?: string }).actor);
   const change = planUpdateCard(state.roadmap, input, { now: nowIso() });
   await assertCardsHoldNoFiles(state.planningRoot, [state.roadmap.roadmapItems.find((item) => item.id === input.cardId)!]);
   const roadmap = await saveRoadmap(state, change.roadmap, change.history);
   return { ...state, roadmap };
-  });
+  }).catch(againIfMoved(() => updateCard(input)));
 }
 
 export async function setCardParent(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   cardId: string;
   parentId: string | null;
   baseRevision?: number | undefined;
@@ -485,6 +595,8 @@ export async function setCardStatus(cwd: string, cardId: string, status: Planban
 
 export async function deleteArchivedCard(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   cardId: string;
   baseRevision?: number | undefined;
 }): Promise<PlanbanResolvedState> {
@@ -492,32 +604,39 @@ export async function deleteArchivedCard(input: {
   if (online) return (await onlineOperation(resolveProjectCwd(input.cwd), online, "deleteArchivedCard", input)).state;
   return withRoadmapWriteLock(input.cwd, async () => {
   const state = await loadState(input.cwd);
-  assertBaseRevision(state, input.baseRevision);
+  await assertBaseRevision(state, input.baseRevision, (input as { cardId?: string }).cardId, (input as { actor?: string }).actor);
   const change = planDeleteArchivedCard(state.roadmap, input);
   const roadmap = await saveRoadmap(state, change.roadmap, change.history);
   await rm(itemRoot(state.planningRoot, input.cardId), { recursive: true, force: true });
   return { ...state, roadmap };
-  });
+  }).catch(againIfMoved(() => deleteArchivedCard(input)));
 }
 
 export async function reorderCards(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   items: Array<{ id: string; status: PlanbanStatus }>;
   baseRevision?: number | undefined;
+  actor?: PlanbanHistoryActor | undefined;
+  completionConfirmed?: boolean | undefined;
 }): Promise<PlanbanResolvedState> {
   const online = await onlineManifest(input.cwd);
   if (online) return (await onlineOperation(resolveProjectCwd(input.cwd), online, "reorderCards", input)).state;
   return withRoadmapWriteLock(input.cwd, async () => {
   const state = await loadState(input.cwd);
-  assertBaseRevision(state, input.baseRevision);
+  await assertBaseRevision(state, input.baseRevision, (input as { cardId?: string }).cardId, (input as { actor?: string }).actor);
   const change = planReorderCards(state.roadmap, input, { now: nowIso() });
+  assertCompletionConfirmed(state.roadmap, change.roadmap, input.actor, input.completionConfirmed);
   const roadmap = await saveRoadmap(state, change.roadmap, change.history);
   return { ...state, roadmap };
-  });
+  }).catch(againIfMoved(() => reorderCards(input)));
 }
 
 export async function createCard(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   title: string;
   status?: PlanbanStatus | undefined;
   summary?: string | undefined;
@@ -531,6 +650,7 @@ export async function createCard(input: {
   actor?: PlanbanHistoryActor | undefined;
   parentId?: string | null | undefined;
   baseRevision?: number | undefined;
+  completionConfirmed?: boolean | undefined;
 }): Promise<PlanbanResolvedState & { createdCard: PlanbanRoadmapItem }> {
   const online = await onlineManifest(input.cwd);
   if (online) {
@@ -539,22 +659,25 @@ export async function createCard(input: {
   }
   return withRoadmapWriteLock(input.cwd, async () => {
   const state = await loadState(input.cwd);
-  assertBaseRevision(state, input.baseRevision);
+  await assertBaseRevision(state, input.baseRevision, (input as { cardId?: string }).cardId, (input as { actor?: string }).actor);
   const change = planCreateCard(state.roadmap, input, {
     now: nowIso(),
     isIdReserved: await reservedItemIds(state.planningRoot),
   });
+  assertCompletionConfirmed(state.roadmap, change.roadmap, input.actor, input.completionConfirmed);
   if (input.specMarkdown !== undefined) checkIndexDocument(input.specMarkdown, input.title.trim(), "spec");
   if (input.planMarkdown !== undefined) checkIndexDocument(input.planMarkdown, input.title.trim(), "plan");
   await mkdir(itemRoot(state.planningRoot, change.cardId), { recursive: true });
   const roadmap = await commitWithDocs(state, change);
   const createdCard = roadmap.roadmapItems.find((entry) => entry.id === change.cardId)!;
   return { ...state, roadmap, createdCard };
-  });
+  }).catch(againIfMoved(() => createCard(input)));
 }
 
 export async function createGroup(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   title: string;
   summary?: string | undefined;
   nextAction?: string | undefined;
@@ -565,6 +688,7 @@ export async function createGroup(input: {
   planMarkdown?: string | undefined;
   baseRevision?: number | undefined;
   actor?: PlanbanHistoryActor | undefined;
+  completionConfirmed?: boolean | undefined;
 }): Promise<PlanbanResolvedState & { createdGroup: PlanbanRoadmapItem }> {
   const online = await onlineManifest(input.cwd);
   if (online) {
@@ -573,27 +697,31 @@ export async function createGroup(input: {
   }
   return withRoadmapWriteLock(input.cwd, async () => {
     const state = await loadState(input.cwd);
-    assertBaseRevision(state, input.baseRevision);
+    await assertBaseRevision(state, input.baseRevision, (input as { cardId?: string }).cardId, (input as { actor?: string }).actor);
     const change = planCreateGroup(state.roadmap, input, {
       now: nowIso(),
       isIdReserved: await reservedItemIds(state.planningRoot),
     });
+    assertCompletionConfirmed(state.roadmap, change.roadmap, input.actor, input.completionConfirmed);
     if (input.specMarkdown !== undefined) checkIndexDocument(input.specMarkdown, input.title.trim(), "spec");
     if (input.planMarkdown !== undefined) checkIndexDocument(input.planMarkdown, input.title.trim(), "plan");
     await mkdir(itemRoot(state.planningRoot, change.groupId), { recursive: true });
     const roadmap = await commitWithDocs(state, change);
     const createdGroup = roadmap.roadmapItems.find((item) => item.id === change.groupId)!;
     return { ...state, roadmap, createdGroup };
-  });
+  }).catch(againIfMoved(() => createGroup(input)));
 }
 
 export async function createCards(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   titles: string[];
   status?: PlanbanStatus | undefined;
   parentId?: string | null | undefined;
   baseRevision?: number | undefined;
   actor?: PlanbanHistoryActor | undefined;
+  completionConfirmed?: boolean | undefined;
   writeSpecFile?: ((path: string, markdown: string) => Promise<void>) | undefined;
 }): Promise<PlanbanResolvedState & { createdCards: PlanbanRoadmapItem[] }> {
   const online = await onlineManifest(input.cwd);
@@ -604,11 +732,12 @@ export async function createCards(input: {
   }
   return withRoadmapWriteLock(input.cwd, async () => {
     const state = await loadState(input.cwd);
-    assertBaseRevision(state, input.baseRevision);
+    await assertBaseRevision(state, input.baseRevision, (input as { cardId?: string }).cardId, (input as { actor?: string }).actor);
     const change = planCreateCards(state.roadmap, input, {
       now: nowIso(),
       isIdReserved: await reservedItemIds(state.planningRoot),
     });
+    assertCompletionConfirmed(state.roadmap, change.roadmap, input.actor, input.completionConfirmed);
     const transactionRoot = join(state.planningRoot, ".transactions", `create-cards-${randomUUID()}`);
     const publishedRoots: string[] = [];
     const writeSpecFile = input.writeSpecFile ?? atomicWriteFile;
@@ -638,7 +767,7 @@ export async function createCards(input: {
     await rm(transactionRoot, { recursive: true, force: true }).catch(() => undefined);
     const createdIds = new Set(change.cardIds);
     return { ...state, roadmap, createdCards: roadmap.roadmapItems.filter((item) => createdIds.has(item.id)) };
-  });
+  }).catch(againIfMoved(() => createCards(input)));
 }
 
 export function docPathForItem(state: PlanbanResolvedState, item: PlanbanRoadmapItem, kind: "spec" | "plan") {
@@ -715,6 +844,7 @@ export async function exportFlatVersion1(input: {
       specDoc: item.specDoc ? exportedDocPath(item.id, "spec") : null,
       planDoc: item.planDoc ? exportedDocPath(item.id, "plan") : null,
     }));
+    await settleGoals(state.planningRoot, state.roadmap.revision);
     const historyEntry = await recordHistoryVersion(state, state.roadmap, {
       actor: input.actor ?? "user",
       operation: "roadmap.export.flat-v1.snapshot",
@@ -765,7 +895,7 @@ export async function reconstructHierarchy(input: {
   if (input.baseRevision === undefined) throw new PlanbanValidationError("baseRevision is required for hierarchy reconstruction.");
   return withRoadmapWriteLock(input.cwd, async () => {
     const state = await loadState(input.cwd);
-    assertBaseRevision(state, input.baseRevision);
+    await assertBaseRevision(state, input.baseRevision, (input as { cardId?: string }).cardId, (input as { actor?: string }).actor);
     const byId = new Map(state.roadmap.roadmapItems.map((item) => [item.id, item]));
     const parentByChild = new Map<string, string>();
     const preferredIndex = new Map<string, number>();
@@ -845,16 +975,26 @@ export async function reconstructHierarchy(input: {
 
 export async function writeDoc(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   cardId: string;
   kind: "spec" | "plan";
   markdown: string;
   expectedMtimeMs?: number | null | undefined;
   history?: PlanbanHistoryMeta | false | undefined;
+  /** Who is writing; defaults to the history's actor. On an online board, an agent stays within the person's setting for their agents. */
+  actor?: PlanbanHistoryActor | undefined;
   /** Only for move-files-out: records files it moved even when a failure left others in the card folder. */
   recordingMovedFiles?: boolean | undefined;
 }): Promise<PlanbanDocPayload> {
   const online = await onlineManifest(input.cwd);
-  if (online) return (await onlineOperation<{ doc: PlanbanDocPayload }>(resolveProjectCwd(input.cwd), online, "writeDoc", input)).result.doc;
+  if (online) {
+    const { history, ...rest } = input;
+    const actor = input.actor ?? (history ? history.actor : undefined);
+    const { state, result } = await onlineOperation<{ doc: PlanbanDocPayload }>(resolveProjectCwd(input.cwd), online, "writeDoc", { ...rest, ...(actor ? { actor } : {}) });
+    // A retried write says so, as card edits do.
+    return { ...result.doc, ...(state.onlineReplay ?? {}) };
+  }
   return withRoadmapWriteLock(input.cwd, async () => {
   const state = await loadState(input.cwd);
   const planned = planWriteDoc(state.roadmap, input, { now: nowIso() });
@@ -869,10 +1009,15 @@ export async function writeDoc(input: {
     if (existsBeforeWrite) {
       const currentStats = await stat(path);
       if (input.expectedMtimeMs === null || currentStats.mtimeMs !== input.expectedMtimeMs) {
-        throw new PlanbanConflictError("Document changed on disk. Reload before saving.");
+        const markdown = await readFile(path, "utf8");
+        // A very long document is left out of the answer, as online; its version is always there.
+        const document = markdown.length > MAX_CONFLICT_DOCUMENT_CHARS
+          ? { cardId: input.cardId, kind: input.kind, path, exists: true, markdown: "", mtimeMs: currentStats.mtimeMs, markdownOmitted: true as const }
+          : { cardId: input.cardId, kind: input.kind, path, exists: true, markdown, mtimeMs: currentStats.mtimeMs };
+        throw await documentConflict(state, input.cardId, input.kind, document, input.actor ?? (input.history ? input.history.actor : undefined));
       }
     } else if (input.expectedMtimeMs !== null) {
-      throw new PlanbanConflictError("Document was removed on disk. Reload before saving.");
+      throw await documentConflict(state, input.cardId, input.kind, { cardId: input.cardId, kind: input.kind, path, exists: false, markdown: "", mtimeMs: null }, input.actor ?? (input.history ? input.history.actor : undefined));
     }
   }
 
@@ -888,10 +1033,12 @@ export async function writeDoc(input: {
   });
   if (input.history !== false) {
     const latestState = await loadState(input.cwd);
-    await recordHistoryVersion(latestState, latestState.roadmap, input.history ?? planned.history);
+    // Like every write: an unfinished goals change is settled before history moves on.
+    await settleGoals(latestState.planningRoot, latestState.roadmap.revision);
+    await recordHistoryVersion(latestState, latestState.roadmap, input.history ?? { ...planned.history, ...(input.actor ? { actor: input.actor } : {}) });
   }
   return { cardId: input.cardId, kind: input.kind, path, exists: true, markdown: input.markdown, mtimeMs: stats.mtimeMs };
-  });
+  }).catch(againIfMoved(() => writeDoc(input)));
 }
 
 export async function historyPayload(cwd: string) {
@@ -913,6 +1060,99 @@ export async function loadHistoryState(input: { cwd: string; version: number }):
   return { ...state, roadmap: await readHistoryRoadmap(state, input.version) };
 }
 
+/**
+ * Agents' refused edits still waiting on an online board, or one card (Spec
+ * point 20). A board only on this computer has one writer, so it has none.
+ */
+export async function unresolvedChanges(input: { cwd: string; cardId?: string | undefined }): Promise<{ changes: Array<Record<string, unknown>> }> {
+  const online = await onlineManifest(input.cwd);
+  if (!online || online.storage?.kind !== "online") return { changes: [] };
+  const query = input.cardId ? `?card=${encodeURIComponent(input.cardId)}` : "";
+  return onlineRequest(online.storage.url, boardPath(online.storage.boardId, `/unresolved${query}`));
+}
+
+/**
+ * An agent on this computer is working on a card of an online board (Spec
+ * point 20): a heads-up for others that ends 15 minutes after its last
+ * activity. Never a lock; best effort, and nothing for a board on this computer.
+ */
+export async function notePresence(input: { cwd: string; cardId: string; agentName?: string | undefined }) {
+  // Best effort from start to finish: a heads-up must never break or stall the agent's work.
+  try {
+    const online = await onlineManifest(input.cwd);
+    if (!online || online.storage?.kind !== "online") return { noted: false };
+    return await onlineRequest<{ noted: boolean }>(online.storage.url, boardPath(online.storage.boardId, "/presence"), { cardId: input.cardId, ...(input.agentName ? { agentName: input.agentName } : {}) }, { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+  } catch {
+    return { noted: false };
+  }
+}
+
+/** Who else is working on a card of an online board, in words: "Claude (Sam) is working on this card, started 4 minutes ago." */
+export async function workingOnCard(input: { cwd: string; cardId: string; agentName?: string | undefined }): Promise<Array<{ who: string; startedAt: string; lastActiveAt: string; note: string }>> {
+  try {
+    const online = await onlineManifest(input.cwd);
+    if (!online || online.storage?.kind !== "online") return [];
+    const agent = input.agentName ? `&agent=${encodeURIComponent(input.agentName)}` : "";
+    const result = await onlineRequest<{ working: Record<string, Array<{ who: string; startedAt: string; lastActiveAt: string; note: string }>> }>(online.storage.url, boardPath(online.storage.boardId, `/presence?card=${encodeURIComponent(input.cardId)}${agent}`), undefined, { timeoutMs: 5_000, signal: AbortSignal.timeout(5_000) });
+    return result.working[input.cardId] ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * One section of a Spec or Plan, by heading (Spec point 20): checked against
+ * that section's own version (from readDocSections), so edits to other
+ * sections never clash. On a board on this computer, the same rules over the file.
+ */
+export async function writeDocSection(input: {
+  cwd: string;
+  cardId: string;
+  kind: "spec" | "plan";
+  heading: string;
+  occurrence?: number | undefined;
+  expectedSectionVersion: string | null;
+  markdown: string;
+  after?: string | undefined;
+  actor?: PlanbanHistoryActor | undefined;
+  idempotencyKey?: string | undefined;
+}): Promise<PlanbanDocPayload & { section?: { heading: string; version: string } }> {
+  const online = await onlineManifest(input.cwd);
+  if (online) {
+    const { state, result } = await onlineOperation<{ doc: PlanbanDocPayload; section: { heading: string; version: string } }>(resolveProjectCwd(input.cwd), online, "writeDocSection", input);
+    return { ...result.doc, section: result.section, ...(state.onlineReplay ?? {}) };
+  }
+  // Another section saved at the same moment changes the file's version: read again and
+  // re-apply, since only this section's own version decides.
+  for (let attempt = 0; ; attempt += 1) {
+    const doc = await readDoc(input);
+    const edit = editSection(doc.markdown, { heading: input.heading, expectedVersion: input.expectedSectionVersion, text: input.markdown, ...(input.occurrence === undefined ? {} : { occurrence: input.occurrence }), ...(input.after ? { after: input.after } : {}) });
+    if (!edit.ok) {
+      const conflict: ConflictDetails = { currentRevision: (await loadState(input.cwd)).roadmap.revision, changes: [], section: edit.current, document: doc };
+      throw new PlanbanEditConflictError(`Not saved: the "${input.heading}" section ${edit.reason === "missing" ? "is no longer there" : edit.reason === "exists" ? "was added since you read it" : "changed since you read it"}.${input.actor === "agent" ? ` ${RECONCILE}` : ""}`, conflict);
+    }
+    try {
+      const written = await writeDoc({ cwd: input.cwd, cardId: input.cardId, kind: input.kind, markdown: edit.markdown, expectedMtimeMs: doc.exists ? doc.mtimeMs : null, actor: input.actor });
+      return { ...written, section: edit.section };
+    } catch (error) {
+      if (!(error instanceof PlanbanEditConflictError) || attempt >= 4) throw error;
+    }
+  }
+}
+
+/** A document with each section's own version, for writeDocSection. */
+export async function readDocSections(input: { cwd: string; cardId: string; kind: "spec" | "plan" }) {
+  const doc = await readDoc(input);
+  return { ...doc, sections: sectionList(doc.markdown) };
+}
+
+/** Drops an unresolved change with a reason, into the card's history. */
+export async function dropChange(input: { cwd: string; changeId: string; reason: string; baseRevision?: number | undefined; actor?: PlanbanHistoryActor | undefined; idempotencyKey?: string | undefined }): Promise<PlanbanResolvedState> {
+  const online = await onlineManifest(input.cwd);
+  if (!online) throw new PlanbanValidationError("Only online boards keep unresolved changes; a board on this computer has one writer at a time.");
+  return (await onlineOperation(resolveProjectCwd(input.cwd), online, "dropChange", input)).state;
+}
+
 export async function readHistoryDoc(input: {
   cwd: string;
   version: number;
@@ -929,15 +1169,19 @@ export async function readHistoryDoc(input: {
 
 export async function restoreBoardVersion(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   version: number;
   actor?: PlanbanHistoryActor | undefined;
   baseRevision?: number | undefined;
+  completionConfirmed?: boolean | undefined;
 }): Promise<PlanbanResolvedState> {
   const online = await onlineManifest(input.cwd);
   if (online) return (await onlineOperation(resolveProjectCwd(input.cwd), online, "restoreBoard", input)).state;
   return withRoadmapWriteLock(input.cwd, async () => {
   const state = await loadState(input.cwd);
   const restored = await restoreRoadmapFromHistory({ state, version: input.version, actor: input.actor });
+  assertCompletionConfirmed(state.roadmap, restored, input.actor, input.completionConfirmed);
   const roadmap = await saveRoadmap(state, restored, {
     actor: input.actor ?? "user",
     operation: "history.restore.board",
@@ -945,15 +1189,18 @@ export async function restoreBoardVersion(input: {
     affectedCards: restored.roadmapItems.map((item) => item.id),
   });
   return { ...state, roadmap };
-  });
+  }).catch(againIfMoved(() => restoreBoardVersion(input)));
 }
 
 export async function restoreCardVersion(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   version: number;
   cardId: string;
   actor?: PlanbanHistoryActor | undefined;
   baseRevision?: number | undefined;
+  completionConfirmed?: boolean | undefined;
 }): Promise<PlanbanResolvedState> {
   const online = await onlineManifest(input.cwd);
   if (online) return (await onlineOperation(resolveProjectCwd(input.cwd), online, "restoreCard", input)).state;
@@ -964,21 +1211,22 @@ export async function restoreCardVersion(input: {
   const roadmapItems = existing
     ? state.roadmap.roadmapItems.map((item) => (item.id === input.cardId ? restoredCard : item))
     : [...state.roadmap.roadmapItems, restoredCard];
-  const roadmap = await saveRoadmap(state, {
-    ...state.roadmap,
-    roadmapItems: normalizeColumnPriorities(roadmapItems),
-  }, {
+  const candidate = { ...state.roadmap, roadmapItems: normalizeColumnPriorities(roadmapItems) };
+  assertCompletionConfirmed(state.roadmap, candidate, input.actor, input.completionConfirmed);
+  const roadmap = await saveRoadmap(state, candidate, {
     actor: input.actor ?? "user",
     operation: "history.restore.card",
     summary: `Restored ${restoredCard.title} from v${input.version}`,
     affectedCards: [input.cardId],
   });
   return { ...state, roadmap };
-  });
+  }).catch(againIfMoved(() => restoreCardVersion(input)));
 }
 
 export async function restoreDocVersion(input: {
   cwd: string;
+  /** Online boards: one key per logical edit, reused only to retry that same edit. */
+  idempotencyKey?: string | undefined;
   version: number;
   cardId: string;
   kind: "spec" | "plan";
@@ -1009,7 +1257,7 @@ export async function restoreDocVersion(input: {
       affectedDocs: [{ cardId: input.cardId, kind: input.kind, path: livePath }],
     },
   });
-  });
+  }).catch(againIfMoved(() => restoreDocVersion(input)));
 }
 
 export async function getStatus(cwdInput: string) {
@@ -1046,8 +1294,163 @@ export async function getStatus(cwdInput: string) {
     agentContextPath: agentContextPath(cwd),
     planningRoot,
     roadmapPath: liveRoadmapPath,
-    roadmapExists: await pathExists(liveRoadmapPath),
+    roadmapExists: await hasLiveRoadmap(planningRoot),
     repoId: manifest.repoId,
     version: currentVersionInfo(),
   };
+}
+
+// ---- Goals (owner decisions, 16 October 2026) ------------------------------
+// Kept beside the board in goals.json, so the board file older Planban
+// versions rewrite is untouched. Every change is a board revision with a
+// history entry, so live updates, edit clashes and retries work as for cards.
+
+const goalsPath = (planningRoot: string) => join(planningRoot, "goals.json");
+/**
+ * A change is written here first, stamped with the board revision it makes,
+ * then the board's revision and history, then it becomes goals.json. If
+ * anything stops in between, the stamp says whether the revision was
+ * committed: if so the change stands, if not it never happened.
+ */
+const nextGoalsPath = (planningRoot: string) => join(planningRoot, "goals.next.json");
+
+async function readGoalsAt(path: string): Promise<{ file: GoalsFile; revision?: number } | null> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { revision?: unknown };
+    return { file: normalizeGoals(parsed), ...(typeof parsed.revision === "number" ? { revision: parsed.revision } : {}) };
+  } catch {
+    throw new PlanbanValidationError(`This board's goals file is damaged (${path}). Restore it from a backup or move it aside to start the goals again.`);
+  }
+}
+
+/** A local board's goals as stored, for moving the board online; null when it has none. */
+export async function readLocalGoals(planningRoot: string, roadmapRevision?: number): Promise<GoalsFile | null> {
+  const file = await readGoalsFile(planningRoot, roadmapRevision ?? (await readRoadmapRevision(planningRoot)));
+  return file.goals.length || file.retired.length || file.context || file.suggestions.length || file.dismissed.length ? file : null;
+}
+
+async function readRoadmapRevision(planningRoot: string): Promise<number> {
+  return (JSON.parse(await readFile(roadmapPath(planningRoot), "utf8")) as { revision?: number }).revision ?? 0;
+}
+
+/**
+ * Whether a change written to goals.next.json was committed: the board
+ * reached its revision, and that revision's history entry is a goals change
+ * (another kind of edit reaching the same number doesn't count).
+ */
+async function nextCommitted(planningRoot: string, next: { revision?: number }, roadmapRevision: number) {
+  if (next.revision === undefined || next.revision > roadmapRevision) return false;
+  const index = await readFile(join(planningRoot, "history", "index.json"), "utf8").then((raw) => JSON.parse(raw) as { entries?: Array<{ roadmapRevision?: number; operation?: string }> }, () => null);
+  return !!index?.entries?.some((entry) => entry.roadmapRevision === next.revision && entry.operation === "goals.edit");
+}
+
+/** The goals as of the board's committed revision (see nextGoalsPath). Never writes, so it is safe without the lock. */
+async function readGoalsFile(planningRoot: string, roadmapRevision: number): Promise<GoalsFile> {
+  const next = await readGoalsAt(nextGoalsPath(planningRoot));
+  if (next && await nextCommitted(planningRoot, next, roadmapRevision)) return next.file;
+  return (await readGoalsAt(goalsPath(planningRoot)))?.file ?? emptyGoals();
+}
+
+/** Under the board lock: settles a change that stopped part way, one way or the other. */
+async function settleGoals(planningRoot: string, roadmapRevision: number) {
+  const next = await readGoalsAt(nextGoalsPath(planningRoot)).catch(() => null);
+  if (!next) {
+    await rm(nextGoalsPath(planningRoot), { force: true });
+    return;
+  }
+  if (await nextCommitted(planningRoot, next, roadmapRevision)) await rename(nextGoalsPath(planningRoot), goalsPath(planningRoot));
+  else await rm(nextGoalsPath(planningRoot), { force: true });
+}
+
+export interface GoalsResult {
+  page: GoalsPage;
+  revision: number;
+  /** Set when a suggestion wasn't added: why. */
+  notAdded?: string | undefined;
+  suggestion?: Record<string, unknown> | undefined;
+}
+
+/** The board's whole Goals page: goals with notes, context, retired goals and suggestions. */
+export async function readGoals(input: { cwd: string }): Promise<GoalsResult> {
+  const online = await onlineManifest(input.cwd);
+  if (online && online.storage?.kind === "online") {
+    return onlineRequest<GoalsResult>(online.storage.url, boardPath(online.storage.boardId, "/goals"));
+  }
+  const state = await loadState(input.cwd);
+  return { page: goalsPage(await readGoalsFile(state.planningRoot, state.roadmap.revision)), revision: state.roadmap.revision };
+}
+
+/** The short Goals block for agents' board reads, or null when the board has no goals. */
+export async function readGoalsBlock(cwd: string): Promise<string | null> {
+  const { page } = await readGoals({ cwd }).catch(() => ({ page: null }));
+  if (!page || !page.goals.length) return null;
+  return goalsBlock({ ...emptyGoals(), goals: page.goals });
+}
+
+async function changeLocalGoals(
+  cwd: string,
+  actor: PlanbanHistoryActor,
+  request: { op: string; input: unknown; idempotencyKey?: string | undefined },
+  plan: (file: GoalsFile, stamp: { revision: number; now: string }) => { goals: GoalsFile | null; summary?: string; notAdded?: string; suggestion?: Record<string, unknown> },
+): Promise<GoalsResult> {
+  const { planningRoot } = await loadState(cwd);
+  // A retry with the same key after a lost reply returns the first answer and changes nothing again.
+  const { value } = await runIdempotentBoardMutation({
+    planningRoot, idempotencyKey: request.idempotencyKey, scope: `goals.${request.op}`, fingerprint: idempotencyFingerprint(request.input),
+    run: () => withRoadmapWriteLock(cwd, async () => {
+      const state = await loadState(cwd);
+      await settleGoals(state.planningRoot, state.roadmap.revision);
+      const file = await readGoalsFile(state.planningRoot, state.roadmap.revision);
+      const planned = plan(file, { revision: state.roadmap.revision + 1, now: nowIso() });
+      if (!planned.goals) return { page: goalsPage(file), revision: state.roadmap.revision, notAdded: planned.notAdded } as GoalsResult;
+      assertGoalsSize(planned.goals);
+      await atomicWriteFile(nextGoalsPath(state.planningRoot), JSON.stringify({ ...planned.goals, revision: state.roadmap.revision + 1 }, null, 2) + "\n");
+      let roadmap: PlanbanRoadmap;
+      try {
+        roadmap = await saveRoadmap(state, state.roadmap, { actor, operation: "goals.edit", summary: planned.summary!, affectedCards: [] }, { goalsChange: true });
+      } catch (error) {
+        await rm(nextGoalsPath(state.planningRoot), { force: true });
+        throw error;
+      }
+      await rename(nextGoalsPath(state.planningRoot), goalsPath(state.planningRoot));
+      return { page: goalsPage(planned.goals), revision: roadmap.revision, ...(planned.suggestion ? { suggestion: planned.suggestion } : {}) } as GoalsResult;
+    }),
+  });
+  return value;
+}
+
+/** A person's change to the goals. Agents can't: they suggest (suggestGoalChange). */
+export async function editGoals(input: { cwd: string; edit: unknown; baseRevision?: number | undefined; actor?: PlanbanHistoryActor | undefined; idempotencyKey?: string | undefined }): Promise<GoalsResult> {
+  if (input.actor === "agent") throw new PlanbanValidationError(PEOPLE_ONLY);
+  const online = await onlineManifest(input.cwd);
+  if (online) return (await onlineOperation<GoalsResult>(resolveProjectCwd(input.cwd), online, "editGoals", input)).result;
+  return changeLocalGoals(input.cwd, "user", { op: "edit", input: { edit: input.edit, baseRevision: input.baseRevision }, idempotencyKey: input.idempotencyKey },
+    (file, stamp) => applyGoalEdit(file, input.edit, { ...stamp, baseRevision: input.baseRevision, by: "you" })).catch(againIfMoved(() => editGoals(input)));
+}
+
+/** A person accepts or dismisses an agent's suggestion. */
+export async function decideGoalSuggestion(input: { cwd: string; suggestionId: string; decision: "accept" | "dismiss"; baseRevision?: number | undefined; actor?: PlanbanHistoryActor | undefined; idempotencyKey?: string | undefined }): Promise<GoalsResult> {
+  if (input.actor === "agent") throw new PlanbanValidationError(PEOPLE_ONLY);
+  const online = await onlineManifest(input.cwd);
+  if (online) return (await onlineOperation<GoalsResult>(resolveProjectCwd(input.cwd), online, "decideGoalSuggestion", input)).result;
+  return changeLocalGoals(input.cwd, "user", { op: "decide", input: { suggestionId: input.suggestionId, decision: input.decision, baseRevision: input.baseRevision }, idempotencyKey: input.idempotencyKey },
+    (file, stamp) => decideSuggestion(file, input, { ...stamp, baseRevision: input.baseRevision, by: "you" })).catch(againIfMoved(() => decideGoalSuggestion(input)));
+}
+
+/** An agent suggests one change to the goals, with its reason, for the person to accept or dismiss. */
+export async function suggestGoalChange(input: { cwd: string; change: unknown; reason: string; agentName?: string | undefined; idempotencyKey?: string | undefined }): Promise<GoalsResult> {
+  const online = await onlineManifest(input.cwd);
+  if (online) return (await onlineOperation<GoalsResult>(resolveProjectCwd(input.cwd), online, "suggestGoalChange", { ...input, actor: "agent" } as typeof input)).result;
+  const by = appName(input.agentName);
+  return changeLocalGoals(input.cwd, "agent", { op: "suggest", input: { change: input.change, reason: input.reason }, idempotencyKey: input.idempotencyKey }, (file, stamp) => {
+    const added = addSuggestion(file, input, { ...stamp, by, id: randomUUID() });
+    return added.goals ? added : { goals: null, notAdded: added.notAdded };
+  }).catch(againIfMoved(() => suggestGoalChange(input)));
 }

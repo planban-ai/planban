@@ -30,6 +30,8 @@ export function randomSecret(prefix: string): string {
 export const planbanTokenVerifier: AuthVerifier = {
   async authenticate(ctx, bearer, origin) {
     if (!/^pb[a-z]_[A-Za-z0-9_-]{20,}$/.test(bearer)) return null;
+    // Browser session tokens only ever work as the web page's cookie.
+    if (bearer.startsWith("pbw_")) return null;
     const resolved = await ctx.runQuery(internal.connections.resolveToken, { tokenHash: await sha256Hex(bearer) });
     if (!resolved) return null;
     // A credential works only through the address it was issued for.

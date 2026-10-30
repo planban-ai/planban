@@ -95,6 +95,17 @@ For release or install-path changes, also run:
 npm run release:preflight
 ```
 
+The board page ships pre-built in `dist/web`, so commit it with any change to its
+source. To have git refuse a push whose `dist/web` is out of date, turn on the
+pre-push hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook builds each commit you push in a temporary checkout, which takes about a
+second, and leaves your own checkout alone. The preflight runs the same check first.
+
 Preflight includes `node scripts/verify-cold-install.mjs`: it copies a fresh
 marketplace and plugin cache without dependencies or configured local paths, then
 executes MCP initialization, Board launch, and CLI startup. Keep bootstrap
@@ -105,6 +116,18 @@ Updater CI separately checks the previous public version upgrade and repeated
 updates of the candidate with unchanged dependencies, in both Codex and Claude Code. Dependency changes must take
 the clean-install fallback; only the unchanged-dependency scenario is required to
 reuse dependencies and meet the relative speed gate.
+
+The updater rehearsal uses seven machines, five of them Windows, so it doesn't run on
+every push. It runs when a pull request opens, reopens or is marked ready for review; later
+pushes run only its quick compatibility checks, so its other checks show as skipped.
+To run it on the latest commit, start it by hand with the branch and the exact commit:
+
+```bash
+gh workflow run updater-rehearsal.yml --ref <branch> -f target_ref=<branch> -f expected_commit=<commit>
+```
+
+A newer push cancels any CI or rehearsal run still going for an older commit on the
+same branch, including one started by hand.
 
 Before publishing a release, use the exact candidate commit and rehearse updating
 from the previous public version. For example:
@@ -123,9 +146,10 @@ lists its tools, and that a board made by the previous release can still be read
 changed. It uses a throwaway home and Claude config folder and needs no Claude sign-in.
 Both need their CLI on your `PATH`; CI pins the versions in the workflow files.
 
-The manual `Release readiness` workflow runs the preflight and both upgrade
-rehearsals against an exact commit SHA. Preflight fails if that workflow stops
-running either rehearsal with a pinned CLI.
+The manual `Release readiness` workflow runs the preflight, both upgrade rehearsals
+and the full updater rehearsal against an exact commit SHA. Give it the branch or tag
+whose head is that commit as `target_ref`, since the updater rehearsal updates from
+it as people do. Preflight fails if that workflow stops running any of these.
 
 In release notes, write Planban CLI examples as `node "$PLANBAN_ROOT/bin/planban.mjs" <command>`.
 Planban is not published to npm, so users do not have a bare `planban` command on

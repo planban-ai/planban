@@ -1,6 +1,6 @@
 {
   "name": "planban",
-  "version": "1.1.7",
+  "version": "2.0.0",
   "description": "Planban roadmap boards for agent-led planning, local by default and online when you share them: open the board beside your session, read card specs and plans, and update roadmap items with the Planban status protocol.",
   "author": {
     "name": "Planban"

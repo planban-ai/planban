@@ -2,7 +2,8 @@
 // pushes the board's revision the moment a change commits, so a watching board
 // server needs no polling. Loaded only for Online Boards.
 import { PlanbanNotFoundError } from "../boardOperations";
-import { onlineRequest } from "./client";
+import { boardCredentials, onlineRequest } from "./client";
+import { checkedConvexUrl } from "./convexUrl";
 
 interface LiveToken {
   token: string;
@@ -12,15 +13,6 @@ interface LiveToken {
 
 export interface LiveWatch {
   close(): Promise<void>;
-}
-
-function checkedConvexUrl(value: string) {
-  const url = new URL(value);
-  const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (url.username || url.password || !(url.protocol === "https:" || (url.protocol === "http:" && loopback))) {
-    throw new Error("Online Board live updates need an HTTPS address.");
-  }
-  return url.href.replace(/\/$/, "");
 }
 
 /**
@@ -33,7 +25,8 @@ export async function watchRevision(
   onRevision: (revision: number) => void,
   onError: (error: Error) => void,
 ): Promise<LiveWatch | null> {
-  const fetchToken = () => onlineRequest<LiveToken>(serviceUrl, "/api/v1/live-token", {});
+  // As the board's own account, looked up again at each renewal.
+  const fetchToken = async () => onlineRequest<LiveToken>(serviceUrl, "/api/v1/live-token", {}, { credentials: await boardCredentials(serviceUrl, boardId) });
   let first: LiveToken;
   try {
     first = await fetchToken();

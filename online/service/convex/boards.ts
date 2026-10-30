@@ -1,10 +1,12 @@
 // The Online Board authority. Every change runs the shared planning rules from
 // src/core/boardOperations.ts inside one Convex mutation, so the revision
 // check, roadmap, documents and history version commit together or not at all.
-import { v } from "convex/values";
+import { v, type Value } from "convex/values";
 import {
   assertBaseRevision,
   assertCommittable,
+  COMPLETION_CONFIRMATION_MESSAGE,
+  newlyCompleted,
   committedRoadmap,
   planCreateCard,
   planCreateCards,
@@ -18,11 +20,19 @@ import {
   type PlannedChange,
 } from "../../../src/core/boardOperations";
 import type { PlanbanHistoryEntry, PlanbanHistoryPayload, PlanbanRoadmap } from "../../../src/core/types";
+import { cardSubject, changesSince, clashSubject, conflictMessage, MAX_CONFLICT_CHANGES, MAX_CONFLICT_DOCUMENT_CHARS, RECONCILE, type ConflictDetails } from "../../../src/core/conflicts";
+import { editSection, type SectionEdit } from "../../../src/core/docSections";
+import { fieldValue, rebaseEdit, settlingFields, touchedFields, type FieldClash } from "../../../src/core/concurrent";
+import { MAX_PER_BOARD, publicUnresolved, recordUnresolved, settledBy, unresolvedOn } from "./model/unresolved";
+import { checkIndexValue, MAX_CARD_BYTES, MAX_DOCUMENT_BYTES } from "../../../src/core/contentRules";
+import { appName, touchPresence, workingOn, workingSentence } from "./model/presence";
 import type { Doc } from "./_generated/dataModel";
-import { internalMutation, internalQuery, type MutationCtx } from "./_generated/server";
-import { boardAccess, liveConnection, reaches } from "./model/access";
-import { packJson, packText, unpackJson, unpackText } from "./model/codec";
-import { asServiceError, fail } from "./model/errors";
+import { boardFeatures } from "../../../src/core/clientVersion";
+import { addSuggestion, applyGoalEdit, assertGoalsSize, decideSuggestion, goalsPage, normalizeGoals, PEOPLE_ONLY, type GoalsFile } from "../../../src/core/goals";
+import { internalMutation, internalQuery, type MutationCtx, type QueryCtx } from "./_generated/server";
+import { asAgent, boardAccess, liveConnection, reaches, refusalFor, type BoardAccess } from "./model/access";
+import { packed, packJson, packText, unpackJson, unpackText } from "./model/codec";
+import { asServiceError, fail, type ServiceErrorData } from "./model/errors";
 import { checkCards, checkDocuments } from "./model/indexRules";
 import { addStored, chargeWrite, sizeOf } from "./model/limits";
 import { historyEntries, historyPage, recordHistory, roadmapAtVersion, type Attribution, type BoardRows } from "./model/history";
@@ -32,7 +42,8 @@ import { reserveRetiredId } from "./model/retired";
 export const BOARD_OPERATIONS = [
   "createCard", "createCards", "createGroup", "updateCard", "moveCard",
   "setCardParent", "reorderCards", "deleteArchivedCard", "writeDoc",
-  "restoreBoard", "restoreCard", "restoreDoc",
+  "restoreBoard", "restoreCard", "restoreDoc", "dropChange", "writeDocSection",
+  "editGoals", "suggestGoalChange", "decideGoalSuggestion",
 ] as const;
 export type BoardOperation = (typeof BOARD_OPERATIONS)[number];
 
@@ -86,7 +97,10 @@ async function commit(ctx: MutationCtx, board: Doc<"boards">, previous: PlanbanR
   for (const doc of change.docWrites) {
     const row = await docRow(ctx, at, doc.cardId, doc.kind);
     const stamp = Math.max(Date.now(), (row?.stamp ?? 0) + 1);
-    const fields = { markdown: packText(doc.markdown), stamp, updatedAt: now, updatedBy: attribution.userId };
+    const fields = {
+      markdown: packText(doc.markdown), stamp, updatedAt: now, updatedBy: attribution.userId,
+      updatedByAgent: attribution.actor === "agent", updatedByClient: attribution.clientName, updateSummary: change.history.summary.slice(0, 200),
+    };
     if (row) await ctx.db.patch(row._id, fields);
     else await ctx.db.insert("docs", { ...at, cardId: doc.cardId, kind: doc.kind, ...fields });
     await addStored(ctx, at, sizeOf(fields.markdown) - (row ? sizeOf(row.markdown) : 0));
@@ -115,24 +129,142 @@ async function commit(ctx: MutationCtx, board: Doc<"boards">, previous: PlanbanR
  * Completing and deleting cards stay with the owner. Judged on the operation's
  * effect (current versus candidate roadmap), so every route is covered.
  */
-function checkOwnerControlled(before: PlanbanRoadmap, after: PlanbanRoadmap, access: { canAdminister: boolean; canComplete: boolean }, completionConfirmed?: boolean) {
-  const previous = new Map(before.roadmapItems.map((item) => [item.id, item]));
+function checkOwnerControlled(before: PlanbanRoadmap, after: PlanbanRoadmap, access: BoardAccess, actor: "user" | "agent", completionConfirmed?: boolean) {
   const remaining = new Set(after.roadmapItems.map((item) => item.id));
-  const completes = after.roadmapItems.some((item) => item.status === "complete" && previous.get(item.id)?.status !== "complete");
+  const completes = newlyCompleted(before, after).length > 0;
   const deletes = before.roadmapItems.some((item) => !remaining.has(item.id));
-  if (deletes && !access.canAdminister) fail("forbidden", "Deleting a card is kept for the board owner's own connection. Ask the owner to do it.");
-  if (completes && !access.canComplete) fail("forbidden", "This connection may not mark cards complete on this board. Ask someone who can, or change what your agents may do.");
-  if (completes && completionConfirmed === false) {
-    fail("validation", "completionConfirmed must be true when this would move a card to complete. Only do this only when a person on the board explicitly asks, confirms it after review or testing, or clearly waives review.");
-  }
+  if (deletes && !access.canAdminister) fail("forbidden", "Deleting a card is kept for the board owner's own sign-in. Ask the owner to do it.");
+  if (completes && !access.canComplete) fail("forbidden", refusalFor(access, "complete"));
+  // Complete is person-controlled: an agent's edit says a person confirmed it.
+  if (completes && actor === "agent" && completionConfirmed !== true) fail("validation", COMPLETION_CONFIRMATION_MESSAGE);
 }
 
-/** Every hosted edit states the revision it was based on (owner decision 10). */
-function requireBaseRevision(current: PlanbanRoadmap, input: Record<string, unknown>) {
+/**
+ * Every hosted edit states the revision it was based on (owner decision 10).
+ * A stale one is refused with what changed since, who changed it, and the
+ * card as it is now, so the agent can reconcile its intent (owner requirement,
+ * 15 October 2026).
+ */
+async function requireBaseRevision(ctx: QueryCtx, at: BoardRows, current: PlanbanRoadmap, input: Record<string, unknown>, op: string, actor: "user" | "agent") {
   if (typeof input.baseRevision !== "number" || !Number.isInteger(input.baseRevision)) {
     fail("validation", `Online Board edits must state the board revision they were based on (baseRevision). The current revision is ${current.revision}; reread the board before editing.`, { currentRevision: current.revision });
   }
-  assertBaseRevision(current, input.baseRevision as number);
+  const base = input.baseRevision as number;
+  if (base === current.revision) return input;
+  assertBaseRevision({ ...current, revision: base }, base);
+  if (base > current.revision) assertBaseRevision(current, base);
+  const cardId = typeof input.cardId === "string" ? input.cardId : undefined;
+  // Editing at the same time (Spec point 20): only a field this edit touches
+  // that changed since the revision it read is a clash; anything else applies
+  // to the current board. Positions never clash.
+  const read = await roadmapAtRevision(ctx, at, base);
+  const rebased = read ? rebaseEdit(op, input, read, current) : null;
+  if (rebased?.ok) return rebased.input;
+  // Refused: now say what changed, and who changed what this edit clashes with.
+  const changes = await describeChanges(ctx, await recentEntries(ctx, at, (entry) => entry.roadmapRevision <= base), base);
+  const clashes = rebased && "clashes" in rebased ? rebased.clashes : undefined;
+  const clashCards = new Set(clashes?.map((clash) => clash.cardId));
+  // Who changed the very field that clashes is named, never someone who changed another field of the card.
+  const authors = clashes && read ? await fieldAuthors(ctx, at, read, base, clashes, (await ctx.db.query("boards").withIndex("by_boardId", (q) => q.eq("boardId", at.boardId)).unique())?.historyVersion ?? 0) : [];
+  if (clashes) {
+    // Recent changes to the clashing cards that aren't the field's own author are context, not blame.
+    for (let index = changes.length - 1; index >= 0; index -= 1) {
+      if (changes[index]!.cards.some((id) => clashCards.has(id))) changes.splice(index, 1);
+    }
+    changes.unshift(...authors);
+  }
+  for (const clashCard of clashCards) {
+    // Beyond the window history is read in: the card's own last-change record, said as that.
+    if (authors.some((change) => change.cards.includes(clashCard))) continue;
+    const last = await ctx.db.query("cardChanges").withIndex("by_board_generation_card", (q) => q.eq("boardId", at.boardId).eq("generation", at.generation).eq("cardId", clashCard)).unique();
+    // Beyond what history still shows: the card's last change, said as that (it may have been another field).
+    if (last) changes.unshift({ at: last.at, by: await personName(ctx, last.userId, last.agent ? last.clientName ?? "" : null), agent: last.agent, summary: `the card's last change: ${last.summary.slice(0, 200)}`, cards: [clashCard], cardLevel: true });
+  }
+  const relevant = clashes ? changes.filter((change) => change.cards.some((id) => clashCards.has(id))) : changes;
+  const conflict: ConflictDetails = {
+    currentRevision: current.revision, yourRevision: base,
+    changes: relevant.length ? relevant : changes,
+    ...(cardId ? { card: current.roadmapItems.find((item) => item.id === cardId) ?? null } : {}),
+    ...(clashes ? { clashes } : {}),
+  };
+  fail("conflict", conflictMessage(clashSubject(current, cardId, clashes), conflict, actor === "agent"), { currentRevision: current.revision, conflict: conflict as unknown as Value });
+}
+
+/** The history version that produced `revision`, or null when it is no longer kept. */
+async function versionAtRevision(ctx: QueryCtx, at: BoardRows, revision: number) {
+  for await (const row of ctx.db.query("history").withIndex("by_board_version", (q) => q.eq("boardId", at.boardId).eq("generation", at.generation)).order("desc")) {
+    const entry = row.entry as PlanbanHistoryEntry;
+    if (entry.roadmapRevision === revision) return row.version;
+    if (entry.roadmapRevision < revision) return null;
+  }
+  return null;
+}
+
+/** The board as it was at `revision`, from history, or null when that version is no longer kept. */
+async function roadmapAtRevision(ctx: QueryCtx, at: BoardRows, revision: number) {
+  const version = await versionAtRevision(ctx, at, revision);
+  return version === null ? null : roadmapAtVersion(ctx, at, version);
+}
+
+/**
+ * Who last changed each clashing field since the edit's read: the latest
+ * version, among the next 50, whose board shows that field changing.
+ */
+async function fieldAuthors(ctx: QueryCtx, at: BoardRows, read: PlanbanRoadmap, base: number, clashes: FieldClash[], latestVersion: number) {
+  const baseVersion = await versionAtRevision(ctx, at, base);
+  if (baseVersion === null) return [];
+  // The latest 50 versions since the read: the most recent change to each field is what counts.
+  const from = Math.max(baseVersion, latestVersion - 50);
+  const latest = new Map<string, PlanbanHistoryEntry>();
+  let previous = from === baseVersion ? read : await roadmapAtVersion(ctx, at, from);
+  if (!previous) return [];
+  for (const { entry, roadmap } of await historyPage(ctx, at, from, 50)) {
+    for (const clash of clashes) {
+      const before = previous.roadmapItems.find((item) => item.id === clash.cardId);
+      const after = roadmap.roadmapItems.find((item) => item.id === clash.cardId);
+      const changed = clash.field === "*" ? JSON.stringify(before) !== JSON.stringify(after) : JSON.stringify(fieldValue(before, clash.field) ?? null) !== JSON.stringify(fieldValue(after, clash.field) ?? null);
+      if (changed) latest.set(`${clash.cardId}|${clash.field}`, entry);
+    }
+    previous = roadmap;
+  }
+  const entries = [...new Map([...latest.values()].map((entry) => [entry.version, entry])).values()];
+  return describeChanges(ctx, entries.sort((a, b) => b.version - a.version));
+}
+
+/** History entries newest first, until `stop` says an entry is old enough (at most a page). */
+async function recentEntries(ctx: QueryCtx, at: BoardRows, stop: (entry: PlanbanHistoryEntry) => boolean, limit = MAX_CONFLICT_CHANGES) {
+  const found: PlanbanHistoryEntry[] = [];
+  const rows = ctx.db.query("history").withIndex("by_board_version", (q) => q.eq("boardId", at.boardId).eq("generation", at.generation)).order("desc");
+  for await (const row of rows) {
+    const entry = row.entry as PlanbanHistoryEntry;
+    if (stop(entry) || found.length >= limit) break;
+    found.push(entry);
+  }
+  return found;
+}
+
+/** "Ana", or "Ana's agent (Claude)" when `agentClient` is given. */
+async function personName(ctx: QueryCtx, userId: string, agentClient: string | null) {
+  const person = await ctx.db.query("people").withIndex("by_userId", (q) => q.eq("userId", userId)).unique();
+  const name = person?.name || person?.email || "someone on the board";
+  return agentClient === null ? name : `${name}'s agent${agentClient ? ` (${agentClient})` : ""}`;
+}
+
+/** Names who made each change, as the people on the board see them. */
+async function describeChanges(ctx: QueryCtx, entries: PlanbanHistoryEntry[], base?: number) {
+  const names = new Map<string, string>();
+  for (const entry of entries) {
+    const userId = (entry as { attribution?: { userId?: string } }).attribution?.userId;
+    if (userId && !names.has(userId)) {
+      const person = await ctx.db.query("people").withIndex("by_userId", (q) => q.eq("userId", userId)).unique();
+      names.set(userId, person?.name || person?.email || "someone on the board");
+    }
+  }
+  return changesSince(entries, base, (entry) => {
+    const attribution = (entry as { attribution?: { userId?: string; clientName?: string; actor?: string } }).attribution;
+    const name = attribution?.userId ? names.get(attribution.userId)! : "someone on the board";
+    return entry.actor === "agent" ? `${name}'s agent${attribution?.clientName ? ` (${attribution.clientName})` : ""}` : name;
+  });
 }
 
 // ---- reads --------------------------------------------------------------
@@ -141,8 +273,11 @@ export const me = internalQuery({
   args: { connectionId: v.id("connections") },
   handler: async (ctx, { connectionId }) => {
     const connection = await liveConnection(ctx, connectionId);
+    // A person's own sign-in (a computer, a browser) learns who it is signed in as; agents and keys don't need to.
+    const profile = connection.canAdminister ? await ctx.db.query("people").withIndex("by_userId", (q) => q.eq("userId", connection.userId)).unique() : null;
     return {
       userId: connection.userId,
+      ...(profile ? { person: { name: profile.name, ...(profile.email ? { email: profile.email } : {}) } } : {}),
       connectionId: connection._id,
       kind: connection.kind,
       name: connection.name,
@@ -154,6 +289,9 @@ export const me = internalQuery({
   },
 });
 
+/** A board's people count is shown as "200+" past this. */
+const MAX_LISTED_PEOPLE = 200;
+
 export const listBoards = internalQuery({
   args: { connectionId: v.id("connections") },
   handler: async (ctx, { connectionId }) => {
@@ -163,9 +301,29 @@ export const listBoards = internalQuery({
     for (const member of memberships) {
       if (!reaches(connection, member.boardId)) continue;
       const board = await ctx.db.query("boards").withIndex("by_boardId", (q) => q.eq("boardId", member.boardId)).unique();
-      if (board && board.authority !== "importing") {
-        boards.push({ boardId: board.boardId, title: board.title, role: member.role, authority: board.authority, revision: board.revision });
+      if (!board || board.authority === "importing") continue;
+      const entry = { boardId: board.boardId, title: board.title, role: member.role, authority: board.authority, revision: board.revision, lastChangedAt: board.updatedAt };
+      if (board.authority !== "online") { boards.push(entry); continue; }
+      // The dashboard's summary of each online board (Planban 2.0 plan): people,
+      // cards per column, the owner's name on shared boards, and, for the owner
+      // only, how many cards wait on them.
+      const roadmap = await currentRoadmap(ctx, { boardId: board.boardId, generation: board.generation });
+      const cardCounts: Record<string, number> = {};
+      let needYou = 0;
+      for (const item of roadmap.roadmapItems) {
+        if (item.isGroup) continue;
+        cardCounts[item.status] = (cardCounts[item.status] ?? 0) + 1;
+        if (item.status !== "complete" && item.status !== "archived" && /^\s*Owner:/.test(item.nextAction ?? "")) needYou += 1;
       }
+      const people = (await ctx.db.query("members").withIndex("by_board", (q) => q.eq("boardId", board.boardId)).take(MAX_LISTED_PEOPLE + 1)).length;
+      const owner = board.ownerId === connection.userId ? null
+        : await ctx.db.query("people").withIndex("by_userId", (q) => q.eq("userId", board.ownerId)).unique();
+      boards.push({
+        ...entry,
+        people,
+        cardCounts,
+        ...(member.role === "owner" ? { needYou } : { ownerName: owner?.name ?? "Someone" }),
+      });
     }
     return boards;
   },
@@ -200,11 +358,14 @@ async function readableBoard(ctx: Parameters<typeof boardAccess>[0], connectionI
 /** The board. With `since` equal to the current revision, returns only the revision: no roadmap is read. */
 export const getBoard = internalQuery({
   args: { connectionId: v.id("connections"), boardId: v.string(), since: v.optional(v.number()) },
-  handler: async (ctx, { connectionId, boardId, since }) => {
-    const { board } = await readableBoard(ctx, connectionId, boardId);
+  handler: async (ctx, { connectionId, boardId, since }) => packed(await (async () => {
+    const { board, role } = await readableBoard(ctx, connectionId, boardId);
     if (since !== undefined && since === board.revision) return { unchanged: true as const, revision: board.revision, authority: board.authority };
-    return { roadmap: await currentRoadmap(ctx, live(board)), authority: board.authority };
-  },
+    // The role lets the web page show a viewer a board they can read but not change. The
+    // features let a computer's older Planban say it can't show everything (16 October 2026).
+    const goals = await goalsOf(ctx, live(board));
+    return { roadmap: await currentRoadmap(ctx, live(board)), authority: board.authority, role, features: boardFeatures({ hasGoals: hasGoalsContent(goals) }) };
+  })()),
 });
 
 /** A single small row: what live updates subscribe to. */
@@ -224,6 +385,41 @@ export const readDoc = internalQuery({
     const item = roadmap.roadmapItems.find((entry) => entry.id === cardId);
     if (!item) fail("not_found", `Card not found: ${cardId}`);
     return docPayload(await docRow(ctx, live(board), cardId, kind), cardId, kind, (kind === "spec" ? item!.specDoc : item!.planDoc) ?? null);
+  },
+});
+
+/** Agents' refused edits still waiting on this board, or one card (Spec point 20). For agent tools only. */
+async function goalsOf(ctx: QueryCtx, at: BoardRows): Promise<GoalsFile> {
+  const row = await stateRow(ctx, at);
+  return normalizeGoals(row.goals ? unpackJson(row.goals) : null);
+}
+
+/** The board's Goals page, for people and agents; the stored goals too, for backups. */
+/** Anything on the Goals page: goals, retired ones, the Context, or suggestions. */
+function hasGoalsContent(file: GoalsFile) {
+  return Boolean(file.goals.length || file.retired.length || file.context || file.suggestions.length || file.dismissed.length);
+}
+
+export const goals = internalQuery({
+  args: { connectionId: v.id("connections"), boardId: v.string() },
+  handler: async (ctx, { connectionId, boardId }) => packed(await (async () => {
+    const { board } = await readableBoard(ctx, connectionId, boardId);
+    const file = await goalsOf(ctx, live(board));
+    return { page: goalsPage(file), revision: board.revision, ...(hasGoalsContent(file) ? { goals: file } : {}) };
+  })()),
+});
+
+export const unresolved = internalQuery({
+  args: { connectionId: v.id("connections"), boardId: v.string(), cardId: v.optional(v.string()) },
+  handler: async (ctx, { connectionId, boardId, cardId }) => {
+    const { board } = await readableBoard(ctx, connectionId, boardId);
+    const rows = await unresolvedOn(ctx, live(board), cardId);
+    const changes = [];
+    for (const row of rows) {
+      const change = publicUnresolved(row);
+      changes.push({ ...change, by: await personName(ctx, row.userId, row.clientName) });
+    }
+    return packed({ changes });
   },
 });
 
@@ -275,12 +471,12 @@ async function historyDocAt(ctx: Parameters<typeof currentRoadmap>[0], at: Board
 /** The board as it stood at a history version, for reading. */
 export const historyVersion = internalQuery({
   args: { connectionId: v.id("connections"), boardId: v.string(), version: v.number() },
-  handler: async (ctx, { connectionId, boardId, version }) => {
+  handler: async (ctx, { connectionId, boardId, version }) => packed(await (async () => {
     const { board } = await readableBoard(ctx, connectionId, boardId);
     const roadmap = await roadmapAtVersion(ctx, live(board), version);
     if (!roadmap) fail("not_found", `History version not found: v${version}`);
     return { roadmap };
-  },
+  })()),
 });
 
 export const historyDoc = internalQuery({
@@ -292,12 +488,15 @@ export const historyDoc = internalQuery({
   },
 });
 
-async function allDocs(ctx: Parameters<typeof currentRoadmap>[0], at: BoardRows, roadmap: PlanbanRoadmap) {
+async function allDocs(ctx: Parameters<typeof currentRoadmap>[0], at: BoardRows, roadmap: PlanbanRoadmap, spend: (bytes: number) => void = () => undefined) {
   const docs: BoardBundle["docs"] = [];
   for (const item of roadmap.roadmapItems) {
     for (const kind of ["spec", "plan"] as const) {
       const row = await docRow(ctx, at, item.id, kind);
-      if (row) docs.push({ cardId: item.id, kind, markdown: unpackText(row.markdown) });
+      if (!row) continue;
+      const markdown = unpackText(row.markdown);
+      spend(utf8Bytes(markdown));
+      docs.push({ cardId: item.id, kind, markdown });
     }
   }
   return docs;
@@ -306,27 +505,54 @@ async function allDocs(ctx: Parameters<typeof currentRoadmap>[0], at: BoardRows,
 /** The whole board as one bundle. Large boards use the paged export below. */
 export const exportBoard = internalQuery({
   args: { connectionId: v.id("connections"), boardId: v.string() },
-  handler: async (ctx, { connectionId, boardId }): Promise<BoardBundle> => {
+  handler: async (ctx, { connectionId, boardId }) => packed(await (async () => {
     const { board } = await readableBoard(ctx, connectionId, boardId);
     const at = live(board);
+    const tooLarge = () => fail("validation", "This board is too large to export in one response. Use the paged export: /export/meta, then /export/docs and /export/history (Planban's own export does this).");
+    // What is stored is read whole: past the limit, refuse before reading it.
+    const stored = (await ctx.db.query("boardSizes").withIndex("by_board_generation", (q) => q.eq("boardId", at.boardId).eq("generation", at.generation)).unique())?.bytes ?? 0;
+    if (stored > WHOLE_EXPORT_BYTES) tooLarge();
     const roadmap = await currentRoadmap(ctx, at);
-    const history = await historyPage(ctx, at, 0, 100_000);
+    // Assembled against a running budget: history unpacks to a whole board per version, which can
+    // far exceed what is stored, so it stops as soon as the export would pass the limit.
+    let budget = WHOLE_EXPORT_BYTES - utf8Bytes(JSON.stringify(roadmap));
+    const spend = (bytes: number) => { budget -= bytes; if (budget < 0) tooLarge(); };
+    const history: Awaited<ReturnType<typeof historyPage>> = [];
+    for (let after = 0; ;) {
+      // Each version is measured as it is rebuilt; past the budget, the export stops there.
+      const page = await historyPage(ctx, at, after, 10, (version) => { spend(utf8Bytes(JSON.stringify(version))); return true; });
+      if (!page.length) break;
+      history.push(...page);
+      after = page.at(-1)!.entry.version;
+    }
     const historyDocs: NonNullable<BoardBundle["historyDocs"]> = [];
     for await (const row of ctx.db.query("historyDocs").withIndex("by_board_version", (q) => q.eq("boardId", boardId).eq("generation", board.generation))) {
-      historyDocs.push({ version: row.version, cardId: row.cardId, kind: row.kind, markdown: unpackText(row.markdown) });
+      const markdown = unpackText(row.markdown);
+      spend(utf8Bytes(markdown));
+      historyDocs.push({ version: row.version, cardId: row.cardId, kind: row.kind, markdown });
     }
-    return {
-      format: "planban-board-bundle", version: 1, roadmap, docs: await allDocs(ctx, at, roadmap), history, historyDocs,
+    const bundle = {
+      format: "planban-board-bundle", version: 1, roadmap, docs: await allDocs(ctx, at, roadmap, spend), history, historyDocs,
       retiredIds: [...await retiredIds(ctx, at)],
       ...(board.retention === undefined ? {} : { retention: board.retention }),
+      ...await storedGoals(ctx, at),
     };
-  },
+    return bundle;
+  })()),
 });
+
+async function storedGoals(ctx: QueryCtx, at: BoardRows): Promise<{ goals?: GoalsFile }> {
+  const row = await stateRow(ctx, at);
+  return row.goals ? { goals: normalizeGoals(unpackJson(row.goals)) } : {};
+}
+
+/** Estimated size above which the whole-board export refuses, within Convex's 16 MiB per response. */
+const WHOLE_EXPORT_BYTES = 12 * 1024 * 1024;
 
 /** Paged export, first page: the roadmap, retention, retired ids and the list of history versions. */
 export const exportMeta = internalQuery({
   args: { connectionId: v.id("connections"), boardId: v.string(), transferId: v.optional(v.string()) },
-  handler: async (ctx, { connectionId, boardId, transferId }) => {
+  handler: async (ctx, { connectionId, boardId, transferId }) => packed(await (async () => {
     const { board } = await readableBoard(ctx, connectionId, boardId);
     requireLocalTransfer(board, transferId);
     const at = live(board);
@@ -337,8 +563,9 @@ export const exportMeta = internalQuery({
       roadmap: await currentRoadmap(ctx, at), retiredIds: [...await retiredIds(ctx, at)], historyVersions: versions,
       ...(board.retention === undefined ? {} : { retention: board.retention }),
       ...(board.uid ? { uid: board.uid } : {}),
+      ...await storedGoals(ctx, at),
     };
-  },
+  })()),
 });
 
 /**
@@ -347,6 +574,8 @@ export const exportMeta = internalQuery({
  * item so a single large one still gets through.
  */
 const PAGE_BYTES = 6 * 1024 * 1024;
+/** Pages are measured in the bytes they really take, not characters (non-Latin text takes up to four per character). */
+const utf8Bytes = (text: string) => new TextEncoder().encode(text).length;
 
 /** Paged export: current documents, a page of cards at a time. */
 export const exportDocs = internalQuery({
@@ -368,40 +597,72 @@ export const exportDocs = internalQuery({
         const row = await docRow(ctx, at, item.id, kind);
         if (!row) continue;
         const markdown = unpackText(row.markdown);
-        bytes += markdown.length;
+        bytes += utf8Bytes(markdown);
         docs.push({ cardId: item.id, kind, markdown });
       }
     }
-    return { docs, nextOffset: index < roadmap.roadmapItems.length ? index : null };
+    return packed({ docs, nextOffset: index < roadmap.roadmapItems.length ? index : null });
   },
 });
 
 /** Paged export: history versions after `after`, each with its roadmap and document bodies. */
 export const exportHistory = internalQuery({
-  args: { connectionId: v.id("connections"), boardId: v.string(), after: v.number(), limit: v.number(), transferId: v.optional(v.string()) },
-  handler: async (ctx, { connectionId, boardId, after, limit, transferId }) => {
+  args: {
+    connectionId: v.id("connections"), boardId: v.string(), after: v.number(), limit: v.number(), transferId: v.optional(v.string()),
+    /** Continuing one version's documents (moreDocs from the previous page). */
+    docsOf: v.optional(v.number()), docsCursor: v.optional(v.string()),
+  },
+  handler: async (ctx, { connectionId, boardId, after, limit, transferId, docsOf, docsCursor }) => packed(await (async () => {
     const { board } = await readableBoard(ctx, connectionId, boardId);
     requireLocalTransfer(board, transferId);
     const at = live(board);
-    const candidates = await historyPage(ctx, at, after, Math.min(Math.max(limit, 1), 20));
+    const versionDocs = (version: number) => ctx.db.query("historyDocs")
+      .withIndex("by_board_version", (q) => q.eq("boardId", boardId).eq("generation", board.generation).eq("version", version));
+    // One version's documents a page at a time (Convex allows one paginated query per function):
+    // for a version holding more than one response may.
+    if (docsOf !== undefined) {
+      // At most five documents (each at most 1 MB of text): the compressed bytes read say little about the expanded size.
+      const page = await versionDocs(docsOf).paginate({ numItems: 5, cursor: docsCursor ?? null, maximumBytesRead: PAGE_BYTES } as never) as unknown as { page: Array<Doc<"historyDocs">>; isDone: boolean; continueCursor: string };
+      const docs = page.page.map((row) => ({ version: row.version, cardId: row.cardId, kind: row.kind, markdown: unpackText(row.markdown) }));
+      return { history: [], historyDocs: docs, ...(page.isDone ? {} : { moreDocs: { version: docsOf, cursor: page.continueCursor } }) };
+    }
+    // Versions are measured as they are rebuilt: a page holds one version at least, then only what fits.
+    let rebuilt = 0;
+    const candidates = await historyPage(ctx, at, after, Math.min(Math.max(limit, 1), 20), (version) => {
+      const size = utf8Bytes(JSON.stringify(version.roadmap));
+      if (rebuilt > 0 && rebuilt + size > PAGE_BYTES) return false;
+      rebuilt += size;
+      return true;
+    });
     const history: typeof candidates = [];
     const historyDocs: NonNullable<BoardBundle["historyDocs"]> = [];
     let bytes = 0;
     for (const version of candidates) {
-      const docs = [];
-      let size = JSON.stringify(version.roadmap).length;
-      for (const row of await ctx.db.query("historyDocs").withIndex("by_board_version", (q) => q.eq("boardId", boardId).eq("generation", board.generation).eq("version", version.entry.version)).collect()) {
+      let size = utf8Bytes(JSON.stringify(version.roadmap));
+      const docs: typeof historyDocs = [];
+      let tooBig = false;
+      // Read as a stream, stopping once this version passes what one page may hold.
+      for await (const row of versionDocs(version.entry.version)) {
         const markdown = unpackText(row.markdown);
-        size += markdown.length;
+        size += utf8Bytes(markdown);
+        if (size > PAGE_BYTES) {
+          tooBig = true;
+          break;
+        }
         docs.push({ version: row.version, cardId: row.cardId, kind: row.kind, markdown });
       }
-      if (history.length > 0 && bytes + size > PAGE_BYTES) break;
+      if (history.length > 0 && (tooBig || bytes + size > PAGE_BYTES)) break;
+      if (tooBig) {
+        // Too big for any page: the version now, its documents on pages of their own (docsOf).
+        history.push(version);
+        return { history, historyDocs, moreDocs: { version: version.entry.version, cursor: "" } };
+      }
       history.push(version);
       historyDocs.push(...docs);
       bytes += size;
     }
     return { history, historyDocs };
-  },
+  })()),
 });
 
 // ---- writes -------------------------------------------------------------
@@ -498,6 +759,8 @@ interface Outcome {
   version: number;
   revision: number;
   generation?: number;
+  /** A refused agent edit, kept as an unresolved change: a retry returns the same refusal. */
+  refused?: unknown;
 }
 
 export const run = internalMutation({
@@ -505,12 +768,14 @@ export const run = internalMutation({
     connectionId: v.id("connections"),
     boardId: v.string(),
     op: v.string(),
-    input: v.any(),
+    /** The operation's input, packed (see packed() in model/codec.ts). */
+    payload: v.bytes(),
     completionConfirmed: v.optional(v.boolean()),
     idempotencyKey: v.optional(v.string()),
     requestHash: v.optional(v.string()),
   },
-  handler: async (ctx, { connectionId, boardId, op, input: rawInput, completionConfirmed, idempotencyKey, requestHash }) => {
+  handler: async (ctx, { connectionId, boardId, op, payload, completionConfirmed, idempotencyKey, requestHash }) => packed(await (async () => {
+    const rawInput = unpackJson<unknown>(payload);
     const access = await readableBoard(ctx, connectionId, boardId);
     const at = live(access.board);
     // A retry of an edit that already happened returns its original result.
@@ -524,6 +789,7 @@ export const run = internalMutation({
         // board was taken online again, or history was trimmed), the current
         // roadmap is returned and says which revision the edit produced.
         const outcome = unpackJson<Outcome>(seen.outcome);
+        if (outcome.refused) return { refused: outcome.refused as ServiceErrorData };
         const original = outcome.generation === at.generation ? await roadmapAtVersion(ctx, at, outcome.version) : null;
         if (original) return { roadmap: original, result: outcome.result, replayed: true };
         return { roadmap: await currentRoadmap(ctx, at), result: outcome.result, replayed: true, originalRevision: outcome.revision };
@@ -531,19 +797,35 @@ export const run = internalMutation({
     }
     if (!BOARD_OPERATIONS.includes(op as BoardOperation)) fail("not_found", `Unknown operation: ${op}`);
     if (access.board.authority !== "online") fail("conflict", "This board was taken back to Local Mode, so it is read-only online.");
-    if (!access.canWrite) fail("forbidden", "This connection can only read this board.");
     let input = (rawInput && typeof rawInput === "object" ? rawInput : {}) as Record<string, unknown>;
+    const attribution = attributionFor(access.connection, input.actor);
+    // An agent's edit, even through the person's own computer sign-in, stays within what the person lets their agents do.
+    const acting = attribution.actor === "agent" ? asAgent(access) : access;
+    if (!acting.canWrite) fail("forbidden", refusalFor(acting, "plan"));
     const current = await currentRoadmap(ctx, at);
     const now = new Date().toISOString();
-    const attribution = attributionFor(access.connection, input.actor);
     let outcome: { committed: PlanbanRoadmap; version: number; result: unknown };
+    // An agent's earlier refused edits that this one settles (Spec point 20).
+    let settled: Array<{ row: Doc<"unresolvedChanges">; fieldsLeft: string[] }> = [];
     try {
-      if (op === "writeDoc") {
-        outcome = await writeDoc(ctx, access.board, current, input, now, attribution);
+      if (op === "editGoals" || op === "suggestGoalChange" || op === "decideGoalSuggestion") {
+        outcome = await changeGoals(ctx, access.board, current, op, input, now, attribution);
+      } else if (op === "dropChange") {
+        outcome = await dropChange(ctx, access.board, current, input, now, attribution);
+      } else if (op === "writeDoc") {
+        if (attribution.actor === "agent" && typeof input.cardId === "string" && (input.kind === "spec" || input.kind === "plan")) {
+          settled = await settledBy(ctx, at, [{ cardId: input.cardId, field: input.kind }], null);
+        }
+        outcome = await writeDoc(ctx, access.board, current, input, now, attribution, settled.length ? " (reconsidered after an earlier clash)" : "");
+      } else if (op === "writeDocSection") {
+        if (attribution.actor === "agent" && typeof input.cardId === "string" && (input.kind === "spec" || input.kind === "plan")) {
+          settled = await settledBy(ctx, at, [{ cardId: input.cardId, field: sectionField(input) }], null);
+        }
+        outcome = await writeDocSection(ctx, access.board, current, input, now, attribution, settled.length ? " (reconsidered after an earlier clash)" : "");
       } else if (op === "restoreBoard" || op === "restoreCard" || op === "restoreDoc") {
         // Restores state the revision they were based on, like any edit, and
         // pass the same completion and ownership checks.
-        requireBaseRevision(current, input);
+        input = await requireBaseRevision(ctx, at, current, input, op, attribution.actor);
         const version = historyVersionArg(input);
         let change: PlannedChange;
         if (op === "restoreDoc") {
@@ -563,7 +845,7 @@ export const run = internalMutation({
           if (!snapshot) fail("not_found", `History version not found: v${version}`);
           if (op === "restoreBoard") {
             // The whole board can change at once, so only the person's own sign-in may do it.
-            if (!access.connection.canAdminister) fail("forbidden", "Only your own sign-in can restore the whole board.");
+            if (!acting.connection.canAdminister || attribution.actor !== "user") fail("forbidden", "Only the person themselves can restore the whole board, from their own sign-in, not an agent.");
             change = {
               roadmap: { ...snapshot!, revision: current.revision, roadmapItems: await keepLiveDocRefs(ctx, at, current, snapshot!.roadmapItems) },
               history: { actor: attribution.actor, operation: "history.restore.board", summary: `Restored board from v${version}`, affectedCards: snapshot!.roadmapItems.map((item) => item.id) },
@@ -583,7 +865,8 @@ export const run = internalMutation({
             };
           }
         }
-        checkOwnerControlled(current, change.roadmap, access, completionConfirmed);
+        checkOwnerControlled(current, change.roadmap, acting, attribution.actor, completionConfirmed);
+        settled = await settle(ctx, at, op, input, current, change, attribution.actor);
         const { committed, version: written } = await commit(ctx, access.board, current, change, attribution, now);
         outcome = { committed, version: written, result: {} };
       } else {
@@ -591,7 +874,7 @@ export const run = internalMutation({
           // Only re-parenting: status and other move fields are not accepted here.
           input = { cardId: input.cardId, parentId: input.parentId, baseRevision: input.baseRevision };
         }
-        requireBaseRevision(current, input);
+        input = await requireBaseRevision(ctx, at, current, input, op, attribution.actor);
         const plannerInput = { ...input, actor: attribution.actor } as never;
         const retired = await retiredIds(ctx, at);
         const reserve = { now, isIdReserved: (id: string) => retired.has(id) };
@@ -633,12 +916,45 @@ export const run = internalMutation({
           default:
             fail("not_found", `Unknown operation: ${op}`);
         }
-        checkOwnerControlled(current, change.roadmap, access, completionConfirmed);
+        checkOwnerControlled(current, change.roadmap, acting, attribution.actor, completionConfirmed);
+        settled = await settle(ctx, at, op, input, current, change, attribution.actor);
         const { committed, version } = await commit(ctx, access.board, current, change, attribution, now);
         outcome = { committed, version, result: result(committed) };
       }
     } catch (error) {
-      throw asServiceError(error, current.revision);
+      const refusal = asServiceError(error, current.revision);
+      const data = refusal.data as ServiceErrorData;
+      // An agent's edit refused over a clash is kept, never lost silently (Spec point 20).
+      const kept = data.code === "conflict" && data.conflict && attribution.actor === "agent"
+        ? await keepRefused(ctx, at, op, input, data, current, attribution)
+        : null;
+      if (kept) {
+        // A retry with the same key returns this same refusal, and keeps nothing twice.
+        if (idempotencyKey) {
+          await ctx.db.insert("operations", {
+            userId: access.connection.userId, key: idempotencyKey, requestHash: requestHash!, boardId,
+            outcome: packJson({ result: null, version: 0, revision: current.revision, generation: at.generation, refused: kept } satisfies Outcome), createdAt: now,
+          });
+        }
+        return { refused: kept };
+      }
+      throw refusal;
+    }
+    // Settled fields leave the unresolved change; one with nothing left is gone.
+    for (const { row, fieldsLeft } of settled) {
+      if (fieldsLeft.length) {
+        await ctx.db.patch(row._id, { fields: fieldsLeft });
+      } else {
+        await ctx.db.delete(row._id);
+        await addStored(ctx, at, -(row.bytes ?? 0));
+      }
+    }
+    // An agent editing a card is working on it (Spec point 20): a heads-up for others, not a lock.
+    // Agents on a computer say so themselves, with their app's name; this covers apps connected to the service.
+    if (attribution.actor === "agent" && !access.connection.canAdminister) {
+      for (const cardId of editedCards(input, outcome.result)) {
+        await touchPresence(ctx, at, { cardId, connectionId: access.connection._id, userId: access.connection.userId, app: appName(typeof input.agentName === "string" ? input.agentName : access.connection.clientName) });
+      }
     }
     if (idempotencyKey) {
       await ctx.db.insert("operations", {
@@ -648,28 +964,234 @@ export const run = internalMutation({
       });
     }
     return { roadmap: outcome.committed, result: outcome.result };
+  })()),
+});
+
+/** The cards an edit worked on: the card it names, or the ones it created. */
+function editedCards(input: Record<string, unknown>, result: unknown) {
+  const made = result as { createdCard?: { id: string }; createdGroup?: { id: string }; createdCards?: Array<{ id: string }> } | null;
+  const ids = [
+    ...(typeof input.cardId === "string" ? [input.cardId] : []),
+    ...(made?.createdCard ? [made.createdCard.id] : []), ...(made?.createdGroup ? [made.createdGroup.id] : []), ...(made?.createdCards ?? []).map((card) => card.id),
+  ];
+  return [...new Set(ids)].slice(0, 20);
+}
+
+/** An agent reading a card is working on it too. */
+export const notePresence = internalMutation({
+  args: { connectionId: v.id("connections"), boardId: v.string(), cardId: v.string(), agentName: v.optional(v.string()) },
+  handler: async (ctx, { connectionId, boardId, cardId, agentName }) => {
+    const access = await readableBoard(ctx, connectionId, boardId);
+    // A card id's shape only: reading the board here would make every board edit retry this.
+    if (!/^[a-z0-9][a-z0-9-]{0,99}$/.test(cardId)) return { noted: false };
+    await touchPresence(ctx, live(access.board), { cardId, connectionId: access.connection._id, userId: access.connection.userId, app: appName(agentName ?? access.connection.clientName) });
+    return { noted: true };
   },
 });
 
-async function writeDoc(ctx: MutationCtx, board: Doc<"boards">, current: PlanbanRoadmap, input: Record<string, unknown>, now: string, attribution: Attribution) {
+/** Who else is working on a card, or on each card, in words for agents. */
+export const working = internalQuery({
+  args: { connectionId: v.id("connections"), boardId: v.string(), cardId: v.optional(v.string()), agentName: v.optional(v.string()) },
+  handler: async (ctx, { connectionId, boardId, cardId, agentName }) => {
+    const access = await readableBoard(ctx, connectionId, boardId);
+    // Leaves out only the asking agent itself: another app on the same sign-in is someone else.
+    const byCard = await workingOn(ctx, live(access.board), { ...(cardId ? { cardId } : {}), except: { connectionId: access.connection._id, app: appName(agentName ?? access.connection.clientName) } });
+    const out: Record<string, Array<{ who: string; startedAt: string; lastActiveAt: string; note: string }>> = {};
+    for (const [card, entries] of Object.entries(byCard)) {
+      out[card] = [];
+      for (const entry of entries) {
+        const person = await ctx.db.query("people").withIndex("by_userId", (q) => q.eq("userId", entry.userId)).unique();
+        const who = `${entry.app} (${person?.name || person?.email || "someone on the board"})`;
+        out[card]!.push({ who, startedAt: entry.startedAt, lastActiveAt: entry.lastActiveAt, note: workingSentence(who, entry.startedAt) });
+      }
+    }
+    return { working: out };
+  },
+});
+
+/** A section's identity in an unresolved change: "spec:Heading#0" (repeated headings are told apart). */
+function sectionField(input: Record<string, unknown>) {
+  return `${String(input.kind)}:${String(input.heading ?? "").trim()}#${typeof input.occurrence === "number" ? input.occurrence : 0}`;
+}
+
+/** The unresolved changes this agent edit settles; its history says so, plainly. */
+async function settle(ctx: MutationCtx, at: BoardRows, op: string, input: Record<string, unknown>, current: PlanbanRoadmap, change: PlannedChange, actor: "user" | "agent") {
+  if (actor !== "agent") return [];
+  const touched = settlingFields(op, input, current);
+  if (!touched?.length) return [];
+  const settled = await settledBy(ctx, at, touched, typeof input.baseRevision === "number" ? input.baseRevision : null);
+  if (settled.length) change.history = { ...change.history, summary: `${change.history.summary} (reconsidered after an earlier clash)` };
+  return settled;
+}
+
+/** Records a refused agent edit as an unresolved change on its card, and says so in the refusal. */
+async function keepRefused(ctx: MutationCtx, at: BoardRows, op: string, input: Record<string, unknown>, data: ServiceErrorData, current: PlanbanRoadmap, attribution: Attribution) {
+  const conflict = data.conflict as unknown as ConflictDetails;
+  const cardId = typeof input.cardId === "string" ? input.cardId : conflict.clashes?.[0]?.cardId ?? conflict.document?.cardId;
+  if (!cardId) return null;
+  // Every field the refused edit wanted is unapplied, not only the ones that clashed.
+  const wanted = touchedFields(op, input, current)?.filter((entry) => entry.cardId === cardId).map((entry) => entry.field) ?? [];
+  const clashing = conflict.clashes?.filter((clash) => clash.cardId === cardId).map((clash) => clash.field) ?? [];
+  const fields = conflict.section && conflict.document ? [sectionField(input)]
+    : conflict.document ? [conflict.document.kind]
+    : [...new Set([...clashing, ...wanted])];
+  const { baseRevision: _base, actor: _actor, idempotencyKey: _key, ...proposed } = input;
+  // Kept text follows the same rules and limits as any write: text only, counted toward the day's writes and the board's size.
+  try {
+    checkIndexValue(proposed, "the refused edit", MAX_DOCUMENT_BYTES + MAX_CARD_BYTES);
+  } catch (error) {
+    throw asServiceError(error);
+  }
+  const bytes = sizeOf(proposed);
+  await chargeWrite(ctx, attribution.userId, bytes);
+  const changeId = await recordUnresolved(ctx, at, {
+    cardId, userId: attribution.userId, clientName: attribution.clientName, createdAt: new Date().toISOString(), op, proposed,
+    fields: fields.length ? fields : ["*"], refusedAtRevision: current.revision, message: data.message.split(". The ")[0]!.slice(0, 500), bytes,
+  });
+  if (!changeId) {
+    return { ...data, message: `${data.message} This board already has ${MAX_PER_BOARD} unresolved changes waiting, so this one is not kept: settle or drop some, then make this edit again from the current version.` };
+  }
+  await addStored(ctx, at, bytes);
+  return {
+    ...data,
+    message: `${data.message} Until you save a reconsidered version or drop it (planban_drop_change with a reason), it is kept as unresolved change ${changeId} on this card, for agents to see.`,
+    conflict: { ...conflict, unresolvedChange: changeId } as unknown as Value,
+  };
+}
+
+/** Drops an unresolved change, with the reason, into the card's history. */
+/**
+ * Goals (owner decisions, 16 October 2026): people change them, from their own
+ * sign-in; agents only suggest. Each change is a board revision with a history
+ * entry, like any edit, so live updates, clashes and retries work the same.
+ */
+async function changeGoals(ctx: MutationCtx, board: Doc<"boards">, current: PlanbanRoadmap, op: string, input: Record<string, unknown>, now: string, attribution: Attribution) {
+  if (op !== "suggestGoalChange" && attribution.actor !== "user") fail("forbidden", PEOPLE_ONLY);
+  const at = live(board);
+  const file = await goalsOf(ctx, at);
+  const agentClient = attribution.actor === "agent" ? appName(typeof input.agentName === "string" ? input.agentName : attribution.clientName) : null;
+  const stamp = { revision: current.revision + 1, baseRevision: typeof input.baseRevision === "number" ? input.baseRevision : undefined, by: await personName(ctx, attribution.userId, agentClient), now };
+  let planned: { goals: GoalsFile; summary: string; suggestion?: unknown };
+  if (op === "editGoals") planned = applyGoalEdit(file, input.edit, stamp);
+  else if (op === "decideGoalSuggestion") planned = decideSuggestion(file, { suggestionId: input.suggestionId, decision: input.decision }, stamp);
+  else {
+    const added = addSuggestion(file, { change: input.change, reason: input.reason }, { ...stamp, id: crypto.randomUUID() });
+    // Nothing new to show the person: no revision, no history entry.
+    if (!added.goals) return { committed: current, version: 0, result: { page: goalsPage(file), revision: current.revision, notAdded: added.notAdded } };
+    planned = added;
+  }
+  // The same measure as on a computer, so goals that fit online still fit after Take Local.
+  try {
+    assertGoalsSize(planned.goals);
+  } catch (error) {
+    throw asServiceError(error);
+  }
+  const packed = packJson(planned.goals);
+  const { committed, version } = await commit(ctx, board, current, { roadmap: current, history: { actor: attribution.actor, operation: "goals.edit", summary: planned.summary, affectedCards: [] }, docWrites: [] }, attribution, now);
+  const state = await stateRow(ctx, at);
+  await chargeWrite(ctx, attribution.userId, sizeOf(packed));
+  await ctx.db.patch(state._id, { goals: packed });
+  await addStored(ctx, at, sizeOf(packed) - (state.goals ? sizeOf(state.goals) : 0));
+  return { committed, version, result: { page: goalsPage(planned.goals), revision: committed.revision, ...(planned.suggestion ? { suggestion: planned.suggestion } : {}) } };
+}
+
+async function dropChange(ctx: MutationCtx, board: Doc<"boards">, current: PlanbanRoadmap, input: Record<string, unknown>, now: string, attribution: Attribution) {
+  const changeId = String(input.changeId ?? "");
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+  if (!reason) fail("validation", "Say why the change is dropped (reason).");
+  if (reason.length > 500) fail("validation", "Keep the reason under 500 characters.");
+  const row = await ctx.db.query("unresolvedChanges").withIndex("by_changeId", (q) => q.eq("changeId", changeId)).unique();
+  if (!row || row.boardId !== board.boardId || row.generation !== board.generation) fail("not_found", `Unresolved change not found: ${changeId}`);
+  const card = current.roadmapItems.find((item) => item.id === row!.cardId);
+  await ctx.db.delete(row!._id);
+  await addStored(ctx, live(board), -(row!.bytes ?? 0));
+  const change: PlannedChange = {
+    roadmap: current,
+    history: { actor: attribution.actor, operation: "card.change.dropped", summary: `Dropped an edit to ${card ? card.title : row!.cardId}: ${reason}`, affectedCards: card ? [card.id] : [] },
+    docWrites: [],
+  };
+  const { committed, version } = await commit(ctx, board, current, change, attribution, now);
+  return { committed, version, result: { dropped: changeId } };
+}
+
+/**
+ * One section of a Spec or Plan, by heading (Spec point 20): checked against
+ * that section's own version, so edits to other sections never clash.
+ */
+async function writeDocSection(ctx: MutationCtx, board: Doc<"boards">, current: PlanbanRoadmap, input: Record<string, unknown>, now: string, attribution: Attribution, note: string) {
+  const cardId = String(input.cardId ?? "");
+  const kind = input.kind as DocKind;
+  if (!DOC_KINDS.has(kind)) fail("validation", "kind must be spec or plan.");
+  const heading = typeof input.heading === "string" ? input.heading.trim() : "";
+  if (!heading) fail("validation", "heading is the section's heading text, without the #s.");
+  if (typeof input.markdown !== "string") fail("validation", "markdown is the whole section, starting with its heading line.");
+  if (input.expectedSectionVersion !== null && typeof input.expectedSectionVersion !== "string") {
+    fail("validation", "expectedSectionVersion is the section's version from read_doc (sections), or null for a new section.");
+  }
+  if (!current.roadmapItems.some((item) => item.id === cardId)) fail("not_found", `Card not found: ${cardId}`);
+  const existing = await docRow(ctx, live(board), cardId, kind);
+  const before = existing ? unpackText(existing.markdown) : "";
+  let edit: SectionEdit;
+  try {
+    edit = editSection(before, {
+      heading, expectedVersion: input.expectedSectionVersion as string | null, text: input.markdown as string,
+      ...(typeof input.occurrence === "number" ? { occurrence: input.occurrence } : {}), ...(typeof input.after === "string" ? { after: input.after } : {}),
+    });
+  } catch (error) {
+    throw asServiceError(error);
+  }
+  if (!edit.ok) {
+    const changes = existing ? [{
+      at: existing.updatedAt, by: await personName(ctx, existing.updatedBy, existing.updatedByAgent ? existing.updatedByClient ?? "" : null),
+      agent: existing.updatedByAgent === true, summary: existing.updateSummary ?? `Edited the ${kind === "spec" ? "Spec" : "Plan"}`, cards: [cardId],
+    }] : [];
+    const document = docPayload(existing, cardId, kind, null);
+    const conflict: ConflictDetails = {
+      currentRevision: current.revision, changes, section: edit.current,
+      document: document.markdown.length > MAX_CONFLICT_DOCUMENT_CHARS ? { ...document, markdown: "", markdownOmitted: true as const } : document,
+    };
+    const where = `the "${heading}" section of the ${kind === "spec" ? "Spec" : "Plan"} of ${cardSubject(current, cardId)}`;
+    const message = edit.reason === "changed"
+      ? conflictMessage(where, conflict, attribution.actor === "agent")
+      : edit.reason === "missing"
+        ? `Not saved: ${where} is no longer there (it was removed or renamed since you read it).${attribution.actor === "agent" ? ` ${RECONCILE}` : ""}`
+        : `Not saved: a section called "${heading}" was added since you read it.${attribution.actor === "agent" ? ` ${RECONCILE}` : ""}`;
+    fail("conflict", message, { currentRevision: current.revision, conflict: conflict as unknown as Value });
+  }
+  const written = await writeDoc(ctx, board, current, { cardId, kind, markdown: edit.markdown, expectedMtimeMs: existing?.stamp ?? null }, now, attribution, ` (the "${heading}" section)${note}`);
+  return { ...written, result: { ...(written.result as Record<string, unknown>), section: edit.section } };
+}
+
+async function writeDoc(ctx: MutationCtx, board: Doc<"boards">, current: PlanbanRoadmap, input: Record<string, unknown>, now: string, attribution: Attribution, note = "") {
   const cardId = String(input.cardId ?? "");
   const kind = input.kind as DocKind;
   if (!DOC_KINDS.has(kind)) fail("validation", "kind must be spec or plan.");
   if (typeof input.markdown !== "string") fail("validation", "markdown must be a string.");
   // A document edit's base version is the document's own stamp (below); the
   // board revision is checked too when the caller states it.
-  if (input.baseRevision !== undefined) requireBaseRevision(current, input);
+  // A document's own version is its check (below); the board revision isn't, so edits elsewhere on the board never refuse it.
   const planned = planWriteDoc(current, { cardId, kind }, { now });
   const existing = await docRow(ctx, live(board), cardId, kind);
   // Documents also state the version they were based on: their stamp, or null for a new document.
   if (input.expectedMtimeMs === undefined) {
     fail("validation", "Online document edits must state the document version they were based on: expectedMtimeMs from reading it, or null for a new document (on the command line, --expected-mtime <mtimeMs> or --expected-mtime new).", { currentRevision: current.revision });
   }
-  if (existing && existing.stamp !== input.expectedMtimeMs) fail("conflict", "Document changed online. Reload before saving.", { currentRevision: current.revision });
-  if (!existing && input.expectedMtimeMs !== null) fail("conflict", "Document was removed online. Reload before saving.", { currentRevision: current.revision });
+  if ((existing && existing.stamp !== input.expectedMtimeMs) || (!existing && input.expectedMtimeMs !== null)) {
+    // The document as it is now, and who last changed it, so the agent can reconcile.
+    // A very long document is left out of the answer (read it with read_doc); its version is always there.
+    const full = docPayload(existing, cardId, kind, planned.path);
+    const document = full.markdown.length > MAX_CONFLICT_DOCUMENT_CHARS ? { ...full, markdown: "", markdownOmitted: true as const } : full;
+    // Who last wrote it is kept on the document itself, so no history scan is needed.
+    const changes = existing ? [{
+      at: existing.updatedAt, by: await personName(ctx, existing.updatedBy, existing.updatedByAgent ? existing.updatedByClient ?? "" : null),
+      agent: existing.updatedByAgent === true, summary: existing.updateSummary ?? `Edited the ${kind === "spec" ? "Spec" : "Plan"}`, cards: [cardId],
+    }] : [];
+    const conflict: ConflictDetails = { currentRevision: current.revision, changes, document };
+    fail("conflict", conflictMessage(`the ${kind === "spec" ? "Spec" : "Plan"} of ${cardSubject(current, cardId)}`, conflict, attribution.actor === "agent"), { currentRevision: current.revision, conflict: conflict as unknown as Value });
+  }
   const change: PlannedChange = {
     roadmap: planned.roadmap ?? current,
-    history: { ...planned.history, actor: attribution.actor },
+    history: { ...planned.history, actor: attribution.actor, summary: `${planned.history.summary}${note}` },
     docWrites: [{ cardId, kind, path: planned.path, markdown: input.markdown as string }],
   };
   // A document edit is a board change too: it bumps the revision so every

@@ -1,21 +1,73 @@
 import { PlanbanConflictError, PlanbanNotFoundError, PlanbanValidationError } from "../boardOperations";
-import { readCredentials, serviceUrl, type OnlineCredentials } from "./credentials";
+import { accountCredentials, readCredentials, serviceUrl, type OnlineCredentials } from "./credentials";
+import { boardAccount } from "./boardLinks";
 import { planbanCommand } from "../command";
+import { PlanbanEditConflictError, type ConflictDetails } from "../conflicts";
+import { PLANBAN_VERSION_HEADER, UPDATE_REQUIRED_MESSAGE, UPDATE_REQUIRED_STATUS } from "../clientVersion";
+import { PLANBAN_VERSION } from "../version";
 
 export class OnlineAuthenticationError extends Error {
   constructor(
     message: string,
     public readonly statusCode = 401,
     /** For a missing or ended sign-in: the service to sign in to, and which of the two it was. */
-    public readonly signIn?: { url: string; reason: "missing" | "expired" },
+    public readonly signIn?: { url: string; reason: "missing" | "expired"; account?: string | null },
   ) {
     super(message);
     this.name = "OnlineAuthenticationError";
   }
 }
 
-function loginRequired(url: string, reason: "missing" | "expired") {
-  return new OnlineAuthenticationError(`Online Board sign-in expired or is missing. Run ${planbanCommand()} online login ${url}.`, 401, { url, reason });
+/** The service needs a newer Planban for this (16 October 2026). Its message is plain and points at Update. */
+export class PlanbanUpdateRequiredError extends Error {
+  readonly statusCode = UPDATE_REQUIRED_STATUS;
+  constructor(message = UPDATE_REQUIRED_MESSAGE) {
+    super(message);
+    this.name = "PlanbanUpdateRequiredError";
+  }
+}
+
+/** The service refused this connection the action (a viewer, an agent's level, or an owner-only step). Its message says which, and what to do. */
+export class PlanbanForbiddenError extends Error {
+  readonly statusCode = 403;
+  constructor(message: string) {
+    super(message);
+    this.name = "PlanbanForbiddenError";
+  }
+}
+
+function loginRequired(url: string, reason: "missing" | "expired", account?: string | null) {
+  if (account !== undefined) {
+    const who = account ?? "the Planban account it was linked to";
+    const state = reason === "expired" ? "whose sign-in on this computer has ended" : "which isn't signed in on this computer";
+    return new OnlineAuthenticationError(`This board uses ${who}, ${state}. Sign in as ${who}: ${planbanCommand()} online sign-in ${url}`, 401, { url, reason, account: account ?? null });
+  }
+  return new OnlineAuthenticationError(`Online Board sign-in expired or is missing. Run ${planbanCommand()} online sign-in ${url}.`, 401, { url, reason });
+}
+
+/**
+ * The sign-in for a board's own account, for /api/v1/boards/<id>/… requests.
+ * A board linked to an account that isn't signed in here is refused, naming
+ * that account; it never falls back to another account's sign-in.
+ */
+async function linkedAccount(url: string, path: string, post = false): Promise<{ credentials: OnlineCredentials; email: string | null } | null> {
+  const match = /^\/api\/v1\/boards\/([^/?]+)/u.exec(path);
+  // POST /api/v1/boards/import makes a new board; any other path naming "import" is a board of that name.
+  if (!match || (post && path === "/api/v1/boards/import")) return null;
+  const link = await boardAccount(url, decodeURIComponent(match[1]!));
+  if (!link) return null;
+  const credentials = await accountCredentials(url, link.person);
+  if (!credentials) throw loginRequired(url, "missing", link.email ?? null);
+  return { credentials, email: credentials.email ?? link.email ?? null };
+}
+
+/**
+ * The sign-in a board's requests use, for requests about the board that
+ * aren't under its own path (who am I, live updates, keys): its own
+ * account's, or the default's while it has no link here.
+ */
+export async function boardCredentials(url: string, boardId: string): Promise<OnlineCredentials> {
+  return (await linkedAccount(serviceUrl(url), `/api/v1/boards/${encodeURIComponent(boardId)}`))?.credentials ?? requireCredentials(url);
 }
 
 export async function requireCredentials(url: string): Promise<OnlineCredentials> {
@@ -64,13 +116,16 @@ async function authorizedResponse(urlInput: string, path: string, body: unknown,
   const url = serviceUrl(urlInput);
   // Machine sign-ins, keys and development sign-ins do not expire by time or
   // refresh; when the service stops accepting one, the person signs in again.
-  const credentials = options.credentials ?? await requireCredentials(url);
+  // A board's requests use the account its link on this computer names, never another (several can be signed in).
+  const linked = options.credentials ? null : await linkedAccount(url, path, body !== undefined);
+  const credentials = options.credentials ?? linked?.credentials ?? await requireCredentials(url);
   const raw = body instanceof RawBody;
   const payload = body === undefined ? undefined : raw ? new Blob([body.bytes as Uint8Array<ArrayBuffer>]) : JSON.stringify(body);
   const send = () => fetch(`${url}${path}`, {
     method: body === undefined ? "GET" : raw ? "PUT" : "POST",
     headers: {
       Authorization: `Bearer ${credentials.accessToken}`, "Content-Type": raw ? "application/octet-stream" : "application/json",
+      [PLANBAN_VERSION_HEADER]: PLANBAN_VERSION,
       ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}),
     },
     ...(payload === undefined ? {} : { body: payload }),
@@ -83,7 +138,13 @@ async function authorizedResponse(urlInput: string, path: string, body: unknown,
       return await send();
     } catch (error) {
       if (!retryable || options.signal?.aborted) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // The pause before the retry ends early if the caller's time is up.
+      await new Promise<void>((resolve) => {
+        const stop = () => { clearTimeout(timer); resolve(); };
+        const timer = setTimeout(() => { options.signal?.removeEventListener("abort", stop); resolve(); }, 500);
+        options.signal?.addEventListener("abort", stop, { once: true });
+      });
+      if (options.signal?.aborted) throw error;
       return send();
     }
   };
@@ -92,14 +153,17 @@ async function authorizedResponse(urlInput: string, path: string, body: unknown,
     const payload = await response.json().catch(() => ({}));
     const message = payload.error?.message ?? `Online Board request failed (${response.status}).`;
     if (response.status === 409) {
+      // A refused edit carries what changed, by whom, and the current card or document.
+      if (payload.error?.conflict) throw new PlanbanEditConflictError(message, payload.error.conflict as ConflictDetails);
       const error = new PlanbanConflictError(message);
       Object.assign(error, { currentRevision: payload.currentRevision ?? payload.error?.currentRevision });
       throw error;
     }
     if (response.status === 400) throw new PlanbanValidationError(message);
     if (response.status === 404) throw new PlanbanNotFoundError(message);
-    if (response.status === 401) throw loginRequired(url, "expired");
-    if (response.status === 403) throw new OnlineAuthenticationError(`${message} Ask the board owner for access.`, 403);
+    if (response.status === 401) throw loginRequired(url, "expired", linked?.email);
+    if (response.status === 403) throw new PlanbanForbiddenError(message);
+    if (response.status === UPDATE_REQUIRED_STATUS) throw new PlanbanUpdateRequiredError(payload.error?.message);
     // A daily limit (owner decision 18): kept as 429 so the board page and agents see a limit, not a failure.
     if (response.status === 429) throw Object.assign(new Error(message), { name: "OnlineLimitError", statusCode: 429 });
     throw new Error(message);

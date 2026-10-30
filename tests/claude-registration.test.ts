@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { openNote } from "../online/service/convex/model/signInNote";
 import { test } from "node:test";
 import { getFunctionName } from "convex/server";
 import { CLAUDE_REDIRECTS, parseClaudeRegistration, REGISTERED_CLIENT_NAME } from "../online/service/convex/model/oauthClient";
@@ -14,7 +15,7 @@ const CLIENT = `pbc_${"c".repeat(43)}`;
 const claudeBody = { client_name: "Claude", redirect_uris: [CLAUDE_REDIRECTS[0]], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none" };
 
 async function configured(run: () => Promise<void>) {
-  const values = { PLANBAN_PUBLIC_URL: origin, CLERK_ISSUER: "https://fixture.clerk.example", CLERK_PUBLISHABLE_KEY: "pk_test_" + btoa("fixture.clerk.example$"), CLERK_SECRET_KEY: "synthetic-fixture-only" };
+  const values = { PLANBAN_PUBLIC_URL: origin, CLERK_ISSUER: "https://fixture.clerk.example", CLERK_PUBLISHABLE_KEY: "pk_test_" + btoa("fixture.clerk.example$"), CLERK_SECRET_KEY: "synthetic-fixture-only", PLANBAN_SIGNIN_NOTE_KEY: "synthetic-sign-in-note-key-for-tests-only" };
   const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
   try { Object.assign(process.env, values); await run(); }
   finally { for (const [key, value] of Object.entries(previous)) if (value === undefined) delete process.env[key]; else process.env[key] = value; }
@@ -211,8 +212,10 @@ test("authorization for a registered client uses the stored registration, never 
     const ok = await authorizationResponse(ctx, new Request(`${origin}/oauth/authorize?${new URLSearchParams(fields)}`), loader);
     assert.equal(ok.status, 303);
     assert.equal(fetched, 0);
-    assert.equal(created[0][0], "oauth:createRequest");
-    assert.equal(created[0][1].clientName, REGISTERED_CLIENT_NAME);
+    // Nothing is stored at the start; the note carries the registered client's name.
+    assert.deepEqual(created, []);
+    const note = await openNote(new URL(ok.headers.get("Location")!).searchParams.get("request")!, "consent");
+    assert.equal(note?.clientName, REGISTERED_CLIENT_NAME);
     const wrongCallback = await authorizationResponse(ctx, new Request(`${origin}/oauth/authorize?${new URLSearchParams({ ...fields, redirect_uri: "https://claude.com/api/mcp/auth_callback" })}`), loader);
     assert.equal(wrongCallback.status, 400);
     const unknown = await authorizationResponse(ctx, new Request(`${origin}/oauth/authorize?${new URLSearchParams({ ...fields, client_id: `pbc_${"z".repeat(43)}` })}`), loader);

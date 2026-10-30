@@ -1,4 +1,4 @@
-import { Command, Option } from "commander";
+import { Command, CommanderError, Option } from "commander";
 import { readFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
@@ -8,9 +8,12 @@ import {
   getStatus,
   initializeProject,
   loadState,
+  dropChange,
   moveCard,
+  unresolvedChanges,
   readDoc,
-  setCardStatus,
+  readDocSections,
+  writeDocSection,
   setCardParent,
   cardAncestry,
   writeDoc,
@@ -21,7 +24,11 @@ import {
   exportFlatVersion1,
   reconstructHierarchy,
   readManifest,
+  readGoals,
+  readGoalsBlock,
+  suggestGoalChange,
 } from "./core/storage";
+import { goalsPageText } from "./core/goals";
 import { PLANBAN_STATUSES, type PlanbanStatus } from "./core/types";
 import { queryWorkItems, workItemQueryFromSearchParams } from "./core/workItemQuery";
 import { friendlyPath } from "./core/indexCheck";
@@ -31,6 +38,8 @@ import { buildUpdateCommandPlan, runPlanbanUpdate } from "./core/updateRunner";
 import { updatePreflight } from "./core/updatePreflight";
 import { PLANBAN_VERSION } from "./core/version";
 import { startServer } from "./server/server";
+import { listAccounts, rememberIdentity, switchAccount } from "./core/online/accounts";
+import { errorReport } from "./core/errorReport";
 import { onlineLogin } from "./core/online/login";
 import { onlineStatus } from "./core/online/credentials";
 import { createKey, listConnections, onlineLogout, revokeConnection } from "./core/online/connections";
@@ -113,19 +122,46 @@ const program = new Command();
 program.name("planban").description("Agent-native planning board for Codex and Claude Code: local by default, online when you share a board").version(PLANBAN_VERSION);
 
 const online = program.command("online").description("Sign in and move boards between local and online authority");
-online.command("login <url>").description("sign this computer in to Planban Online, for example: login https://app.planban.ai")
+online.command("sign-in <url>").description("add a Planban account on this computer, for example: sign-in https://app.planban.ai; other accounts stay signed in, and this one becomes the default for new boards")
   // Development-only sign-in on a local backend; hidden from help.
   .addOption(new Option("--access <scope>", "with --dev-user: connection access").choices(["all", "board"]).default("all").hideHelp())
   .addOption(new Option("--boards <id>", "with --dev-user: the one board the connection reaches").hideHelp())
   .addOption(new Option("--dev-user <id>", "development sign-in on a local Online Board backend").hideHelp())
   .option("--key-env <name>", "sign in with a personal access key held in this environment variable")
-  .option("--no-browser", "print the sign-in link instead of opening a browser (for remote machines)")
+  .option("--device", "sign in by approving a link on any signed-in device, computer or phone")
+  .option("--no-browser", "print the approval link instead of opening a browser (for remote or headless machines)")
+  // Kept so older scripts still run: adding an account no longer replaces another.
+  .addOption(new Option("--switch-account", "no longer needed: signing in adds an account").hideHelp())
   .action(async (url, options) => print(await onlineLogin(url, {
     ...options,
-    ...(options.browser === false ? { openBrowser: async (link: string) => { process.stderr.write(`Open this link to sign in to Planban:\n${link}\n`); } } : {}),
+    // Without a browser here, approve by link on any device: a loopback callback can't reach a remote machine.
+    ...(options.browser === false ? { printOnly: true } : {}),
   }), {}));
-online.command("logout <url>").description("sign out on this machine and revoke its connection")
-  .action(async (url) => print(await onlineLogout(url), {}));
+online.command("login <url>").description("same as sign-in")
+  // Development-only sign-in on a local backend; hidden from help.
+  .addOption(new Option("--access <scope>", "with --dev-user: connection access").choices(["all", "board"]).default("all").hideHelp())
+  .addOption(new Option("--boards <id>", "with --dev-user: the one board the connection reaches").hideHelp())
+  .addOption(new Option("--dev-user <id>", "development sign-in on a local Online Board backend").hideHelp())
+  .option("--key-env <name>", "sign in with a personal access key held in this environment variable")
+  .option("--device", "sign in by approving a link on any signed-in device, computer or phone")
+  .option("--no-browser", "print the approval link instead of opening a browser (for remote or headless machines)")
+  // Kept so older scripts still run: adding an account no longer replaces another.
+  .addOption(new Option("--switch-account", "no longer needed: signing in adds an account").hideHelp())
+  .action(async (url, options) => print(await onlineLogin(url, {
+    ...options,
+    // Without a browser here, approve by link on any device: a loopback callback can't reach a remote machine.
+    ...(options.browser === false ? { printOnly: true } : {}),
+  }), {}));
+for (const name of ["sign-out", "logout"]) {
+  online.command(`${name} <url>`).description(name === "logout" ? "same as sign-out" : "sign one account out on this computer and revoke its connection; its boards say so until it signs in again")
+    .option("--account <email>", "which account, when several are signed in")
+    .action(async (url, options) => print(await onlineLogout(url, { account: options.account }), options));
+}
+online.command("accounts").description("the accounts signed in on this computer, the default for new boards, and which boards use each")
+  .action(async (options) => print(await listAccounts(), options));
+online.command("switch <url>").description("change the default account for boards taken online or attached from now on; boards already linked keep theirs")
+  .requiredOption("--account <email>", "a signed-in account")
+  .action(async (url, options) => print(await switchAccount(url, options.account), options));
 online.command("connections <url>").description("list this person's machines, agents and keys")
   .action(async (url) => print(await listConnections(url), {}));
 online.command("revoke <url> <connectionId>").description("cut off a machine, agent or key at once")
@@ -140,9 +176,15 @@ keys.command("create <url>").requiredOption("--board <id>", "the one board the k
     process.stderr.write("Copy this key now. Planban keeps only a fingerprint of it and cannot show it again.\n");
     print(created, {});
   });
-online.command("status").description("which Planban Online services this computer is signed in to").action(async () => print(await onlineStatus(), {}));
+online.command("status").description("which Planban Online services this computer is signed in to, and as whom").action(async () => {
+  // Sign-ins from before emails were kept: ask the service once, quietly.
+  const before = await onlineStatus();
+  for (const service of before) if (!service.signedInAs) await rememberIdentity(service.url, 1).catch(() => undefined);
+  print(await onlineStatus(), {});
+});
 online.command("take-online <url>").description("take this project's board online, for example to https://app.planban.ai; it must hold no files").option("--cwd <path>", "project directory")
-  .action(async (url, options) => print(await takeOnline(url, cwdOption(options.cwd)), {}));
+  .option("--account <email>", "as this signed-in account (the default otherwise); the board uses it from now on")
+  .action(async (url, options) => print(await takeOnline(url, cwdOption(options.cwd), { account: options.account }), options));
 online.command("stop-take-online").description("stop an unfinished take-online; the board stays on this machine").option("--cwd <path>", "project directory")
   .action(async (options) => print(await stopTakeOnline(cwdOption(options.cwd)), {}));
 const onlineBoardOf = async (cwd: string) => {
@@ -160,7 +202,8 @@ online.command("take-local").description("bring this project's online board back
   .action(async (options) => print(await takeLocal(cwdOption(options.cwd), { removeOthers: !!options.removeOthers }), {}));
 online.command("attach <url> <boardId>").description("use an online board in this project folder on this computer").requiredOption("--cwd <path>", "project directory")
   .option("--replace-stale-copy", "set aside this project's out-of-date local copy of the board")
-  .action(async (url, boardId, options) => print(await attachOnline(url, boardId, cwdOption(options.cwd), { replaceStaleCopy: !!options.replaceStaleCopy }), {}));
+  .option("--account <email>", "use the board as this signed-in account (the default otherwise)")
+  .action(async (url, boardId, options) => print(await attachOnline(url, boardId, cwdOption(options.cwd), { replaceStaleCopy: !!options.replaceStaleCopy, account: options.account }), options));
 online.command("restore-backup").description("make a new local board from a backup this computer kept of an online board").requiredOption("--from <folder>", "backup folder: .../latest or .../daily/<date>")
   .requiredOption("--cwd <path>", "empty project directory").requiredOption("--repo-id <id>", "id for the restored local board")
   .action(async (options) => print(await restoreBackup(options.from, cwdOption(options.cwd), options.repoId), {}));
@@ -219,7 +262,10 @@ program
   .option("--cwd <path>", "project directory")
   .option("-o, --output <format>", "output format")
   .action(async (options) => {
-    print(await getStatus(cwdOption(options.cwd)), options);
+    const status = await getStatus(cwdOption(options.cwd));
+    // The goal statements only, when the board has goals.
+    const goals = status.initialized ? await readGoalsBlock(status.cwd) : null;
+    print({ ...status, ...(goals ? { goals } : {}) }, options);
   });
 
 program
@@ -336,10 +382,11 @@ program
   .description("delete a whole Planban board after creating a timestamped local backup")
   .argument("<repoId>")
   .option("--yes", "confirm deletion")
+  .option("--this-computer-only", "for an online board: only remove it from this computer; it stays online for everyone")
   .option("-o, --output <format>", "output format")
   .action(async (repoId, options) => {
     if (!options.yes) throw new Error("Refusing to delete a board without --yes");
-    print(await deleteBoard(repoId), options);
+    print(await deleteBoard(repoId, { thisComputerOnly: options.thisComputerOnly === true }), options);
   });
 
 program
@@ -418,8 +465,10 @@ program
   .option("--board", "move to the main board")
   .option("--after <cardId>", "place after a sibling in the target status")
   .option("--first", "place first in the target ownership and status scope")
+  .option("--completion-confirmed", "a person on the board asked for, confirmed or waived review of completing this card (required to put a card in complete)")
   .option("--base-revision <revision>", "roadmap revision for stale-write protection (required for Online Boards)", parseRevisionOption)
   .option("--cwd <path>", "project directory")
+  .option("--idempotency-key <key>", "online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores); reuse it only to retry the same edit after a lost reply")
   .option("-o, --output <format>", "output format")
   .action(async (cardId, options) => {
     if (options.parent && options.board) throw new Error("Choose at most one of --parent or --board.");
@@ -435,6 +484,8 @@ program
         parentId: options.parent ? options.parent : options.board ? null : undefined,
         afterId: options.after ? options.after : options.first ? null : undefined,
         baseRevision: options.baseRevision,
+        actor: "agent", idempotencyKey: options.idempotencyKey,
+        completionConfirmed: options.completionConfirmed === true,
       }),
       options,
     );
@@ -451,10 +502,11 @@ program
   .option("--tag <tag>", "replacement tag; repeat for multiple tags", collectOption)
   .option("--blocked-by <cardId>", "replace the blocking card")
   .option("--clear-blocked-by", "clear the blocking card")
-  .option("--metadata-json <json>", "replace metadata with a JSON object")
+  .option("--metadata-json <json>", "set metadata keys from a JSON object; a key set to null is removed")
   .option("--clear-metadata", "clear card metadata")
   .option("--base-revision <revision>", "roadmap revision for stale-write protection (required for Online Boards)", parseRevisionOption)
   .option("--cwd <path>", "project directory")
+  .option("--idempotency-key <key>", "online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores); reuse it only to retry the same edit after a lost reply")
   .option("-o, --output <format>", "output format")
   .action(async (cardId, options) => {
     if (options.summary !== undefined && options.clearSummary) throw new Error("Choose at most one of --summary or --clear-summary.");
@@ -479,7 +531,7 @@ program
       blockedBy: options.clearBlockedBy ? null : options.blockedBy,
       metadata: options.clearMetadata ? null : options.metadataJson !== undefined ? parseMetadataJson(options.metadataJson) : undefined,
       baseRevision: options.baseRevision,
-      actor: "agent",
+      actor: "agent", idempotencyKey: options.idempotencyKey,
     }), options);
   });
 
@@ -491,6 +543,7 @@ program
   .option("--board", "move to the main board")
   .option("--base-revision <revision>", "roadmap revision for stale-write protection (required for Online Boards)", parseRevisionOption)
   .option("--cwd <path>", "project directory")
+  .option("--idempotency-key <key>", "online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores); reuse it only to retry the same edit after a lost reply")
   .option("-o, --output <format>", "output format")
   .action(async (cardId, options) => {
     if ((options.parent ? 1 : 0) + (options.board ? 1 : 0) !== 1) {
@@ -501,6 +554,7 @@ program
       cardId,
       parentId: options.board ? null : options.parent,
       baseRevision: options.baseRevision,
+      actor: "agent", idempotencyKey: options.idempotencyKey,
     }), options);
   });
 
@@ -517,8 +571,10 @@ program
   .option("--position <position>", "insert at top or bottom of the target status column")
   .option("--after <cardId>", "insert after another card in the target status column")
   .option("--parent <cardId>", "create inside a Group")
+  .option("--completion-confirmed", "a person on the board asked for, confirmed or waived review of completing this card (required to put a card in complete)")
   .option("--base-revision <revision>", "roadmap revision for stale-write protection (required for Online Boards)", parseRevisionOption)
   .option("--cwd <path>", "project directory")
+  .option("--idempotency-key <key>", "online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores); reuse it only to retry the same edit after a lost reply")
   .option("-o, --output <format>", "output format")
   .action(async (title, options) => {
     print(
@@ -536,6 +592,8 @@ program
         afterId: options.after,
         parentId: options.parent,
         baseRevision: options.baseRevision,
+        actor: "agent", idempotencyKey: options.idempotencyKey,
+        completionConfirmed: options.completionConfirmed === true,
       }),
       options,
     );
@@ -552,7 +610,9 @@ function configureCreateGroupCommand(command: Command) {
     .option("--anchor <cardId>", "initial Item whose Main Board position the Group takes")
     .option("--spec-file <path>", "read initial Group spec markdown from a file")
     .option("--plan-file <path>", "read initial Group plan markdown from a file")
+    .option("--completion-confirmed", "a person on the board asked for, confirmed or waived review of completing this card (required to put a card in complete)")
     .option("--base-revision <revision>", "roadmap revision for stale-write protection (required for Online Boards)", parseRevisionOption)
+    .option("--idempotency-key <key>", "online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores); reuse it only to retry the same edit after a lost reply")
     .option("--cwd <path>", "project directory")
     .option("-o, --output <format>", "output format")
     .action(async (title, options) => {
@@ -567,6 +627,8 @@ function configureCreateGroupCommand(command: Command) {
         specMarkdown: options.specFile ? readFileSync(resolve(options.specFile), "utf8") : undefined,
         planMarkdown: options.planFile ? readFileSync(resolve(options.planFile), "utf8") : undefined,
         baseRevision: options.baseRevision,
+        actor: "agent", idempotencyKey: options.idempotencyKey,
+        completionConfirmed: options.completionConfirmed === true,
       }), options);
     });
 }
@@ -579,14 +641,17 @@ program
   .requiredOption("--title <title>", "title to create; repeat for multiple cards", collectOption, [])
   .option("--status <status>", "initial status")
   .option("--parent <cardId>", "create inside a Group")
+  .option("--completion-confirmed", "a person on the board asked for, confirmed or waived review of completing this card (required to put a card in complete)")
   .option("--base-revision <revision>", "roadmap revision for stale-write protection (required for Online Boards)", parseRevisionOption)
   .option("--cwd <path>", "project directory")
+  .option("--idempotency-key <key>", "online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores); reuse it only to retry the same edit after a lost reply")
   .option("-o, --output <format>", "output format")
   .action(async (options) => {
     print(await createCards({
       cwd: cwdOption(options.cwd), titles: options.title,
       status: options.status ? requireStatus(options.status) : undefined,
       parentId: options.parent, baseRevision: options.baseRevision,
+      actor: "agent", idempotencyKey: options.idempotencyKey, completionConfirmed: options.completionConfirmed === true,
     }), options);
   });
 
@@ -599,12 +664,89 @@ for (const [command, status] of [
     .command(command)
     .argument("<cardId>")
     .option("--base-revision <revision>", "roadmap revision for stale-write protection (required for Online Boards)", parseRevisionOption)
+    .option("--completion-confirmed", "for complete-card: a person on the board asked for, confirmed or waived review of completing it")
+    .option("--idempotency-key <key>", "online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores); reuse it only to retry the same edit after a lost reply")
     .option("--cwd <path>", "project directory")
     .option("-o, --output <format>", "output format")
     .action(async (cardId, options) => {
-      print(await setCardStatus(cwdOption(options.cwd), cardId, status, options.baseRevision), options);
+      print(await moveCard({
+        cwd: cwdOption(options.cwd), cardId, status, baseRevision: options.baseRevision,
+        actor: "agent", idempotencyKey: options.idempotencyKey, completionConfirmed: options.completionConfirmed === true,
+      }), options);
     });
 }
+
+program
+  .command("write-doc-section")
+  .description("replace one section of a Spec or Plan by its heading, or add one; only that section is checked, so edits to other sections never clash")
+  .argument("<cardId>")
+  .argument("<kind>")
+  .requiredOption("--heading <text>", "the section's heading text, without the #s")
+  .requiredOption("--expected-section-version <version|new>", "the section's version from read-doc (sections), or new for a new section")
+  .option("--occurrence <n>", "which section with this heading (0 for the first), when headings repeat", (value) => Number(value))
+  .option("--after <heading>", "for a new section: the heading to put it after")
+  .option("--file <path>", "read the section from a file instead of stdin (it starts with its heading line)")
+  .option("--idempotency-key <key>", "online boards: reuse only to retry the same edit after a lost reply")
+  .option("--cwd <path>", "project directory")
+  .option("-o, --output <format>", "output format")
+  .action(async (cardId, kind, options) => {
+    if (kind !== "spec" && kind !== "plan") throw new Error("kind must be spec or plan");
+    const markdown = options.file ? readFileSync(options.file, "utf8") : await readStdin();
+    const expected = String(options.expectedSectionVersion).trim();
+    print(await writeDocSection({
+      cwd: cwdOption(options.cwd), cardId, kind, heading: options.heading, expectedSectionVersion: expected === "new" ? null : expected,
+      markdown, occurrence: options.occurrence, after: options.after, actor: "agent", idempotencyKey: options.idempotencyKey,
+    }), options);
+  });
+
+program
+  .command("unresolved-changes")
+  .description("on an online board: agents' edits refused because something they touched changed since, still waiting")
+  .option("--card <cardId>", "only this card's")
+  .option("--cwd <path>", "project directory")
+  .option("-o, --output <format>", "output format")
+  .action(async (options) => print(await unresolvedChanges({ cwd: cwdOption(options.cwd), cardId: options.card }), options));
+
+program
+  .command("drop-change")
+  .description("on an online board: drop an unresolved change that is no longer needed, with the reason, into the card's history")
+  .argument("<changeId>")
+  .requiredOption("--reason <reason>", "why it is dropped, in a sentence")
+  .requiredOption("--base-revision <revision>", "roadmap revision you last read", parseRevisionOption)
+  .option("--idempotency-key <key>", "reuse only to retry the same drop after a lost reply")
+  .option("--cwd <path>", "project directory")
+  .option("-o, --output <format>", "output format")
+  .action(async (changeId, options) => print(await dropChange({ cwd: cwdOption(options.cwd), changeId, reason: options.reason, baseRevision: options.baseRevision, actor: "agent", idempotencyKey: options.idempotencyKey }), options));
+
+program
+  .command("goals")
+  .description("the board's Goals page: goals in order with notes, context, suggestions waiting and recently dismissed, retired goals")
+  .option("--cwd <path>", "project directory")
+  .option("-o, --output <format>", "output format")
+  .action(async (options) => {
+    const result = await readGoals({ cwd: cwdOption(options.cwd) });
+    print(options.output === "json" ? { ...result.page, revision: result.revision } : goalsPageText(result.page), options);
+  });
+
+program
+  .command("suggest-goal-change")
+  .description("leave one suggested change to the goals, with the evidence, for the person to accept or dismiss; ask them in chat first and use this only if they agree, or in an unattended run; only people change goals")
+  .requiredOption("--kind <kind>", "add, reword, reorder or retire")
+  .option("--goal <goal>", "reword, reorder, retire: the goal's number or id")
+  .option("--statement <text>", "add, reword: the goal in one line")
+  .option("--notes <text>", "add, reword: optional notes")
+  .option("--position <n>", "add, reorder: where it goes, 1 for the top")
+  .requiredOption("--reason <reason>", "why, with evidence the person can check")
+  .option("--idempotency-key <key>", "reuse only to retry the same suggestion after a lost reply")
+  .option("--cwd <path>", "project directory")
+  .option("-o, --output <format>", "output format")
+  .action(async (options) => {
+    const result = await suggestGoalChange({
+      cwd: cwdOption(options.cwd), reason: options.reason, agentName: process.env.PLANBAN_AGENT_NAME, idempotencyKey: options.idempotencyKey,
+      change: { kind: options.kind, goal: options.goal, statement: options.statement, notes: options.notes, position: options.position },
+    });
+    print(options.output === "json" ? result : result.notAdded ?? `Suggested to ${result.page.suggestions.at(-1)?.summary}. It waits at the top of the Goals page for the person to accept or dismiss.`, options);
+  });
 
 program
   .command("read-doc")
@@ -614,7 +756,8 @@ program
   .option("-o, --output <format>", "output format")
   .action(async (cardId, kind, options) => {
     if (kind !== "spec" && kind !== "plan") throw new Error("kind must be spec or plan");
-    print(await readDoc({ cwd: cwdOption(options.cwd), cardId, kind }), options);
+    // With each section's own version, for write-doc-section.
+    print(await readDocSections({ cwd: cwdOption(options.cwd), cardId, kind }), options);
   });
 
 program
@@ -624,6 +767,7 @@ program
   .option("--cwd <path>", "project directory")
   .option("--file <path>", "read markdown from a file instead of stdin")
   .option("--expected-mtime <mtimeMs|new>", "the document version this edit is based on: mtimeMs from read-doc, or new for a document that doesn't exist yet (required for Online Boards)")
+  .option("--idempotency-key <key>", "online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores); reuse it only to retry the same edit after a lost reply")
   .option("-o, --output <format>", "output format")
   .action(async (cardId, kind, options) => {
     if (kind !== "spec" && kind !== "plan") throw new Error("kind must be spec or plan");
@@ -634,7 +778,7 @@ program
       if (expectedMtimeMs !== null && (!raw || !Number.isFinite(expectedMtimeMs))) throw new Error("--expected-mtime is the mtimeMs value from read-doc, or new");
     }
     const markdown = options.file ? readFileSync(options.file, "utf8") : await readStdin();
-    print(await writeDoc({ cwd: cwdOption(options.cwd), cardId, kind, markdown, ...(expectedMtimeMs === undefined ? {} : { expectedMtimeMs }) }), options);
+    print(await writeDoc({ cwd: cwdOption(options.cwd), cardId, kind, markdown, actor: "agent", ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}), ...(expectedMtimeMs === undefined ? {} : { expectedMtimeMs }) }), options);
   });
 
 function describeMoveFilesOut(result: MoveFilesOutResult) {
@@ -696,8 +840,31 @@ program
     }), options);
   });
 
+// Every command takes -o json, the online ones included (their results are JSON already).
+const everyCommand = (command: Command): Command[] => [command, ...command.commands.flatMap(everyCommand)];
+for (const command of everyCommand(online)) {
+  if (!command.options.some((option) => option.long === "--output")) command.option("-o, --output <format>", "output format");
+}
+
+/** Whether this run asked for JSON output, however the option was written. */
+function wantsJson(argv: string[]) {
+  return argv.some((arg, index) => arg === "--output=json" || arg === "-ojson" || ((arg === "-o" || arg === "--output") && argv[index + 1] === "json"));
+}
+
+// Argument mistakes (a missing argument, an unknown option) reach the handler
+// below instead of exiting at once, so a JSON caller gets them as JSON too.
+for (const command of everyCommand(program)) command.exitOverride();
+
 program.parseAsync().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : "Unknown error";
-  process.stderr.write(`${message}\n`);
+  if (error instanceof CommanderError) {
+    // Help and --version end here too, successfully. Commander has already printed its message.
+    if (error.exitCode === 0) return;
+    if (wantsJson(process.argv)) process.stdout.write(JSON.stringify({ error: { category: "validation", message: error.message.replace(/^error: /u, "") } }, null, 2) + "\n");
+    process.exitCode = error.exitCode;
+    return;
+  }
+  // A JSON caller gets the failure as JSON too: its kind, message and details (agent-surface audit).
+  if (wantsJson(process.argv)) process.stdout.write(JSON.stringify({ error: errorReport(error) }, null, 2) + "\n");
+  process.stderr.write(`${error instanceof Error ? error.message : "Unknown error"}\n`);
   process.exitCode = 1;
 });

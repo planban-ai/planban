@@ -1,3 +1,4 @@
+import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -95,6 +96,29 @@ export function defaultPlanningRoot(repoId: string): string {
 
 export function roadmapPath(planningRoot: string): string {
   return join(planningRoot, ROADMAP_FILE);
+}
+
+/**
+ * What Take Online leaves at a board's local roadmap.json once the board is
+ * online. Planban 1.x cannot parse it, so each of its reads and writes fails
+ * instead of using the retired copy, and its error quotes it in full
+ * ('Unexpected token 'R', "Restart: Planban 2.0" is not valid JSON'). That
+ * error shows at most 20 characters, so this must stay that short. Its
+ * presence also stops 1.x `init` from putting a fresh, empty board there.
+ */
+export const RETIRED_ROADMAP = "Restart: Planban 2.0";
+
+/** True when this roadmap.json is the marker Take Online left behind. */
+export async function isRetiredRoadmap(path: string): Promise<boolean> {
+  const info = await stat(path).catch(() => null);
+  if (!info?.isFile() || info.size !== RETIRED_ROADMAP.length) return false;
+  return (await readFile(path, "utf8").catch(() => "")) === RETIRED_ROADMAP;
+}
+
+/** A local board's live roadmap is there: present, and not the marker of a board that moved online. */
+export async function hasLiveRoadmap(planningRoot: string): Promise<boolean> {
+  const path = roadmapPath(planningRoot);
+  return await stat(path).then(() => true, () => false) && !(await isRetiredRoadmap(path));
 }
 
 export function eventsPath(planningRoot: string): string {

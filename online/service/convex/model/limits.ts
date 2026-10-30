@@ -22,6 +22,9 @@ export const DAILY_INVITES = 30;
 export const DAILY_INVITE_EMAILS = 10;
 export const SERVICE_DAILY_INVITE_EMAILS = 200;
 export const DAILY_KEYS = 20;
+/** Per account: boards that come online in a day, and online boards owned at once (Planban 2.0 plan). */
+export const DAILY_NEW_BOARDS = 10;
+export const MAX_OWNED_ONLINE_BOARDS = 20;
 const SERVICE = "*service*";
 
 /** A test backend may set lower limits (PLANBAN_TEST_LIMITS="board,writes,writeBytes,importBytes"); never higher. */
@@ -77,11 +80,12 @@ export async function chargeImport(ctx: MutationCtx, userId: string, bytes: numb
   await ctx.db.patch(row._id, { importBytes: row.importBytes + bytes });
 }
 
-type AdminCounter = "invites" | "inviteEmails" | "keys";
+type AdminCounter = "invites" | "inviteEmails" | "keys" | "boards";
 const ADMIN_LIMITS: Record<AdminCounter, { daily: number; what: string }> = {
   invites: { daily: DAILY_INVITES, what: "invitations" },
   inviteEmails: { daily: DAILY_INVITE_EMAILS, what: "invitation emails" },
   keys: { daily: DAILY_KEYS, what: "new personal access keys" },
+  boards: { daily: DAILY_NEW_BOARDS, what: "boards brought online" },
 };
 
 /** Counts one invitation, invitation email or key against the account's day; refuses past the limit. */
@@ -95,4 +99,30 @@ export async function chargeAdmin(ctx: MutationCtx, userId: string, counter: Adm
     await ctx.db.patch(service._id, { inviteEmails: (service.inviteEmails ?? 0) + 1 });
   }
   await ctx.db.patch(row._id, { [counter]: (row[counter] ?? 0) + 1 });
+}
+
+/**
+ * A board is about to come online for this account: a new board on the web, or
+ * Take Online from a computer (including a board that was taken local and
+ * comes back). Refuses before anything is written when the account already
+ * owns the most online boards allowed, or has brought today's limit online.
+ * A resumed upload of a board already counted isn't charged again, because it
+ * never reaches this check.
+ */
+export async function chargeNewOnlineBoard(ctx: MutationCtx, userId: string) {
+  const owned = await ctx.db.query("members").withIndex("by_user", (q) => q.eq("userId", userId)).collect();
+  let online = 0;
+  for (const member of owned) {
+    if (member.role !== "owner") continue;
+    const board = await ctx.db.query("boards").withIndex("by_boardId", (q) => q.eq("boardId", member.boardId)).unique();
+    if (!board) continue;
+    // A board taken local holds its place from the moment its upload back starts.
+    const returning = board.authority === "returned-local"
+      && !!await ctx.db.query("transfers").withIndex("by_board_state", (q) => q.eq("boardId", board.boardId).eq("state", "open")).first();
+    if (board.authority === "online" || board.authority === "importing" || returning) online += 1;
+  }
+  if (online >= MAX_OWNED_ONLINE_BOARDS) {
+    fail("rate_limited", `This account already owns ${MAX_OWNED_ONLINE_BOARDS} online boards, the most an account can have. Take one back to your computer first.`);
+  }
+  await chargeAdmin(ctx, userId, "boards");
 }

@@ -9,6 +9,11 @@ on:
       - main
   pull_request:
 
+# A newer push to the same pull request (or branch) cancels the older run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release-preflight:
     runs-on: ubuntu-24.04

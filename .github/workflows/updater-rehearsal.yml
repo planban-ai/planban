@@ -5,6 +5,11 @@ permissions:
 
 on:
   pull_request:
+    # The seven-machine rehearsal runs when a pull request opens, reopens or becomes
+    # ready. A later push runs only the quick compatibility checks (and cancels any
+    # rehearsal still going). Rerun it by hand, and Release readiness runs it on the
+    # exact release commit. See CONTRIBUTING.md.
+    types: [opened, reopened, ready_for_review, synchronize]
     paths:
       - ".github/workflows/updater-rehearsal.yml"
       - "package.json"
@@ -15,6 +20,7 @@ on:
       - "scripts/platform-invocation.d.mts"
       - "scripts/rehearse-marketplace-update-performance.mjs"
       - "scripts/rehearse-claude-code-upgrade.mjs"
+      - "scripts/rehearsal-retry.mjs"
       - "scripts/marketplace-rehearsal-config.mjs"
       - "tests/marketplace-rehearsal-config.test.ts"
       - "scripts/update-marketplace-runtime.mjs"
@@ -37,10 +43,34 @@ on:
         description: Exact commit the marketplace must install
         required: true
         type: string
+  workflow_call:
+    inputs:
+      from_version:
+        description: Public Planban version used as the old marketplace
+        required: true
+        type: string
+      target_ref:
+        description: Remote branch or tag containing the exact candidate
+        required: true
+        type: string
+      expected_commit:
+        description: Exact commit the marketplace must install
+        required: true
+        type: string
+
+# A newer push cancels a rehearsal of an older commit. The rehearsal fetches the branch
+# by name, as people update, so a run outlived by a push would install the newer commit
+# and fail. Runs are grouped by the branch under test, so a push also cancels a
+# rehearsal started by hand or by Release readiness on that branch.
+concurrency:
+  group: updater-rehearsal-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || inputs.target_ref || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   marketplace-update:
     name: Marketplace update (${{ matrix.os }}, shard ${{ matrix.shard }})
+    # Not on later pushes to a pull request: see the triggers above.
+    if: github.event_name != 'pull_request' || github.event.action != 'synchronize'
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -128,6 +158,8 @@ jobs:
 
   claude-code-update:
     name: Claude Code plugin update (${{ matrix.os }})
+    # Not on later pushes to a pull request: see the triggers above.
+    if: github.event_name != 'pull_request' || github.event.action != 'synchronize'
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -209,6 +241,8 @@ jobs:
     steps:
       - name: Check out candidate
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.expected_commit || '' }}
 
       - name: Set up Node
         uses: actions/setup-node@v4

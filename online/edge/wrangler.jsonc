@@ -7,6 +7,17 @@
   "workers_dev": false,
   "preview_urls": false,
   "routes": [{ "pattern": "app.planban.ai", "custom_domain": true }],
+  // The web page (Planban 2.0): built into dist/web with its _headers file
+  // (online/edge/write-headers.ts). Only the service's addresses run the
+  // Worker; every other address serves the page, falling back to its main
+  // page so it can route /boards/... and /invite/... itself. Keep
+  // run_worker_first equal to WORKER_FIRST in worker.ts (a test checks).
+  "assets": {
+    "directory": "../../dist/web",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/oauth/*", "/mcp", "/.well-known/*", "/web/*", "/favicon.svg", "/favicon.ico", "/brand/*"]
+  },
   // Per caller address. Registrations come from Anthropic's shared addresses, so they get more room.
   "ratelimits": [
     { "name": "SIGNIN_LIMITER", "namespace_id": "1001", "simple": { "limit": 6, "period": 60 } },

@@ -39,7 +39,7 @@ test("failure capture is bounded and ignores foreign files and symbolic links", 
     assert.ok(result.logs.length > 0 && result.logs.length <= 3);
     assert.ok(result.logs.every((log: { tailBytes: number }) => log.tailBytes <= 65536));
     assert.doesNotMatch(raw, /secret|credentials|planban diagnostic|2026-/u);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
 test("timed-out stage retains original failure and completes cleanup after capture", async () => {
@@ -61,5 +61,5 @@ test("timed-out stage retains original failure and completes cleanup after captu
     const original = new Error("original failure");
     await assert.rejects(withColdInstallDiagnostics(async () => { throw original; }, logs, script), (error) => error === original);
     assert.equal(await withColdInstallDiagnostics(async () => 42, logs, destination), 42);
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally { await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });

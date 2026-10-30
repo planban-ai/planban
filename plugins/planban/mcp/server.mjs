@@ -22,14 +22,19 @@ const stalenessModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT,
 const stalenessSourcesModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/stalenessSources.ts")).href);
 const contentRulesModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/contentRules.ts")).href);
 const moveFilesOutModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/moveFilesOut.ts")).href);
+const errorReportModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/errorReport.ts")).href);
+const accountsModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/online/accounts.ts")).href);
+const goalsModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/goals.ts")).href);
 
-const { cardAncestry, createCard, createCards, createGroup, exportFlatVersion1, getStatus, loadState, moveCard, readDoc, reconstructHierarchy, setCardParent, updateCard, writeDoc } = storageModule;
+const { cardAncestry, createCard, createCards, createGroup, dropChange, exportFlatVersion1, getStatus, historyPayload, loadState, moveCard, notePresence, readDoc, readDocSections, readGoals, readGoalsBlock, reconstructHierarchy, setCardParent, suggestGoalChange, unresolvedChanges, updateCard, workingOnCard, writeDoc, writeDocSection } = storageModule;
+const { goalsPageText } = goalsModule;
+const { UPDATE_HOW } = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/clientVersion.ts")).href);
 const { archiveBoard, deleteBoard, duplicateBoard, listAllBoards, listBoards, resolveBoardCwd, restoreBoard } = registryModule;
 const { PLANBAN_STATUSES } = typesModule;
 const { queryWorkItems } = queryModule;
 const { ensureDemoBoard } = demoModule;
 const { PLANBAN_MCP_VERSION } = versionModule;
-const { stalenessAttention, stalenessLine } = stalenessModule;
+const { largeDocNote, stalenessAttention, stalenessLine } = stalenessModule;
 const { collectStaleness, projectStaleness } = stalenessSourcesModule;
 const { HOW_TO_REFER } = contentRulesModule;
 const { moveFilesOut } = moveFilesOutModule;
@@ -44,21 +49,23 @@ const SERVER_ICONS = [
   { src: "https://app.planban.ai/brand/icon-dark.png", mimeType: "image/png", sizes: ["512x512"], theme: "dark" },
 ];
 const PLANBAN_MCP_INSTRUCTIONS = [
-  "Prefer these tools for all Planban reads and writes.",
-  "Pass cwd as the absolute repository path, or repoId for a registered board.",
-  "Before creating or materially editing owner-facing content, read .planban/agent-context.md and follow the Planban protocol and Planban house style when installed.",
-  "Serialize writes: one mutation at a time per board.",
+  "Prefer these tools for Planban reads and writes.",
+  "Pass cwd (absolute repository path) or repoId.",
+  "Before editing owner-facing content, read .planban/agent-context.md and follow the Planban protocol and Planban house style.",
+  "Serialize writes, one at a time.",
   "Planban is an index, not file storage: link to files; planban_move_files_out tidies cards holding them.",
-  "Complete is person-controlled: complete a card only when a person on the board asks, confirms after review, or waives it.",
-  "Online Boards: pass baseRevision and expectedMtimeMs; read only through these tools.",
+  "Complete is person-controlled: only when a person asks, confirms or waives review; set completionConfirmed true.",
+  "Online Boards: card edits pass baseRevision, document writes their expectedMtimeMs; if refused as changed, reapply only what is still needed, tell the person if you drop it, never just resend; retry lost replies with the same idempotencyKey; never edit board files.",
+  "Refusals say why; tell the person.",
   "move_card is the canonical placement operation.",
-  "After a successful open, or after the complete logical mutation batch, include the exact clickable Board URL from the result's userReply.markdown in the final reply.",
-  "If the host has an in-app browser, make at most one bounded attempt to show that URL there; never reopen the board after every write.",
-  "If boardUrlVerified is false, call planban_launch_board once to verify the URL before presenting it.",
-  "A planban:<board>/<item> token is a Planban reference: resolve it with planban_get_card using repoId and cardId; the id is the identity and any quoted title beside it is display context only.",
-  "Board administration, recovery and the legacy set_card_parent alias appear only through explicit profiles.",
+  "After an open or the complete logical mutation batch, include the clickable Board URL from userReply.markdown in the final reply.",
+  "With an in-app browser, make at most one bounded attempt to show it; never reopen the board after every write.",
+  "If boardUrlVerified is false, call planban_launch_board once before presenting it.",
+  "A planban:<board>/<item> token is a Planban reference: resolve it with planban_get_card (repoId, cardId); trust the id over any quoted title.",
+  "Admin, recovery and legacy tools need explicit profiles.",
 ].join(" ");
 const SERVER_VERSION = PLANBAN_MCP_VERSION;
+let clientAgentName = null;
 const JsonRpcError = {
   METHOD_NOT_FOUND: -32601,
   INVALID_PARAMS: -32602,
@@ -190,6 +197,9 @@ async function cwdFromArgs(args) {
 
 function summarizeBoard(state) {
   return {
+    // Shared with the remote tools: boardId, title, revision, roadmapItems.
+    boardId: state.manifest.repoId,
+    title: state.roadmap.project.title,
     cwd: state.cwd,
     manifestPath: state.manifestPath,
     planningRoot: state.planningRoot,
@@ -204,7 +214,8 @@ function summarizeBoard(state) {
 
 function compactBoardSummary(state) {
   const { roadmapItems, ...summary } = summarizeBoard(state);
-  return { ...summary, itemCount: roadmapItems.length };
+  // A retried online edit says so, and which revision it first produced.
+  return { ...summary, itemCount: roadmapItems.length, ...(state.onlineReplay ?? {}) };
 }
 
 const DEFAULT_BOARD_ORIGIN = "http://127.0.0.1:4317";
@@ -254,6 +265,22 @@ async function boardHandoff(repoId) {
   };
 }
 
+/** Who else is working on a card, for get_card; this agent is now working on it too. */
+async function workingFor(cwd, cardId) {
+  // Both at once, each with its own 5-second limit overall.
+  const [, others] = await Promise.all([
+    notePresence({ cwd, cardId, agentName: clientAgentName ?? undefined }),
+    workingOnCard({ cwd, cardId, agentName: clientAgentName ?? undefined }).catch(() => []),
+  ]);
+  return others.length ? { workingOn: others } : {};
+}
+
+/** A card's unresolved changes, for get_card; nothing when there are none or the service can't be asked. */
+async function unresolvedFor(cwd, cardId) {
+  const result = await unresolvedChanges({ cwd, cardId }).catch(() => ({ changes: [] }));
+  return result.changes.length ? { unresolvedChanges: result.changes } : {};
+}
+
 async function boardResult(text, repoId, structuredContent) {
   if (typeof repoId !== "string" || !repoId) return textResult(text, structuredContent);
   const handoff = await boardHandoff(repoId);
@@ -265,11 +292,18 @@ async function boardResult(text, repoId, structuredContent) {
 
 // Stale signals are advisory: they never block or fail a read.
 async function boardStaleness(state) {
-  return await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems });
+  return await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems, storage: state.manifest.storage });
 }
 
 function withLine(text, line) {
   return line ? `${text}\n${line}` : text;
+}
+
+// A Spec or Plan over 100 KB is being appended to; say so whenever an agent reads or writes it.
+function docSizeLine(payload) {
+  if (typeof payload?.markdown !== "string" || (payload.kind !== "spec" && payload.kind !== "plan")) return null;
+  const note = largeDocNote(payload.kind, Buffer.byteLength(payload.markdown, "utf8"));
+  return note ? `${note}.` : null;
 }
 
 function signalsLine(signals) {
@@ -531,10 +565,11 @@ const tools = [
   {
     name: "planban_delete_board",
     title: "Delete Planban Board",
-    description: "Delete a whole Planban board after creating a timestamped local backup. This never deletes the user's source project repository.",
+    description: "Delete a whole local Planban board after creating a timestamped local backup. This never deletes the user's source project repository. An online board can't be deleted from a computer: this is refused, and says how its owner deletes it. With thisComputerOnly, an online board is only removed from this computer and stays online for everyone.",
     inputSchema: schema.object({
       repoId: { type: "string", description: "Registered Planban repo id to delete." },
       confirmRepoId: { type: "string", description: "Must exactly match repoId." },
+      thisComputerOnly: { type: "boolean", description: "Online boards only: remove it from this computer's list and cache. The board itself stays online." },
     }, ["repoId", "confirmRepoId"]),
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
@@ -573,6 +608,62 @@ const tools = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: "planban_unresolved_changes",
+    title: "Planban Unresolved Changes",
+    description: "On an online board: agents' edits that were refused because something they touched changed since they read it, and are still waiting, with card, who, when, what each proposed and which fields clashed. planban_get_card includes a card's own. Save a reconsidered version of the same fields to settle one, or drop it with planban_drop_change and a reason.",
+    inputSchema: schema.object({
+      ...commonBoardProperties,
+      cardId: { type: "string", description: "Only this card's unresolved changes." },
+    }, []),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "planban_drop_change",
+    title: "Drop Planban Unresolved Change",
+    description: "On an online board: drop an unresolved change that is no longer needed (already covered, or overtaken), with a short reason. The card's history records it. Tell the person too.",
+    inputSchema: schema.object({
+      ...commonBoardProperties,
+      changeId: { type: "string", description: "The unresolved change's id." },
+      reason: { type: "string", description: "Why it is dropped, in a sentence." },
+      baseRevision: { type: "number", description: "Roadmap revision you last read." },
+      idempotencyKey: { type: "string", description: "Reuse only to retry the same drop after a lost reply." },
+    }, ["changeId", "reason", "baseRevision"]),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "planban_history",
+    title: "Planban Board History",
+    description: "List recent changes to the board, newest first: what changed, when, and whether a person or an agent made it.",
+    inputSchema: schema.object({
+      ...commonBoardProperties,
+      limit: { type: "number", description: "Most recent entries to return. Defaults to 20." },
+    }),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "planban_read_goals",
+    title: "Read Planban Goals",
+    description: "Only when a board read lists goals: the board's whole Goals page, its goals in order with their notes, the Context section, suggestions waiting for the person, suggestions dismissed in the last 30 days, and retired goals. Board reads list only the goal statements.",
+    inputSchema: schema.object(commonBoardProperties),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "planban_suggest_goal_change",
+    title: "Suggest a Planban Goals Change",
+    description: "Leave one suggested change to the board's goals, with the evidence, on the Goals page for the person to accept or dismiss. Ask the person in chat first and use this only if they agree, or if no person is in the conversation (an unattended run). Only people change goals; agents can't edit them. A suggestion the person dismissed isn't shown again for 30 days.",
+    inputSchema: schema.object({
+      ...commonBoardProperties,
+      kind: { type: "string", enum: ["add", "reword", "reorder", "retire"] },
+      goal: { type: "string", description: "reword, reorder, retire: the goal's number on the Goals page, or its id." },
+      statement: { type: "string", description: "add, reword: the goal in one line." },
+      notes: { type: "string", description: "add, reword: optional notes for the goal." },
+      position: { type: "number", description: "add, reorder: where it goes, 1 for the top." },
+      reason: { type: "string", description: "Why, with evidence the person can check, in a sentence or two." },
+      idempotencyKey: { type: "string", description: "Reuse only to retry the same suggestion after a lost reply." },
+    }, ["kind", "reason"]),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
     name: "planban_export_flat_v1",
     title: "Export Recoverable Flat Version-1 Board",
     description: "Create a deliberate history-backed flat version-1 export without changing the live hierarchy.",
@@ -607,7 +698,9 @@ const tools = [
       position: { type: "string", enum: ["top", "bottom"], description: "Insert at top or bottom of the target status column." },
       afterId: { type: "string", description: "Optional card id to insert after in the target status column." },
       parentId: { type: "string", description: "Optional existing Group id. Creates an owned Item." },
+      completionConfirmed: { type: "boolean", description: "Required true when this would put a card in complete: only when a person on the board explicitly asks, confirms it after review or testing, or clearly waives review." },
       baseRevision: { type: "number", description: "Roadmap revision you last read, for stale-write protection. Optional on local boards; required on Online Boards." },
+      idempotencyKey: { type: "string", description: "Online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores). Reuse it only to retry the same edit after a lost reply; a revised edit after a conflict gets a new key." },
     }, ["title"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
@@ -625,7 +718,9 @@ const tools = [
       anchorId: { type: "string", description: "Initial Item whose Main Board position the Group takes." },
       specMarkdown: { type: "string", description: "Optional initial Group spec markdown." },
       planMarkdown: { type: "string", description: "Optional initial Group plan markdown." },
+      completionConfirmed: { type: "boolean", description: "Required true when this would put a card in complete: only when a person on the board explicitly asks, confirms it after review or testing, or clearly waives review." },
       baseRevision: { type: "number", description: "Roadmap revision you last read, for stale-write protection. Optional on local boards; required on Online Boards." },
+      idempotencyKey: { type: "string", description: "Online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores). Reuse it only to retry the same edit after a lost reply; a revised edit after a conflict gets a new key." },
     }, ["title"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
@@ -638,7 +733,9 @@ const tools = [
       titles: { type: "array", items: { type: "string" }, description: "One or more Work Item titles." },
       status: { type: "string", enum: [...PLANBAN_STATUSES], description: "Initial status. Defaults to pending." },
       parentId: { type: "string", description: "Optional parent Group id." },
+      completionConfirmed: { type: "boolean", description: "Required true when this would put a card in complete: only when a person on the board explicitly asks, confirms it after review or testing, or clearly waives review." },
       baseRevision: { type: "number", description: "Roadmap revision you last read, for stale-write protection. Optional on local boards; required on Online Boards." },
+      idempotencyKey: { type: "string", description: "Online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores). Reuse it only to retry the same edit after a lost reply; a revised edit after a conflict gets a new key." },
     }, ["titles"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
@@ -657,7 +754,7 @@ const tools = [
     name: "planban_move_card",
     title: "Place Planban Card",
     description:
-      "Place an Item in one mutation: change status, move it into or out of an existing Group, and/or set its sibling rank. Groups cannot be placed inside Groups, and Items never become Groups through movement. Use null afterId for first position. Only use status complete when the user explicitly asks, confirms review/testing, or clearly waives user-side verification; set completionConfirmed true in that case.",
+      "Place an Item in one mutation: change status, move it into or out of an existing Group, and/or set its sibling rank. Groups cannot be placed inside Groups, and Items never become Groups through movement. Use null afterId for first position. Only use status complete when the user explicitly asks, confirms review/testing, or clearly waives user-side verification; set completionConfirmed true in that case. If refused because something changed since you read it, the refusal includes what changed, who changed it and the current version: apply only what is still needed, and tell the person if you drop or change your edit.",
     inputSchema: schema.object({
       ...commonBoardProperties,
       cardId: { type: "string", description: "Planban card id." },
@@ -665,9 +762,10 @@ const tools = [
       parentId: { type: ["string", "null"], description: "Optional root Group/destination id, or null for the Main Board." },
       afterId: { type: ["string", "null"], description: "Optional sibling id to insert after, or null for first position." },
       baseRevision: { type: "number", description: "Roadmap revision you last read, for stale-write protection. Optional on local boards; required on Online Boards." },
+      idempotencyKey: { type: "string", description: "Online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores). Reuse it only to retry the same edit after a lost reply; a revised edit after a conflict gets a new key." },
       completionConfirmed: {
         type: "boolean",
-        description: "Required true when moving a card to complete.",
+        description: "Required true when this would put a card in complete: only when a person on the board explicitly asks, confirms it after review or testing, or clearly waives review.",
       },
     }, ["cardId"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -675,17 +773,18 @@ const tools = [
   {
     name: "planban_update_card",
     title: "Update Planban Card",
-    description: `Update non-status card fields such as title, summary, next action, tags, blocked-by, or metadata. Follow the installed Planban house style when owner-facing content changes. ${INDEX_RULE}`,
+    description: `Update non-status card fields such as title, summary, next action, tags, blocked-by, or metadata. Follow the installed Planban house style when owner-facing content changes. ${INDEX_RULE} If refused because something changed since you read it, the refusal includes what changed, who changed it and the current version: apply only what is still needed, and tell the person if you drop or change your edit.`,
     inputSchema: schema.object({
       ...commonBoardProperties,
       cardId: { type: "string", description: "Planban card id." },
       baseRevision: { type: "number", description: "Roadmap revision you last read, for stale-write protection. Optional on local boards; required on Online Boards." },
+      idempotencyKey: { type: "string", description: "Online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores). Reuse it only to retry the same edit after a lost reply; a revised edit after a conflict gets a new key." },
       title: { type: "string", description: "New non-empty card title." },
       summary: { type: ["string", "null"], description: "New card summary, or null to clear." },
       nextAction: { type: ["string", "null"], description: "New next action, or null to clear." },
       tags: { type: "array", items: { type: "string" }, description: "Replacement tag list." },
       blockedBy: { type: ["string", "null"], description: "Blocking card id or null." },
-      metadata: { type: ["object", "null"], description: "Replacement metadata object or null to clear." },
+      metadata: { type: ["object", "null"], description: "Metadata keys to set; other keys are kept. A key set to null is removed; null clears all metadata." },
     }, ["cardId"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
@@ -698,20 +797,39 @@ const tools = [
       cardId: { type: "string", description: "Planban card id." },
       parentId: { type: ["string", "null"], description: "Root Group/destination id, or null for the Main Board." },
       baseRevision: { type: "number", description: "Roadmap revision you last read, for stale-write protection. Optional on local boards; required on Online Boards." },
+      idempotencyKey: { type: "string", description: "Online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores). Reuse it only to retry the same edit after a lost reply; a revised edit after a conflict gets a new key." },
     }, ["cardId", "parentId"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: "planban_write_doc",
     title: "Write Planban Document",
-    description: `Write a card Spec or Plan with optional stale-file protection. Follow the installed Planban house style, preserve the authoritative current section, and retain exact execution or evidence detail in its proper location. ${INDEX_RULE} Documents are limited to 1 MB; pictures stored inside a document (data: addresses) and base64 are refused.`,
+    description: `Write a card Spec or Plan with optional stale-file protection. Follow the installed Planban house style, preserve the authoritative current section, and retain exact execution or evidence detail in its proper location. ${INDEX_RULE} Documents are limited to 1 MB; pictures stored inside a document (data: addresses) and base64 are refused. If refused because something changed since you read it, the refusal includes what changed, who changed it and the current version: apply only what is still needed, and tell the person if you drop or change your edit.`,
     inputSchema: schema.object({
       ...commonBoardProperties,
       cardId: { type: "string", description: "Planban card id." },
       kind: { type: "string", enum: ["spec", "plan"], description: "Document kind to write." },
       markdown: { type: "string", description: "Full markdown contents." },
       expectedMtimeMs: { type: ["number", "null"], description: "The mtimeMs from planban_read_doc (null for a new document), for stale-write protection. Optional on local boards; required on Online Boards." },
+      idempotencyKey: { type: "string", description: "Online boards: a key for this edit (8 to 100 letters, digits, dashes or underscores). Reuse it only to retry the same edit after a lost reply; a revised edit after a conflict gets a new key." },
     }, ["cardId", "kind", "markdown"]),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "planban_write_doc_section",
+    title: "Write One Section of a Planban Document",
+    description: "Replace one section of a card's Spec or Plan, by its heading, or add a new one. Pass the section's version from planban_read_doc (sections) as expectedSectionVersion, or null for a new section; only that section is checked, so edits to other sections never clash. markdown is the whole section, starting with its heading line. Follow the installed Planban house style. If refused because the section changed, the refusal includes the section as it is now: apply only what is still needed, and tell the person if you drop or change your edit.",
+    inputSchema: schema.object({
+      ...commonBoardProperties,
+      cardId: { type: "string", description: "Planban card id." },
+      kind: { type: "string", enum: ["spec", "plan"], description: "Document kind." },
+      heading: { type: "string", description: "The section's heading text, without the #s." },
+      occurrence: { type: "number", description: "Which section with this heading (0 for the first), when headings repeat." },
+      expectedSectionVersion: { type: ["string", "null"], description: "The section's version from planban_read_doc; null for a new section." },
+      markdown: { type: "string", description: "The whole section, starting with its heading line." },
+      after: { type: "string", description: "For a new section: the heading to put it after (else it goes at the end)." },
+      idempotencyKey: { type: "string", description: "Online boards: reuse only to retry the same edit after a lost reply." },
+    }, ["cardId", "kind", "heading", "expectedSectionVersion", "markdown"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
@@ -778,10 +896,12 @@ async function callToolImpl(name, args) {
     const status = await getStatus(await cwdFromArgs(args));
     const board = status.initialized ? await projectStaleness(status.cwd) : null;
     const attention = board ? stalenessAttention(board.staleness, board.items) : null;
+    const goals = status.initialized ? await readGoalsBlock(status.cwd) : null;
     return await boardResult(
-      withLine(status.initialized ? `Planban is initialized for ${status.cwd}.` : `Planban is not initialized for ${status.cwd}.`, attention && stalenessLine(attention)),
+      withLine(withLine(status.initialized ? `Planban is initialized for ${status.cwd}.` : `Planban is not initialized for ${status.cwd}.`, attention && stalenessLine(attention, "attention in this result")), goals),
       status.initialized ? status.repoId : null,
-      attention ? { ...status, attention } : status,
+      // The Planban accounts signed in on this computer and which boards use each (emails only).
+      { ...status, ...(attention ? { attention } : {}), ...(goals ? { goals } : {}), onlineAccounts: await accountsModule.listAccounts().catch(() => []) },
     );
   }
 
@@ -813,9 +933,11 @@ async function callToolImpl(name, args) {
     const repoId = requireString(args.repoId, "repoId");
     const confirmRepoId = requireString(args.confirmRepoId, "confirmRepoId");
     if (confirmRepoId !== repoId) throw new Error("confirmRepoId must exactly match repoId.");
-    const result = await deleteBoard(repoId);
+    const result = await deleteBoard(repoId, { thisComputerOnly: optionalBoolean(args.thisComputerOnly, "thisComputerOnly") === true });
     return textResult(
-      result.backupPath
+      result.removedFromThisComputerOnly
+        ? `Removed online board ${repoId} from this computer. It is still online for everyone on it.`
+        : result.backupPath
         ? `Deleted Planban board ${repoId}. A local backup was created at ${result.backupPath}.`
         : `Deleted Planban board ${repoId}. No planning root existed to back up.`,
       result,
@@ -826,10 +948,13 @@ async function callToolImpl(name, args) {
     const cwd = await cwdFromArgs(args);
     const state = await loadState(cwd);
     const attention = stalenessAttention(await boardStaleness(state), state.roadmap.roadmapItems);
+    const goals = await readGoalsBlock(cwd);
+    // A board using features this Planban can't show: say so plainly, and how to update.
+    const behind = state.planbanBehind ? `${state.planbanBehind.notice} ${UPDATE_HOW}` : null;
     return await boardResult(
-      withLine(`Loaded Planban board ${state.manifest.repoId} at revision ${state.roadmap.revision}.`, stalenessLine(attention)),
+      withLine(withLine(withLine(`Loaded Planban board ${state.manifest.repoId} at revision ${state.roadmap.revision}.`, behind), goals), stalenessLine(attention, "attention in this result")),
       state.manifest.repoId,
-      { ...summarizeBoard(state), attention },
+      { ...summarizeBoard(state), attention, ...(goals ? { goals } : {}), ...(behind ? { planbanBehind: { ...state.planbanBehind, notice: behind } } : {}) },
     );
   }
 
@@ -852,15 +977,17 @@ async function callToolImpl(name, args) {
     const board = await boardStaleness(state);
     const staleness = Object.fromEntries(result.matches.flatMap((entry) => board.cards[entry.item.id] ? [[entry.item.id, board.cards[entry.item.id]]] : []));
     const staleCount = Object.keys(staleness).length;
-    return textResult(withLine(
+    const stalenessNotes = board.notes ?? [];
+    return textResult(withLine(withLine(
       `Matched ${result.matches.length} Planban Work Items at revision ${state.roadmap.revision}.`,
       staleCount ? `${staleCount} matched Item${staleCount === 1 ? " has" : "s have"} stale signals (see staleness).` : null,
-    ), {
+    ), stalenessNotes.join(" ") || null), {
       cwd: state.cwd,
       repoId: state.manifest.repoId,
       revision: state.roadmap.revision,
       ...result,
       staleness,
+      ...(stalenessNotes.length ? { stalenessNotes } : {}),
     });
   }
 
@@ -869,8 +996,11 @@ async function callToolImpl(name, args) {
     const cardId = requireString(args.cardId, "cardId");
     const state = await loadState(cwd);
     const card = findCard(state, cardId);
-    const staleness = (await boardStaleness(state)).cards[card.id] ?? [];
-    return textResult(withLine(`Loaded Planban card ${card.id}.`, signalsLine(staleness)), {
+    const board = await boardStaleness(state);
+    const staleness = board.cards[card.id] ?? [];
+    // Why some warnings may be missing (GitHub out of reach, not signed in, not fully checked yet).
+    const stalenessNotes = board.notes ?? [];
+    return textResult(withLine(withLine(`Loaded Planban card ${card.id}.`, signalsLine(staleness)), stalenessNotes.join(" ") || null), {
       cwd: state.cwd,
       repoId: state.manifest.repoId,
       revision: state.roadmap.revision,
@@ -878,7 +1008,50 @@ async function callToolImpl(name, args) {
       card,
       ancestry: cardAncestry(state.roadmap, cardId),
       staleness,
+      ...(stalenessNotes.length ? { stalenessNotes } : {}),
+      // Edits to this card that were refused and still wait, and who else is working on it (online boards; Spec point 20).
+      ...await unresolvedFor(cwd, cardId),
+      ...await workingFor(cwd, cardId),
     });
+  }
+
+  if (name === "planban_unresolved_changes") {
+    const cwd = await cwdFromArgs(args);
+    const result = await unresolvedChanges({ cwd, cardId: optionalString(args.cardId, "cardId") });
+    return textResult(result.changes.length ? `${result.changes.length} unresolved change${result.changes.length === 1 ? "" : "s"} waiting.` : "No unresolved changes.", result);
+  }
+
+  if (name === "planban_drop_change") {
+    const cwd = await cwdFromArgs(args);
+    const state = await dropChange({
+      cwd, changeId: requireString(args.changeId, "changeId"), reason: requireString(args.reason, "reason"),
+      baseRevision: optionalRevision(args.baseRevision, "baseRevision"), actor: "agent", idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
+    });
+    return await boardResult(`Dropped unresolved change ${args.changeId}.`, state.manifest.repoId, compactBoardSummary(state));
+  }
+
+  if (name === "planban_history") {
+    const history = await historyPayload(await cwdFromArgs(args));
+    const limit = typeof args.limit === "number" && args.limit > 0 ? Math.min(Math.floor(args.limit), 200) : 20;
+    const entries = [...history.entries].sort((a, b) => b.version - a.version).slice(0, limit);
+    return textResult(`${entries.length} most recent change${entries.length === 1 ? "" : "s"} of ${history.entries.length} kept.`, { currentVersion: history.currentVersion, entries });
+  }
+
+  if (name === "planban_read_goals") {
+    const result = await readGoals({ cwd: await cwdFromArgs(args) });
+    // The text in the structured part too, as the online server does: Claude Code shows agents only that part.
+    const text = goalsPageText(result.page);
+    return textResult(text, { revision: result.revision, text, ...result.page });
+  }
+
+  if (name === "planban_suggest_goal_change") {
+    const cwd = await cwdFromArgs(args);
+    const kind = requireString(args.kind, "kind");
+    const change = { kind, goal: optionalString(args.goal, "goal"), statement: optionalString(args.statement, "statement"), notes: optionalString(args.notes, "notes"), position: args.position };
+    const result = await suggestGoalChange({ cwd, change, reason: requireString(args.reason, "reason"), agentName: clientAgentName ?? undefined, idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey") });
+    if (result.notAdded) return textResult(result.notAdded, { added: false, note: result.notAdded });
+    const shown = result.page.suggestions.at(-1);
+    return textResult(`Suggested to ${shown?.summary ?? "change the goals"}. It waits at the top of the Goals page for the person to accept or dismiss; tell them.`, { added: true, suggestion: shown, revision: result.revision });
   }
 
   if (name === "planban_export_flat_v1") {
@@ -904,13 +1077,15 @@ async function callToolImpl(name, args) {
 
   if (name === "planban_read_doc") {
     const cwd = await cwdFromArgs(args);
-    const payload = await readDoc({
+    // With each section's own version, for planban_write_doc_section.
+    const payload = await readDocSections({
       cwd,
       cardId: requireString(args.cardId, "cardId"),
       kind: requireDocKind(args.kind),
     });
+    void notePresence({ cwd, cardId: payload.cardId, agentName: clientAgentName ?? undefined }).catch(() => undefined);
     return textResult(
-      payload.exists ? `Read ${payload.kind} document for ${payload.cardId}.` : `No ${payload.kind} document exists for ${payload.cardId}.`,
+      payload.exists ? withLine(`Read ${payload.kind} document for ${payload.cardId}.`, docSizeLine(payload)) : `No ${payload.kind} document exists for ${payload.cardId}.`,
       payload,
     );
   }
@@ -932,6 +1107,8 @@ async function callToolImpl(name, args) {
       parentId: optionalString(args.parentId, "parentId"),
       baseRevision: optionalRevision(args.baseRevision, "baseRevision"),
       actor: "agent",
+      idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
+      completionConfirmed: optionalBoolean(args.completionConfirmed, "completionConfirmed") === true,
     });
     const notes = metadataNotes(state.createdCard);
     return await boardResult(withLine(`Created Planban card ${state.createdCard.id}.`, notes[0]), state.manifest.repoId, {
@@ -948,7 +1125,8 @@ async function callToolImpl(name, args) {
       cwd: await cwdFromArgs(args), titles,
       status: optionalStatus(args.status, "status"),
       parentId: optionalString(args.parentId, "parentId"),
-      baseRevision: optionalRevision(args.baseRevision, "baseRevision"), actor: "agent",
+      baseRevision: optionalRevision(args.baseRevision, "baseRevision"), actor: "agent", idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
+      completionConfirmed: optionalBoolean(args.completionConfirmed, "completionConfirmed") === true,
     });
     return await boardResult(`Created ${state.createdCards.length} Planban cards.`, state.manifest.repoId, { ...compactBoardSummary(state), cards: state.createdCards });
   }
@@ -969,6 +1147,8 @@ async function callToolImpl(name, args) {
       planMarkdown: args.planMarkdown === undefined ? undefined : requireText(args.planMarkdown, "planMarkdown"),
       baseRevision: optionalRevision(args.baseRevision, "baseRevision"),
       actor: "agent",
+      idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
+      completionConfirmed: optionalBoolean(args.completionConfirmed, "completionConfirmed") === true,
     });
     return await boardResult(`Created Group ${state.createdGroup.id} with ${itemIds.length} Items.`, state.manifest.repoId, {
       ...compactBoardSummary(state),
@@ -983,9 +1163,6 @@ async function callToolImpl(name, args) {
     if (status === undefined && parentId === undefined && afterId === undefined) {
       throw new Error("Provide status, parentId, or afterId.");
     }
-    if (status === "complete" && !optionalBoolean(args.completionConfirmed, "completionConfirmed")) {
-      throw new Error("completionConfirmed must be true when moving a card to complete.");
-    }
     const state = await moveCard({
       cwd: await cwdFromArgs(args),
       cardId: requireString(args.cardId, "cardId"),
@@ -994,6 +1171,8 @@ async function callToolImpl(name, args) {
       afterId,
       baseRevision: optionalRevision(args.baseRevision, "baseRevision"),
       actor: "agent",
+      idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
+      completionConfirmed: optionalBoolean(args.completionConfirmed, "completionConfirmed") === true,
     });
     const card = findCard(state, requireString(args.cardId, "cardId"));
     return await boardResult(`Moved Planban card ${card.id} to ${card.status}.`, state.manifest.repoId, {
@@ -1014,6 +1193,7 @@ async function callToolImpl(name, args) {
       blockedBy: optionalNullableString(args.blockedBy, "blockedBy"),
       metadata: optionalMetadata(args.metadata, "metadata"),
       actor: "agent",
+      idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
     });
     const card = findCard(state, requireString(args.cardId, "cardId"));
     const notes = metadataNotes(card);
@@ -1029,7 +1209,7 @@ async function callToolImpl(name, args) {
     const parentId = args.parentId === null ? null : requireString(args.parentId, "parentId");
     const state = await setCardParent({
       cwd: await cwdFromArgs(args), cardId, parentId,
-      baseRevision: optionalRevision(args.baseRevision, "baseRevision"), actor: "agent",
+      baseRevision: optionalRevision(args.baseRevision, "baseRevision"), actor: "agent", idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
     });
     const card = findCard(state, cardId);
     return await boardResult(parentId ? `Moved ${card.id} into ${parentId}.` : `Moved ${card.id} to the main board.`, state.manifest.repoId, {
@@ -1047,6 +1227,7 @@ async function callToolImpl(name, args) {
       kind,
       markdown: requireText(args.markdown, "markdown"),
       expectedMtimeMs: args.expectedMtimeMs === undefined ? undefined : optionalNumber(args.expectedMtimeMs, "expectedMtimeMs") ?? null,
+      idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
       history: {
         actor: "agent",
         operation: "doc.write",
@@ -1055,7 +1236,20 @@ async function callToolImpl(name, args) {
         affectedDocs: [{ cardId, kind, path: `items/${cardId}/${kind}.md` }],
       },
     });
-    return await boardResult(`Wrote ${payload.kind} document for ${payload.cardId}.`, repoIdFromCwd(cwd), payload);
+    return await boardResult(withLine(`Wrote ${payload.kind} document for ${payload.cardId}.`, docSizeLine(payload)), repoIdFromCwd(cwd), { ...payload, doc: payload });
+  }
+
+  if (name === "planban_write_doc_section") {
+    const cwd = await cwdFromArgs(args);
+    const expected = args.expectedSectionVersion;
+    if (expected !== null && typeof expected !== "string") throw new Error("expectedSectionVersion is the section's version from planban_read_doc, or null for a new section.");
+    const payload = await writeDocSection({
+      cwd, cardId: requireString(args.cardId, "cardId"), kind: requireDocKind(args.kind), heading: requireString(args.heading, "heading"),
+      occurrence: args.occurrence === undefined ? undefined : optionalNumber(args.occurrence, "occurrence"),
+      expectedSectionVersion: expected, markdown: requireText(args.markdown, "markdown"), after: optionalString(args.after, "after"),
+      actor: "agent", idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
+    });
+    return await boardResult(withLine(`Wrote the "${args.heading}" section of the ${payload.kind} for ${payload.cardId}.`, docSizeLine(payload)), repoIdFromCwd(cwd), { ...payload, doc: payload });
   }
 
   if (name === "planban_move_files_out") {
@@ -1098,16 +1292,25 @@ async function callTool(name, rawArgs) {
     },
   });
   try {
-    return await callToolImpl(name, args);
+    const result = await callToolImpl(name, args);
+    // An agent editing a card is working on it: the app's own name, for "Claude (Sam) is working on this card".
+    if (CARD_EDIT_TOOLS.has(name) && typeof args.cardId === "string") {
+      void cwdFromArgs(args).then((cwd) => notePresence({ cwd, cardId: args.cardId, agentName: clientAgentName ?? undefined })).catch(() => undefined);
+    }
+    return result;
   } finally {
     await activity?.end();
   }
 }
 
+const CARD_EDIT_TOOLS = new Set(["planban_move_card", "planban_update_card", "planban_write_doc", "planban_write_doc_section", "planban_set_card_parent"]);
+
 async function handleRequest(message) {
   const { id, method, params } = message;
 
   if (method === "initialize") {
+    // Which app this is ("claude-code", "codex-mcp-client"), for "Claude (Sam) is working on this card".
+    clientAgentName = typeof params?.clientInfo?.name === "string" ? params.clientInfo.name : null;
     sendResult(id, {
       protocolVersion: params?.protocolVersion ?? "2025-11-25",
       capabilities: { tools: {} },
@@ -1132,7 +1335,12 @@ async function handleRequest(message) {
       const result = await callTool(params?.name, params?.arguments ?? {});
       sendResult(id, result);
     } catch (error) {
-      sendError(id, JsonRpcError.INVALID_PARAMS, error instanceof Error ? error.message : String(error));
+      // Bad arguments stay protocol errors. A tool that ran and was refused or
+      // failed reports it as a tool result, with its kind and details readable
+      // (conflict and the current revision, signed out, forbidden...).
+      const report = errorReportModule.errorReport(error);
+      if (report.category === "error") sendError(id, JsonRpcError.INVALID_PARAMS, report.message);
+      else sendResult(id, { content: [{ type: "text", text: report.message }], structuredContent: { error: report }, isError: true });
     }
     return;
   }

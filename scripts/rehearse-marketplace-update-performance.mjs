@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { runCommand, updateMarketplaceRuntime } from "./update-marketplace-runtime.mjs";
 import { retargetMarketplace } from "./marketplace-rehearsal-config.mjs";
+import { isTransientInstallFailure, retryOnce } from "./rehearsal-retry.mjs";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
@@ -111,7 +112,11 @@ async function runSample(options, mode, sampleNumber, sharedNpmCache) {
     await run("codex", ["plugin", "marketplace", "add", options.sourceUrl,
       "--ref", options.fromRef ?? `v${options.fromVersion}`], { env });
     const root = await marketplaceRoot(codexHome, env);
-    await run("npm", ["install", "--no-audit", "--no-fund"], { cwd: root, env });
+    // Setup, not measured: a dropped download or a Windows file lock gets one retry.
+    await retryOnce("Installing the previous release's dependencies", () => run("npm", ["install", "--no-audit", "--no-fund"], { cwd: root, env, timeoutMs: 300000 }), {
+      shouldRetry: isTransientInstallFailure,
+      beforeRetry: () => rm(join(root, "node_modules"), { recursive: true, force: true, maxRetries: 5, retryDelay: 500 }),
+    });
     await run("node", ["--import", "tsx/esm", "src/cli.ts", "init", "--cwd", projectRoot,
       "--repo-id", "update-performance-rehearsal", "--title", "Update performance rehearsal", "--no-agents"], {
       cwd: root,
@@ -177,8 +182,14 @@ async function runSample(options, mode, sampleNumber, sharedNpmCache) {
     if (!options.keep) {
       const cleanupStartedAt = performance.now();
       process.stderr.write("  Removing sample fixture...\n");
-      await rm(sampleRoot, { recursive: true, force: true });
-      process.stderr.write(`  Removed sample fixture in ${Math.round(performance.now() - cleanupStartedAt)}ms\n`);
+      // Retries ride out Windows releasing files late; a fixture that still can't be
+      // removed is reported, never allowed to hide why the sample itself failed.
+      try {
+        await rm(sampleRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+        process.stderr.write(`  Removed sample fixture in ${Math.round(performance.now() - cleanupStartedAt)}ms\n`);
+      } catch (error) {
+        process.stderr.write(`  Couldn't remove sample fixture: ${error instanceof Error ? error.message : String(error)}\n`);
+      }
     } else process.stderr.write(`Preserved rehearsal at ${sampleRoot}\n`);
   }
 }

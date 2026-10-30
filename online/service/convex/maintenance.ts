@@ -1,6 +1,7 @@
 // Housekeeping: idempotency records expire after seven days, uploads
 // abandoned for a day are cancelled so their board id is released, and used
 // command-line sign-in tokens are forgotten once too old to exchange anyway.
+import { PRESENCE_KEEP_MS } from "./model/presence";
 import { internal } from "./_generated/api";
 import { internalMutation } from "./_generated/server";
 import { abortTransfer } from "./model/transfer";
@@ -16,6 +17,16 @@ export const expireOperations = internalMutation({
     const old = await ctx.db.query("operations").withIndex("by_createdAt", (q) => q.lt("createdAt", cutoff)).take(BATCH);
     for (const row of old) await ctx.db.delete(row._id);
     if (old.length === BATCH) await ctx.scheduler.runAfter(0, internal.maintenance.expireOperations, {});
+  },
+});
+
+/** "Working on a card" rows quiet for a day are removed, in batches (Spec point 20). */
+export const expirePresence = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const old = await ctx.db.query("presence").withIndex("by_active", (q) => q.lt("lastActiveAt", Date.now() - PRESENCE_KEEP_MS)).take(BATCH);
+    for (const row of old) await ctx.db.delete(row._id);
+    if (old.length === BATCH) await ctx.scheduler.runAfter(0, internal.maintenance.expirePresence, {});
   },
 });
 

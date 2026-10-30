@@ -81,7 +81,11 @@ export async function roadmapAtVersion(ctx: QueryCtx, at: BoardRows, version: nu
 }
 
 /** History versions after `after`, oldest first, each with its full roadmap. */
-export async function historyPage(ctx: QueryCtx, at: BoardRows, after: number, limit: number) {
+/**
+ * Versions after `after`, rebuilt in order. `accept` sees each one as it is rebuilt and can stop
+ * the page there (that version left out), so a caller with a byte budget never holds more than it allows.
+ */
+export async function historyPage(ctx: QueryCtx, at: BoardRows, after: number, limit: number, accept?: (version: { entry: PlanbanHistoryEntry; roadmap: PlanbanRoadmap }) => boolean) {
   const rows = await ctx.db.query("history")
     .withIndex("by_board_version", (q) => q.eq("boardId", at.boardId).eq("generation", at.generation).gt("version", after))
     .take(limit);
@@ -94,7 +98,9 @@ export async function historyPage(ctx: QueryCtx, at: BoardRows, after: number, l
       : previous
         ? apply(previous, unpackJson<Delta>(stored.delta!))
         : await roadmapAtVersion(ctx, at, row.version);
-    page.push({ entry: row.entry as PlanbanHistoryEntry, roadmap: roadmap! });
+    const version = { entry: row.entry as PlanbanHistoryEntry, roadmap: roadmap! };
+    if (accept && !accept(version)) break;
+    page.push(version);
     previous = roadmap;
   }
   return page;

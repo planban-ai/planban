@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { boardPath, cardPath } from "./apiPaths";
+import React, { useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { boardPath, boardWebAddress, cardIdFromHash, cardPath, linkedCardOnBoard } from "./apiPaths";
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import ReactMarkdown from "react-markdown";
+import { stripFrontMatter } from "../core/frontMatter";
 import remarkGfm from "remark-gfm";
 import {
   Archive,
@@ -25,7 +26,7 @@ import {
   FolderTree,
   HelpCircle,
   History,
-  Home,
+  Info,
   Loader2,
   ListTree,
   Minimize2,
@@ -42,6 +43,7 @@ import {
   X,
   Settings,
   Link2,
+  Target,
 } from "lucide-react";
 import {
   closestCorners,
@@ -99,7 +101,7 @@ import {
   type TutorialProgress,
 } from "./tutorialNavigation";
 import { OverflowMarqueeText } from "./OverflowMarqueeText";
-import { BoardPeopleContext, BoardSettingsModal, CardFace, ConnectionsModal, HistoryAuthor, InviteModal, PeopleModal, LocationPill, OlderCopyBanner, SignedOutScreen, useBoardPeople, useOnlineStatus, type SignedOut } from "./onlineBoard";
+import { BoardPeopleContext, BoardSettingsModal, NewBoardModal, CardFace, CardWorking, ConnectionsModal, HistoryAuthor, InviteModal, PeopleModal, LocationPill, OlderCopyBanner, SignedOutScreen, useBoardPeople, useOnlineStatus, type SignedOut } from "./onlineBoard";
 import {
   activityLabIsEnabled,
   activityVariantForIndex,
@@ -117,6 +119,25 @@ import {
   type PlanbanActivitySnapshot,
 } from "../core/activity";
 import { liveRefreshDecision } from "./liveSync";
+import { capabilities } from "./capabilities";
+import { Dropdown } from "./Dropdown";
+import { useKeyboardInset, usePhoneLayout } from "./phoneLayout";
+import { GoalsPage, GoalsStrip, useGoals } from "./goals";
+import { latestRequestGate } from "./latestRequest";
+import { AccountMenu, ApprovePage, HostedDashboard, InvitePage, JoinedNote, SignInPage, webScreen } from "./hostedScreens";
+import { CardStackMark } from "./Wordmark";
+import { captureAddressSecrets } from "./webAccount";
+
+// On the web, an invitation's token or a sign-in request in the address is
+// moved out of it before anything else runs.
+if (capabilities.hosted) {
+  captureAddressSecrets();
+  // The web page's own look where it differs from the installed app's, such as dark primary buttons.
+  document.documentElement.classList.add("web-hosted");
+}
+import { newIdempotencyKey } from "./hostedAdapter";
+import { watchHostedBoard } from "./hostedLive";
+import { hostedAdapter, pageFetch } from "./transport";
 import { stalenessChipLabel, type StalenessSignal } from "../core/staleness";
 import {
   canPlaceItemInside,
@@ -171,6 +192,10 @@ interface RoadmapItem {
 
 interface PlanbanState {
   staleness?: { cards: Record<string, StalenessSignal[]> };
+  /** On the web: the person's role on this board. */
+  hosted?: { boardId: string; role: "owner" | "editor" | "viewer" | null; authority: string | null };
+  /** On a computer: the online board uses features this Planban can't show (16 October 2026). */
+  planbanBehind?: { notice: string; features: string[] };
   cwd: string;
   manifest: { repoId: string };
   manifestPath: string;
@@ -837,7 +862,8 @@ async function api<T>(path: string, init?: RequestInit, timeoutMs?: number): Pro
     ...(init?.headers ?? {}),
   } as Record<string, string>;
   if (method !== "GET" && method !== "HEAD" && !headers["Idempotency-Key"]) {
-    headers["Idempotency-Key"] = `web:${Date.now()}:${crypto.randomUUID()}`;
+    // One key per logical edit, in the form the online service accepts too.
+    headers["Idempotency-Key"] = newIdempotencyKey();
   }
   const timeoutController = timeoutMs ? new AbortController() : null;
   const timeout = timeoutController
@@ -851,9 +877,7 @@ async function api<T>(path: string, init?: RequestInit, timeoutMs?: number): Pro
       headers,
       ...(signals.length > 0 ? { signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0]! } : {}),
     };
-    response = await fetch(path, {
-      ...requestInit,
-    });
+    response = await pageFetch(path, requestInit);
   } catch (error) {
     if (timeoutController?.signal.aborted) {
       throw new Error("Planban took too long to respond. Try loading the Board again.");
@@ -881,11 +905,26 @@ async function api<T>(path: string, init?: RequestInit, timeoutMs?: number): Pro
         : `Request failed: ${response.status}`;
     const error = new Error(errorMessage);
     Object.assign(error, { status: response.status });
+    // A refused edit: what changed, by whom, and the current value or document (Spec point 20).
+    if (payload && typeof payload === "object" && "conflict" in payload && payload.conflict && typeof payload.conflict === "object") {
+      Object.assign(error, { conflict: payload.conflict });
+    }
     // A missing or ended Online Board sign-in names the service, so the page can offer Sign in.
     if (payload && typeof payload === "object" && "signInNeeded" in payload && typeof payload.signInNeeded === "string") {
       const reason = "signedOut" in payload && payload.signedOut === "expired" ? "expired" : "missing";
       const command = "signInCommand" in payload && typeof payload.signInCommand === "string" ? payload.signInCommand : undefined;
-      Object.assign(error, { signedOut: { url: payload.signInNeeded, reason, ...(command ? { command } : {}) } satisfies SignedOut });
+      // A board linked to an account that isn't signed in here names that account.
+      const account = "signInAccount" in payload ? (typeof payload.signInAccount === "string" ? payload.signInAccount : null) : undefined;
+      Object.assign(error, { signedOut: { url: payload.signInNeeded, reason, ...(command ? { command } : {}), ...(account !== undefined ? { account } : {}) } satisfies SignedOut });
+    }
+    // A board of another account than the one signed in on this computer (from its own records).
+    if (payload && typeof payload === "object" && "otherAccount" in payload && payload.otherAccount && typeof payload.otherAccount === "object") {
+      const other = payload.otherAccount as { url?: unknown; boardAccount?: unknown; signedInAs?: unknown; signInCommand?: unknown };
+      if (typeof other.url === "string") Object.assign(error, { signedOut: {
+        url: other.url, reason: "other-account",
+        otherAccount: { boardAccount: typeof other.boardAccount === "string" ? other.boardAccount : null, signedInAs: typeof other.signedInAs === "string" ? other.signedInAs : null },
+        ...(typeof other.signInCommand === "string" ? { command: other.signInCommand } : {}),
+      } satisfies SignedOut });
     }
     throw error;
   }
@@ -893,9 +932,8 @@ async function api<T>(path: string, init?: RequestInit, timeoutMs?: number): Pro
   return payload as T;
 }
 
-function stripFrontmatter(markdown: string) {
-  return markdown.replace(/^---\n[\s\S]*?\n---\n?/, "");
-}
+/** One rule with section editing (src/core/frontMatter.ts), so they agree where the document starts. */
+const stripFrontmatter = stripFrontMatter;
 
 function formatHistoryTime(input: string) {
   const date = new Date(input);
@@ -1107,6 +1145,7 @@ function CardContent({ item, rollup, ancestry = [], expanded = false }: { item: 
           {item.title}
         </p>
         <span className="card-title-tail">
+          <CardWorking cardId={item.id} />
           <CardFace cardId={item.id} />
           {workItemRank(item) ? <span className="priority">P{workItemRank(item)}</span> : null}
         </span>
@@ -1855,7 +1894,7 @@ function BoardPicker({
             >
               <span>
                 <b>{board.title}</b>
-                <small>{board.cwd}</small>
+                {capabilities.projectFolders ? <small>{board.cwd}</small> : null}
               </span>
             </button>
           ))}
@@ -1866,8 +1905,10 @@ function BoardPicker({
 }
 
 function BoardMoreMenu({
+  onOpenGoals,
   onOpenSettings,
   onOpenConnections,
+  webAddress,
   onOpenHistory,
   onOpenTutorial,
   onOpenFeedback,
@@ -1875,10 +1916,13 @@ function BoardMoreMenu({
   showArchived,
   onToggleArchived,
 }: {
+  onOpenGoals?: () => void;
   onOpenSettings?: () => void;
   onOpenConnections?: () => void;
+  /** An online board's address on the web page, for the installed app's "Open on the web". */
+  webAddress?: string | undefined;
   onOpenHistory?: () => void;
-  onOpenTutorial: () => void;
+  onOpenTutorial?: () => void;
   onOpenFeedback: () => void;
   hasArchivedCards: boolean;
   showArchived: boolean;
@@ -1903,10 +1947,12 @@ function BoardMoreMenu({
       </TooltipButton>
       {open ? (
         <div className="board-more-popover" role="menu">
+          {onOpenGoals ? <button role="menuitem" onClick={() => choose(onOpenGoals)}><Target size={14} /><span>Goals</span></button> : null}
           {onOpenSettings ? <button role="menuitem" onClick={() => choose(onOpenSettings)}><Settings size={14} /><span>Board settings</span></button> : null}
           {onOpenConnections ? <button role="menuitem" onClick={() => choose(onOpenConnections)}><Link2 size={14} /><span>Your connections</span></button> : null}
+          {webAddress ? <button role="menuitem" onClick={() => choose(() => { window.open(webAddress, "_blank", "noopener,noreferrer"); })}><ExternalLink size={14} /><span>Open on the web</span></button> : null}
           {onOpenHistory ? <button role="menuitem" onClick={() => choose(onOpenHistory)}><History size={14} /><span>Board history</span></button> : null}
-          <button role="menuitem" onClick={() => choose(onOpenTutorial)}><HelpCircle size={14} /><span>Tutorial</span></button>
+          {onOpenTutorial ? <button role="menuitem" onClick={() => choose(onOpenTutorial)}><HelpCircle size={14} /><span>Tutorial</span></button> : null}
           <button role="menuitem" onClick={() => choose(onOpenFeedback)}><Bug size={14} /><span>Feedback / Bug</span></button>
           {hasArchivedCards ? (
             <button
@@ -2054,10 +2100,12 @@ function FeedbackModal({
             {busy === "copy" ? <Loader2 size={14} className="spin" /> : <Copy size={14} />}
             Copy prompt
           </button>
-          <button onClick={openInCodex} disabled={!canSubmit}>
-            {busy === "open" ? <Loader2 size={14} className="spin" /> : <Send size={14} />}
-            Open in Codex
-          </button>
+          {capabilities.localAgents ? (
+            <button onClick={openInCodex} disabled={!canSubmit}>
+              {busy === "open" ? <Loader2 size={14} className="spin" /> : <Send size={14} />}
+              Open in Codex
+            </button>
+          ) : null}
         </footer>
       </section>
     </div>,
@@ -3384,6 +3432,7 @@ interface PlanbanSelectOption<T extends string> {
   disabled?: boolean;
 }
 
+/** The board page's dropdowns: the one Planban dropdown, with an optional label above it. */
 function PlanbanSelectMenu<T extends string>({
   label,
   value,
@@ -3403,58 +3452,26 @@ function PlanbanSelectMenu<T extends string>({
   initialFocus?: boolean;
   onChange: (value: T) => void;
 }) {
-  const [open, setOpen] = useState(false);
   const disabledReasonId = useId();
-  const { containerRef, onKeyDown } = useListboxPopover(open, setOpen, disabled);
-  const selected = options.find((option) => option.value === value) ?? options[0];
-
-  const menu = (
-    <div ref={containerRef} className="version-change-menu planban-select-menu" onKeyDown={onKeyDown}>
-      <button
-        type="button"
-        className={`version-change-trigger planban-select-trigger ${labelPlacement === "outside" ? "label-outside" : ""}`}
-        aria-label={`${label}: ${selected?.label ?? value}`}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-describedby={disabled && disabledReason ? disabledReasonId : undefined}
-        disabled={disabled}
-        data-dialog-initial-focus={initialFocus ? true : undefined}
-        onClick={() => setOpen((current) => !current)}
-      >
-        {labelPlacement === "inside" ? <span>{label}</span> : null}
-        <b>{selected?.label ?? value}</b>
-        <ChevronDown size={14} />
-      </button>
-      {open ? (
-        <div className="version-change-popover planban-select-popover" role="listbox" aria-label={label}>
-          {options.map((option) => (
-            <button
-              type="button"
-              key={option.value}
-              className={option.value === value ? "active" : ""}
-              role="option"
-              aria-selected={option.value === value}
-              disabled={disabled || option.disabled}
-              onClick={() => {
-                setOpen(false);
-                onChange(option.value);
-              }}
-            >
-              <span><b>{option.label}</b></span>
-            </button>
-          ))}
-        </div>
-      ) : null}
-    </div>
+  const dropdown = (
+    <Dropdown
+      label={label}
+      value={value}
+      options={options}
+      disabled={disabled}
+      initialFocus={initialFocus}
+      prefix={labelPlacement === "inside" ? label : undefined}
+      describedBy={disabled && disabledReason ? disabledReasonId : undefined}
+      onChange={onChange}
+    />
   );
-
   return labelPlacement === "outside" ? (
     <div className={`planban-select-field ${disabled && disabledReason ? "has-disabled-reason" : ""}`}>
       <span className="planban-select-field-label">{label}</span>
-      {menu}
+      {dropdown}
       {disabled && disabledReason ? <span className="disabled-control-tooltip" id={disabledReasonId} role="tooltip">{disabledReason}</span> : null}
     </div>
-  ) : menu;
+  ) : dropdown;
 }
 
 function WorkflowStatusMenu({
@@ -3506,10 +3523,13 @@ function GroupRailCard({
   dropOperation,
   reorderPreview,
   hideSourceDuringDrag,
+  readOnly = false,
 }: {
   item: RoadmapItem;
   selected: boolean;
   disabled: boolean;
+  /** A viewer on the web: no order controls at all. */
+  readOnly?: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
   onSelect: () => void;
@@ -3538,10 +3558,10 @@ function GroupRailCard({
         </span>
       </button>
       {dropOperation === "inside" ? <div className="hierarchy-drop-inside-label"><GroupIcon size={13} /><span>Move inside</span></div> : null}
-      <div className="group-rank-actions" aria-label={`${item.title} order controls`}>
+      {readOnly ? null : <div className="group-rank-actions" aria-label={`${item.title} order controls`}>
         <button title="Move up" aria-label={`Move ${item.title} up`} disabled={disabled || !canMoveUp} onClick={onMoveUp}><ChevronUp size={13} /></button>
         <button title="Move down" aria-label={`Move ${item.title} down`} disabled={disabled || !canMoveDown} onClick={onMoveDown}><ChevronDown size={13} /></button>
-      </div>
+      </div>}
     </article>
   );
 }
@@ -3741,7 +3761,13 @@ function DetailView({
   const [docsByKind, setDocsByKind] = useState<Partial<Record<DocKind, DocPayload>>>({});
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  /** A save refused because the document changed meanwhile: the newer version, and who made it. */
+  // Someone else's version landed while editing (Spec point 20): shown beside yours, to keep theirs, use yours, or edit.
+  const [conflict, setConflict] = useState<{ theirs: DocPayload; who: string | null; showing: boolean; seen: boolean; choosing: boolean } | null>(null);
+  const boardPeople = useContext(BoardPeopleContext);
   const [objectiveEditing, setObjectiveEditing] = useState(false);
+  // Someone else's objective landed while editing (Spec point 20): theirs beside yours, to keep theirs, use yours, or edit.
+  const [objectiveConflict, setObjectiveConflict] = useState<{ theirs: string | null; who: string | null; revision: number; choosing: boolean } | null>(null);
   const [objectiveDraft, setObjectiveDraft] = useState(item.summary ?? "");
   const [busy, setBusy] = useState(false);
   const [referenceCopied, showReferenceCopied] = useTransientConfirmation(`${boardId}:${item.id}`);
@@ -3759,12 +3785,18 @@ function DetailView({
   const [groupDropIntent, setGroupDropIntent] = useState<{ targetId: string; operation: HierarchyDropOperation } | null>(null);
   const [groupColumnDropPreview, setGroupColumnDropPreview] = useState<{ status: Status; targetId: string | null; operation: "after" | "empty" } | null>(null);
   const [groupOptimisticItems, setGroupOptimisticItems] = useState<RoadmapItem[] | null>(null);
-  const groupSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 3 } }));
+  const phone = usePhoneLayout();
+  const groupPointer = useSensor(PointerSensor, { activationConstraint: { distance: 3 } });
+  // No dragging for viewers, or on a phone, where a swipe scrolls.
+  const groupSensors = useSensors(phone || state.hosted?.role === "viewer" ? undefined : groupPointer);
   const groupDropIntentRef = useRef<{ targetId: string; operation: HierarchyDropOperation } | null>(null);
   const groupColumnDropPreviewRef = useRef<{ status: Status; targetId: string | null; operation: "after" | "empty" } | null>(null);
   const groupDropRectsRef = useRef(new Map<string, HierarchyDropRect>());
   const doc = docsByKind[activeTab] ?? null;
   const isPreviewing = previewVersion !== null;
+  // A viewer on the web reads the card, its Spec, Plan and History, and changes nothing.
+  const viewOnly = state.hosted?.role === "viewer";
+  const locked = isPreviewing || viewOnly;
   const currentVersion = history?.currentVersion ?? null;
   const cardHistoryEntries = useMemo(
     () => (history?.entries ?? []).filter((entry) => isCardDetailsHistory(entry, item.id)),
@@ -3886,12 +3918,20 @@ function DetailView({
         method: "PATCH",
         body: JSON.stringify({
           summary: objectiveDraft.trim() || null,
-          baseRevision: state.roadmap.revision,
+          // After seeing theirs, "use mine" saves over the version shown.
+          baseRevision: objectiveConflict?.revision ?? state.roadmap.revision,
         }),
       });
+      setObjectiveConflict(null);
       setObjectiveEditing(false);
       await onStateRefresh();
     } catch (error) {
+      const conflict = (error as { status?: number; conflict?: { currentRevision: number; card?: { summary?: string | null } | null; changes?: Array<{ by: string }> } } | null);
+      if (conflict?.status === 409 && conflict.conflict) {
+        // Theirs beside yours; the text you wrote stays.
+        setObjectiveConflict({ theirs: conflict.conflict.card?.summary ?? null, who: conflict.conflict.changes?.[0]?.by ?? null, revision: conflict.conflict.currentRevision, choosing: true });
+        return;
+      }
       window.alert(error instanceof Error ? error.message : "Group objective update failed");
       setObjectiveDraft(item.summary ?? "");
     } finally {
@@ -3987,7 +4027,7 @@ function DetailView({
 
   async function reorderWorkspaceItem(targetId: string, direction: "up" | "down") {
     const target = byId.get(targetId);
-    if (!target) return;
+    if (!target || viewOnly) return;
     const siblings = workspaceGroups[target.status];
     const index = siblings.findIndex((entry) => entry.id === target.id);
     if (index < 0 || (direction === "up" && index === 0) || (direction === "down" && index === siblings.length - 1)) return;
@@ -4026,10 +4066,26 @@ function DetailView({
     setGroupOptimisticItems(null);
   }, [boardId, item.id, previewVersion]);
 
+  // The objective as it was when editing began, and the board revision then.
+  const objectiveStart = useRef<{ value: string; revision: number } | null>(null);
+  useEffect(() => {
+    if (objectiveEditing && objectiveStart.current === null) objectiveStart.current = { value: item.summary ?? "", revision: state.roadmap.revision };
+    if (!objectiveEditing) objectiveStart.current = null;
+  }, [objectiveEditing, item.summary, state.roadmap.revision]);
   useEffect(() => {
     setObjectiveEditing(false);
+    setObjectiveConflict(null);
     setObjectiveDraft(item.summary ?? "");
-  }, [item.id, item.summary]);
+  }, [item.id]);
+  useEffect(() => {
+    const start = objectiveStart.current;
+    // Someone else's objective landed while editing: keep the draft and offer the choice (Spec point 20).
+    if (objectiveEditing && start && (item.summary ?? "") !== start.value) {
+      setObjectiveConflict((current) => current ?? { theirs: item.summary ?? null, who: null, revision: state.roadmap.revision, choosing: true });
+      return;
+    }
+    if (!objectiveEditing) setObjectiveDraft(item.summary ?? "");
+  }, [item.summary]);
 
   useEffect(() => {
     if (!workspaceRoot) return;
@@ -4056,52 +4112,85 @@ function DetailView({
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [busy, item.status, placementOpen]);
 
+  /** A Spec or Plan that couldn't be read: said plainly, with Try again, never "Loading" for ever. */
+  const [docErrors, setDocErrors] = useState<Partial<Record<DocKind, string>>>({});
+  // Which document is on screen now: an answer for an earlier card or version must not land on this one.
+  const docIdentity = `${boardId}\n${item.id}\n${previewVersion ?? "current"}`;
+  const docIdentityRef = useRef(docIdentity);
+  docIdentityRef.current = docIdentity;
+  const [docRequests] = useState(() => latestRequestGate<DocKind>());
+  useEffect(() => setDocErrors({}), [docIdentity]);
   const loadDoc = useCallback(
     async (kind: DocKind) => {
-      const payload = await api<DocPayload>(
-        previewVersion
-          ? cardPath(boardId, item.id, `/docs/${kind}`, previewVersion)
-          : cardPath(boardId, item.id, `/docs/${kind}`),
-      );
-      setDocsByKind((current) => ({ ...current, [kind]: payload }));
-      return payload;
+      // Only the newest request for this kind, for the document still on screen, may land.
+      const current = docRequests.begin(kind, `${boardId}\n${item.id}\n${previewVersion ?? "current"}`, () => docIdentityRef.current);
+      setDocErrors((errors) => ({ ...errors, [kind]: undefined }));
+      try {
+        const payload = await api<DocPayload>(
+          previewVersion
+            ? cardPath(boardId, item.id, `/docs/${kind}`, previewVersion)
+            : cardPath(boardId, item.id, `/docs/${kind}`),
+          undefined,
+          30_000,
+        );
+        if (current()) setDocsByKind((docs) => ({ ...docs, [kind]: payload }));
+        return payload;
+      } catch (error) {
+        if (current()) setDocErrors((errors) => ({ ...errors, [kind]: error instanceof Error ? error.message : "This document couldn't be loaded." }));
+        throw error;
+      }
     },
-    [boardId, item.id, previewVersion],
+    [boardId, item.id, previewVersion, docRequests],
   );
 
   useEffect(() => {
-    let cancelled = false;
-    for (const kind of availableDocKinds) {
-      void loadDoc(kind).then((payload) => {
-        if (cancelled) return;
-        setDocsByKind((current) => ({ ...current, [kind]: payload }));
-      });
-    }
-    return () => {
-      cancelled = true;
-    };
+    // loadDoc itself shows the answer, if it is still the newest for the document on screen.
+    for (const kind of availableDocKinds) void loadDoc(kind).catch(() => undefined);
   }, [availableDocKinds, loadDoc]);
 
   useEffect(() => {
     setEditing(false);
     setDraft(doc?.markdown ?? "");
+    setConflict(null);
   }, [activeTab, doc]);
+
+  /** Who last changed this document, for the conflict note: "Maya", "Maya's agent", or null. */
+  async function latestDocAuthor(): Promise<string | null> {
+    const latest = await api<HistoryPayload>(boardPath(boardId, "/history")).catch(() => null);
+    const entry = latest?.entries.filter((candidate) => isDocHistory(candidate, item.id, activeTab)).sort((a, b) => b.version - a.version)[0];
+    if (!entry?.attribution) return null;
+    const name = boardPeople?.people.find((person) => person.userId === entry.attribution!.userId)?.name;
+    if (!name) return null;
+    const first = name.split(/\s+/)[0] ?? name;
+    return entry.attribution.actor === "agent" ? `${first}'s agent` : first;
+  }
 
   async function saveDoc() {
     setBusy(true);
+    // After a conflict, the person has been shown that the document changed; save over that version.
+    const base = conflict?.theirs ?? doc;
     try {
       const payload = await api<DocPayload>(cardPath(boardId, item.id, `/docs/${activeTab}`), {
         method: "PUT",
-        body: JSON.stringify({ markdown: draft, expectedMtimeMs: doc?.mtimeMs ?? null }),
+        body: JSON.stringify({ markdown: draft, expectedMtimeMs: base?.mtimeMs ?? null }),
       });
+      setConflict(null);
       setDocsByKind((current) => ({ ...current, [activeTab]: payload }));
       setDraft(payload.markdown);
       setEditing(false);
       onStateRefresh();
     } catch (error) {
+      if ((error as { status?: number } | null)?.status === 409) {
+        // Someone else saved first. Their version is fetched to look at; the person's text stays in the editor.
+        const theirs = await api<DocPayload>(cardPath(boardId, item.id, `/docs/${activeTab}`)).catch(() => null);
+        if (theirs) {
+          // Theirs is shown beside yours, with a simple choice.
+          setConflict({ theirs, who: await latestDocAuthor(), showing: true, seen: true, choosing: true });
+          return;
+        }
+      }
+      // Nothing is thrown away: the text stays in the editor to try again.
       window.alert(error instanceof Error ? error.message : "Document save failed");
-      const payload = await loadDoc(activeTab);
-      setDraft(payload.markdown);
     } finally {
       setBusy(false);
     }
@@ -4144,9 +4233,11 @@ function DetailView({
           <div className="detail-history-actions">
             <span>Viewing v{previewVersion}</span>
             <button onClick={onReturnToCurrent}>Return to current</button>
-            <button className="primary" onClick={() => onRestoreCard?.(item.id)}>
-              Restore card details
-            </button>
+            {!viewOnly ? (
+              <button className="primary" onClick={() => onRestoreCard?.(item.id)}>
+                Restore card details
+              </button>
+            ) : null}
           </div>
         ) : null}
         </div>
@@ -4260,7 +4351,8 @@ function DetailView({
                                 <GroupRailCard
                                   item={entry}
                                   selected={item.id === entry.id}
-                                  disabled={isPreviewing || busy}
+                                  disabled={isPreviewing || busy || viewOnly}
+                                  readOnly={viewOnly}
                                   canMoveUp={index > 0}
                                   canMoveDown={index < group.length - 1}
                                   onSelect={() => onSelectWorkItem?.(entry.id)}
@@ -4299,17 +4391,51 @@ function DetailView({
           <span className="group-objective-label">Group objective</span>
           {objectiveEditing ? (
             <div className="editor-pane group-objective-editor">
-              <AutoSizingTextarea
-                autoFocus
-                aria-label="Group objective"
-                value={objectiveDraft}
-                disabled={busy}
-                onChange={(event) => setObjectiveDraft(event.target.value)}
-                placeholder="What larger outcome do these Items achieve together?"
-              />
+              {objectiveConflict ? (
+                <div className="doc-conflict-note" role="alert">
+                  <b>{objectiveConflict.who ? `${objectiveConflict.who} changed the objective while you were editing.` : "The objective changed while you were editing."}</b>{" "}
+                  {objectiveConflict.choosing ? "Theirs is beside yours. Keep theirs, use yours, or edit yours." : "Edit yours with theirs in view, then save."}
+                </div>
+              ) : null}
+              <div className={objectiveConflict ? "doc-conflict-compare" : undefined}>
+                {objectiveConflict ? (
+                  <section className="doc-conflict-side">
+                    <p className="doc-conflict-label">{objectiveConflict.who ? `${objectiveConflict.who}'s version` : "The new version"}</p>
+                    <p className="group-objective-theirs">{objectiveConflict.theirs || "No objective"}</p>
+                  </section>
+                ) : null}
+                <section className={objectiveConflict ? "doc-conflict-side" : undefined}>
+                  {objectiveConflict ? <p className="doc-conflict-label">Yours</p> : null}
+                  <AutoSizingTextarea
+                    autoFocus
+                    aria-label="Group objective"
+                    value={objectiveDraft}
+                    disabled={busy}
+                    readOnly={objectiveConflict?.choosing === true}
+                    onChange={(event) => setObjectiveDraft(event.target.value)}
+                    placeholder="What larger outcome do these Items achieve together?"
+                  />
+                </section>
+              </div>
+              {objectiveConflict?.choosing ? (
+                <div className="editor-actions group-objective-actions doc-conflict-choice">
+                  <button disabled={busy} onClick={() => {
+                    setObjectiveDraft(objectiveConflict.theirs ?? "");
+                    setObjectiveConflict(null);
+                    setObjectiveEditing(false);
+                    void onStateRefresh();
+                  }}>Keep theirs</button>
+                  <button disabled={busy} onClick={() => setObjectiveConflict({ ...objectiveConflict, choosing: false })}>Edit</button>
+                  <button className="primary" disabled={busy} onClick={() => void saveObjective()}>
+                    {busy ? <Loader2 size={14} className="spin" /> : <Pencil size={14} />}
+                    Use mine
+                  </button>
+                </div>
+              ) : (
               <div className="editor-actions group-objective-actions">
                 <button disabled={busy} onClick={() => {
                   setObjectiveDraft(item.summary ?? "");
+                  setObjectiveConflict(null);
                   setObjectiveEditing(false);
                 }}>Cancel</button>
                 <button
@@ -4321,10 +4447,11 @@ function DetailView({
                   Save objective
                 </button>
               </div>
+              )}
             </div>
           ) : item.summary ? (
             <div className="group-objective-body editable-content-region">
-              {!isPreviewing ? (
+              {!locked ? (
                 <TooltipButton
                   label="Edit Group objective"
                   className="content-edit-action"
@@ -4335,7 +4462,7 @@ function DetailView({
               ) : null}
               <p>{item.summary}</p>
             </div>
-          ) : isPreviewing ? (
+          ) : locked ? (
             <div className="group-objective-empty"><p>No objective recorded.</p></div>
           ) : (
             <div className="group-objective-empty">
@@ -4349,7 +4476,7 @@ function DetailView({
       <section className={`overview-panel ${item.isGroup ? "after-group-objective" : ""}`}>
         <div className="meta-grid">
           <div className="workflow-status-summary">
-            {isPreviewing ? <><span>Status</span><b>{labels[item.status]}</b></> : (
+            {locked ? <><span>Status</span><b>{labels[item.status]}</b></> : (
               <WorkflowStatusMenu status={item.status} busy={busy} onChange={(status) => void changeWorkflowStatus(status)} />
             )}
           </div>
@@ -4366,17 +4493,17 @@ function DetailView({
                   showReferenceCopied();
                 })}
               ><CopyConfirmationIcon confirmed={referenceCopied} /></TooltipButton>
-              {!item.isGroup ? (
+              {!item.isGroup && !viewOnly ? (
                 <TooltipButton label="Move Item" aria-expanded={placementOpen} onClick={() => setPlacementOpen(true)}>
                   <ArrowRightLeft size={14} />
                 </TooltipButton>
               ) : null}
-              {item.status !== "complete" && item.status !== "archived" ? (
+              {item.status !== "complete" && item.status !== "archived" && !viewOnly ? (
                 <TooltipButton label="Mark complete" disabled={busy} onClick={() => void changeWorkflowStatus("complete")}>
                   <CheckCircle2 size={14} />
                 </TooltipButton>
               ) : null}
-              {item.status !== "archived" ? (
+              {item.status !== "archived" && !viewOnly ? (
                 <TooltipButton label="Archive" disabled={busy} onClick={() => void changeWorkflowStatus("archived")}>
                   <Archive size={14} />
                 </TooltipButton>
@@ -4532,21 +4659,64 @@ function DetailView({
         {doc ? (
           editing ? (
             <div className="editor-pane">
-              <AutoSizingTextarea value={draft} onChange={(event) => setDraft(event.target.value)} />
-              <div className="editor-actions">
-                <button disabled={busy} onClick={() => {
-                  setDraft(doc.markdown);
-                  setEditing(false);
-                }}>Cancel</button>
-                <button className="primary" onClick={saveDoc} disabled={busy || draft === doc.markdown}>
-                  {busy ? <Loader2 size={14} className="spin" /> : <Pencil size={14} />}
-                  Save {activeTab}
-                </button>
+              {conflict ? (
+                <div className="doc-conflict-note" role="alert">
+                  <b>{conflict.who ? `${conflict.who} changed this ${docKindLabel(activeTab)} while you were editing.` : `This ${docKindLabel(activeTab)} changed while you were editing.`}</b>{" "}
+                  {conflict.choosing ? "Theirs is beside yours. Keep theirs, use yours, or edit yours." : "Edit yours with theirs in view, then save."}
+                </div>
+              ) : null}
+              <div className={conflict?.showing ? "doc-conflict-compare" : undefined}>
+                {conflict?.showing ? (
+                  <section className="doc-conflict-side">
+                    <p className="doc-conflict-label">{conflict.who ? `${conflict.who}'s version` : "The new version"}</p>
+                    <article className="markdown-body doc-conflict-theirs" aria-label={`${conflict.who ? `${conflict.who}'s` : "The new"} version`}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{stripFrontmatter(conflict.theirs.markdown)}</ReactMarkdown>
+                    </article>
+                  </section>
+                ) : null}
+                <section className={conflict?.showing ? "doc-conflict-side" : undefined}>
+                  {conflict?.showing ? <p className="doc-conflict-label">Yours</p> : null}
+                  <AutoSizingTextarea value={draft} readOnly={conflict?.choosing === true} onChange={(event) => setDraft(event.target.value)} />
+                </section>
               </div>
+              {conflict?.choosing ? (
+                <div className="editor-actions doc-conflict-choice">
+                  <button disabled={busy} onClick={() => {
+                    // Keep theirs: yours is set aside, and the document shows theirs.
+                    setDocsByKind((current) => ({ ...current, [activeTab]: conflict.theirs }));
+                    setDraft(conflict.theirs.markdown);
+                    setConflict(null);
+                    setEditing(false);
+                    onStateRefresh();
+                  }}>Keep theirs</button>
+                  <button disabled={busy} onClick={() => setConflict({ ...conflict, choosing: false })}>Edit</button>
+                  <button className="primary" disabled={busy} onClick={saveDoc}>
+                    {busy ? <Loader2 size={14} className="spin" /> : <Pencil size={14} />}
+                    Use mine
+                  </button>
+                </div>
+              ) : (
+                <div className="editor-actions">
+                  <button disabled={busy} onClick={() => {
+                    setDraft(doc.markdown);
+                    setConflict(null);
+                    setEditing(false);
+                  }}>Cancel</button>
+                  {conflict ? (
+                    <button disabled={busy} aria-pressed={conflict.showing} onClick={() => setConflict({ ...conflict, showing: !conflict.showing, seen: true })}>
+                      {conflict.showing ? "Hide" : "See"} {conflict.who ? `${conflict.who}'s` : "the new"} version
+                    </button>
+                  ) : null}
+                  <button className="primary" onClick={saveDoc} disabled={busy || draft === (conflict?.theirs.markdown ?? doc.markdown)}>
+                    {busy ? <Loader2 size={14} className="spin" /> : <Pencil size={14} />}
+                    Save {activeTab}
+                  </button>
+                </div>
+              )}
             </div>
           ) : doc.exists ? (
             <article className="markdown-body">
-              {canRestoreActiveDoc ? (
+              {canRestoreActiveDoc && !viewOnly ? (
                 <div className="doc-preview-row">
                   <span>Historical {docKindLabel(activeTab).toLowerCase()}</span>
                   <button className="primary" onClick={() => onRestoreDoc?.(item.id, activeTab)}>
@@ -4555,7 +4725,7 @@ function DetailView({
                 </div>
               ) : null}
               <div className="markdown-content-region">
-                {!isPreviewing ? (
+                {!locked ? (
                   <TooltipButton
                     label={`Edit ${docKindLabel(activeTab)}`}
                     className="content-edit-action doc-content-edit-action"
@@ -4571,12 +4741,21 @@ function DetailView({
             <div className="missing-doc">
               <p>No {activeTab} document snapshot exists for this card in v{previewVersion}.</p>
             </div>
+          ) : viewOnly ? (
+            <div className="missing-doc">
+              <p>No {activeTab} document exists for this card yet.</p>
+            </div>
           ) : (
             <div className="missing-doc">
               <p>No {activeTab} document exists for this card yet.</p>
               <button onClick={() => setEditing(true)}>Create {activeTab}</button>
             </div>
           )
+        ) : docErrors[activeTab] ? (
+          <div className="missing-doc" role="alert">
+            <p>Couldn't load this {docKindLabel(activeTab).toLowerCase()}. {docErrors[activeTab]}</p>
+            <button onClick={() => void loadDoc(activeTab).catch(() => undefined)}>Try again</button>
+          </div>
         ) : (
           <div className="loading">Loading document...</div>
         )}
@@ -4710,6 +4889,19 @@ function WorkItemSearchModal({
   );
 }
 
+/** On a phone: one chip per column, each jumping to its group in the list. */
+function PhoneStatusTabs({ statuses: shown, counts }: { statuses: readonly Status[]; counts: Record<string, number> }) {
+  return (
+    <nav className="phone-status-tabs" aria-label="Columns">
+      {shown.map((status) => (
+        <button key={status} type="button" onClick={() => document.querySelector(`.board-grid [data-status="${status}"]`)?.scrollIntoView({ block: "start", behavior: "smooth" })}>
+          {labels[status]} <span>{counts[status] ?? 0}</span>
+        </button>
+      ))}
+    </nav>
+  );
+}
+
 function BoardView({
   state,
   boards,
@@ -4733,6 +4925,19 @@ function BoardView({
     const params = new URLSearchParams(window.location.search);
     return ["group", "programme"].includes(params.get("projection") ?? "") ? params.get("groupId") ?? params.get("programmeId") : null;
   });
+  // A second card link while this board is already open only changes the address's "#card=".
+  const boardItemsRef = useRef(state.roadmap.roadmapItems);
+  boardItemsRef.current = state.roadmap.roadmapItems;
+  useEffect(() => {
+    const onHashChange = () => {
+      if (!cardIdFromHash(window.location.hash)) return;
+      const cardId = linkedCardOnBoard(window.location.hash, boardItemsRef.current.map((item) => item.id));
+      window.history.replaceState(window.history.state, "", `${window.location.pathname}${window.location.search}`);
+      if (cardId) setSelectedId(cardId);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
   const [showArchived, setShowArchived] = useState(() => normalizeBoardViewPreferences(readBoardViewPreferences(state.manifest.repoId)).showArchived);
   const [search, setSearch] = useState(() => initialBoardQueryState(state.manifest.repoId).search);
   const [queryError, setQueryError] = useState<string | null>(() => initialBoardQueryState(state.manifest.repoId).error);
@@ -4782,12 +4987,29 @@ function BoardView({
   const [activityDetailEditSerial, setActivityDetailEditSerial] = useState(0);
   const activityEditCursorRef = useRef(0);
   const activityEditSerialRef = useRef(0);
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 3 } }));
+  const phone = usePhoneLayout();
+  // A viewer on the web reads everything and changes nothing.
+  const viewOnly = state.hosted?.role === "viewer";
+  const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 3 } });
+  // Phones move cards with Status and Move to, not by dragging, so a swipe always scrolls.
+  // Always one argument, so switching to phone width really turns dragging off.
+  const sensors = useSensors(phone || viewOnly ? undefined : pointerSensor);
   const displayState = preview?.state ?? state;
   const previewVersion = preview?.version ?? null;
   const isPreviewing = preview !== null;
   const boardKind = boards.find((board) => board.repoId === boardId)?.kind;
   const isDemoBoard = boardKind === "demo";
+  // The board's goals (owner decisions, 16 October 2026): read again with each revision; "#goals" opens their page.
+  const [goals] = useGoals(boardId, state.roadmap.revision, api);
+  const [goalsOpen, setGoalsOpen] = useState(() => window.location.hash === "#goals");
+  const openGoals = () => {
+    window.history.replaceState(window.history.state, "", `${window.location.pathname}${window.location.search}#goals`);
+    setGoalsOpen(true);
+  };
+  const closeGoals = () => {
+    window.history.replaceState(window.history.state, "", `${window.location.pathname}${window.location.search}`);
+    setGoalsOpen(false);
+  };
   const online = useOnlineStatus(isDemoBoard ? null : boardId, state.roadmap.revision);
   const boardPeople = useBoardPeople(isDemoBoard ? null : boardId, online.status?.location === "online", `${state.roadmap.revision}:${online.status?.location}`);
   const isActivityLab = activityLabIsEnabled(boardId, boardKind, window.location.search);
@@ -4892,7 +5114,10 @@ function BoardView({
     const params = new URLSearchParams(window.location.search);
     const queryProjection = params.get("projection");
     const isGroupProjection = queryProjection === "group" || queryProjection === "programme";
-    setSelectedId(isGroupProjection ? params.get("groupId") ?? params.get("programmeId") : null);
+    // A link to a card (from ChatGPT, Claude or a copied address) opens it once, then leaves the address as the board's.
+    const opensCard = linkedCardOnBoard(window.location.hash, state.roadmap.roadmapItems.map((item) => item.id));
+    if (cardIdFromHash(window.location.hash)) window.history.replaceState(window.history.state, "", `${window.location.pathname}${window.location.search}`);
+    setSelectedId(isGroupProjection ? params.get("groupId") ?? params.get("programmeId") : opensCard);
     setGroupId(null);
     setProjection(queryProjection === "flattened" ? "flattened" : "main");
     setActivityChangedCardTitle(null);
@@ -4942,7 +5167,7 @@ function BoardView({
   useEffect(() => {
     setPreview(null);
     void loadHistory().catch(() => setHistory(null));
-    void loadUpdateStatus().catch(() => undefined);
+    if (capabilities.updates) void loadUpdateStatus().catch(() => undefined);
   }, [boardId, loadHistory, loadUpdateStatus]);
 
   useEffect(() => {
@@ -5134,7 +5359,7 @@ function BoardView({
   }
 
   useEffect(() => {
-    if (isPreviewing) return undefined;
+    if (isPreviewing || !capabilities.localAgents) return undefined;
     const pendingItems = state.roadmap.roadmapItems.filter(hasPendingCodexThread);
     if (pendingItems.length === 0) return undefined;
     let cancelled = false;
@@ -5545,6 +5770,20 @@ function BoardView({
     }
   }
 
+  if (goalsOpen && !isDemoBoard) {
+    return (
+      <GoalsPage
+        boardId={boardId}
+        boardTitle={state.roadmap.project.title}
+        viewOnly={viewOnly}
+        phone={phone}
+        request={api}
+        initial={goals}
+        onBack={closeGoals}
+      />
+    );
+  }
+
   if (selectedItem) {
     return (
       <BoardPeopleContext.Provider value={boardPeople.people}>
@@ -5582,31 +5821,28 @@ function BoardView({
     <StalenessContext.Provider value={stalenessCards}>
     <BoardPeopleContext.Provider value={boardPeople.people}>
     <main className={`board-screen ${online.status?.location === "local" && online.status.stale ? "older-copy" : ""}`}>
-      <header className={`app-header ${updateStatus?.updateAvailable ? "has-update" : ""}`}>
-        <div className="board-title-group">
-          <div className="board-home-row">
-            <TooltipButton label="All Boards" className="board-home-button" onClick={() => onSelectBoard(null)}>
-              <Home size={15} />
-            </TooltipButton>
-          </div>
-          <div className="board-title-row">
-            <BoardPicker boards={boards} currentRepoId={boardId} onSelectBoard={onSelectBoard} />
-            <LocationPill status={online.status} />
-          </div>
+      {/* One line (owner decision, 16 October 2026): the card stack back to all boards, the
+          board's name opening the switcher, and where it lives; then Update (on a computer,
+          only when there is one) and the board's tools. */}
+      <header className="app-header">
+        <div className="board-title-row">
+          <TooltipButton label="Your boards" tooltipPlacement="bottom" className="board-home-mark" onClick={() => onSelectBoard(null)}>
+            <CardStackMark />
+          </TooltipButton>
+          <BoardPicker boards={boards} currentRepoId={boardId} onSelectBoard={onSelectBoard} />
+          <LocationPill status={online.status} />
         </div>
-        <div className={`header-controls ${updateStatus?.updateAvailable ? "has-update" : ""}`}>
-          {updateStatus?.updateAvailable ? (
-            <div className="header-update-row">
-              <button
-                className="toolbar-button update-available-button"
-                onClick={() => {
-                  setUpdateOpen(true);
-                  void loadUpdateStatus().catch(() => undefined);
-                }}
-              >
-                <span>Update Available</span>
-              </button>
-            </div>
+        <div className="header-controls">
+          {!capabilities.hosted && updateStatus?.updateAvailable ? (
+            <button
+              className="toolbar-button update-available-button"
+              onClick={() => {
+                setUpdateOpen(true);
+                void loadUpdateStatus().catch(() => undefined);
+              }}
+            >
+              <span>Update</span>
+            </button>
           ) : null}
           <div className="header-actions">
             <TooltipButton
@@ -5626,19 +5862,35 @@ function BoardView({
               {projection === "main" ? <ListTree size={15} /> : <FolderTree size={15} />}
             </TooltipButton>
             <BoardMoreMenu
+              {...(!isDemoBoard ? { onOpenGoals: openGoals } : {})}
               {...(!isDemoBoard && online.status ? { onOpenSettings: () => setSettingsOpen(true) } : {})}
               {...(!isDemoBoard && online.status?.signedIn.length ? { onOpenConnections: () => setOnlineScreen("connections") } : {})}
+              {...(!capabilities.hosted && online.status?.location === "online" && online.status.url && online.status.boardId ? { webAddress: boardWebAddress(online.status.url, online.status.boardId) } : {})}
               {...(!isDemoBoard ? { onOpenHistory: () => setBoardHistoryOpen(true) } : {})}
-              onOpenTutorial={() => openTutorial("first-run", isDemoBoard ? null : boardId)}
+              {...(capabilities.tutorial ? { onOpenTutorial: () => openTutorial("first-run", isDemoBoard ? null : boardId) } : {})}
               onOpenFeedback={() => setFeedbackOpen(true)}
               hasArchivedCards={hasArchivedCards}
               showArchived={showArchived}
               onToggleArchived={() => setShowArchived((value) => !value)}
             />
+            {capabilities.hosted ? <AccountMenu /> : null}
           </div>
         </div>
       </header>
-      <OlderCopyBanner repoId={boardId} boardTitle={state.roadmap.project.title} status={online.status} reload={online.reload} />
+      {capabilities.hosted ? <JoinedNote /> : null}
+      {!capabilities.hosted && state.planbanBehind ? (
+        <div className="older-copy-banner planban-behind-banner" role="status">
+          <Info size={16} />
+          <div className="grow">
+            <b>Your Planban is behind this board</b>
+            <p>{state.planbanBehind.notice}</p>
+          </div>
+          <div className="acts">
+            <button className="online-board-button primary-accent" onClick={() => { setUpdateOpen(true); void loadUpdateStatus().catch(() => undefined); }}>Update</button>
+          </div>
+        </div>
+      ) : null}
+      {capabilities.olderCopyCheck ? <OlderCopyBanner repoId={boardId} boardTitle={state.roadmap.project.title} status={online.status} reload={online.reload} /> : null}
 
       {isActivityLab ? (
         <ActivityLabPanel
@@ -5721,12 +5973,15 @@ function BoardView({
             </span>
           </div>
           <button onClick={returnToCurrent}>Close preview</button>
-          <button className="primary" onClick={restoreBoardFromPreview}>
-            Restore board state
-          </button>
+          {!viewOnly ? (
+            <button className="primary" onClick={restoreBoardFromPreview}>
+              Restore board state
+            </button>
+          ) : null}
         </section>
       ) : null}
 
+      {!isDemoBoard && goals ? <GoalsStrip goals={goals.goals} phone={phone} onOpen={openGoals} /> : null}
       {queryActive ? (
         <section className="query-results" aria-label="Filtered Work Items">
           <header><div><span>Query results</span><b>{queryResult.matches.length} matching {queryResult.matches.length === 1 ? "Work Item" : "Work Items"}</b><small>WIP {queryResult.wip} · {queryResult.context.length} muted {queryResult.context.length === 1 ? "ancestor" : "ancestors"}</small></div><button onClick={clearQuery}>Clear</button></header>
@@ -5743,7 +5998,9 @@ function BoardView({
             {queryResult.matches.length === 0 ? <div className="query-empty">No Work Items match this query.</div> : null}
           </div>
         </section>
-      ) : <DndContext
+      ) : <>
+      {phone ? <PhoneStatusTabs statuses={visibleStatuses} counts={Object.fromEntries(visibleStatuses.map((status) => [status, grouped[status].length]))} /> : null}
+      <DndContext
         sensors={sensors}
         collisionDetection={isFlattenedRoot ? boardCollisionDetection : hierarchyCollisionDetection}
         onDragStart={onDragStart}
@@ -5762,7 +6019,7 @@ function BoardView({
               key={status}
               status={status}
               items={grouped[status]}
-              collapsed={collapsed[status] === true}
+              collapsed={!phone && collapsed[status] === true}
               cardsHidden={hiddenCards[status] === true}
               highlighted={dragOver === status}
               onToggleCollapsed={() => setCollapsed((value) => ({ ...value, [status]: !value[status] }))}
@@ -5771,7 +6028,7 @@ function BoardView({
               onCopyReference={(item) => copyWorkItemReference(state, item)}
               onMove={moveItem}
               onDelete={deleteItem}
-              readOnly={isPreviewing}
+              readOnly={isPreviewing || viewOnly}
               groupRollups={isFlattenedRoot ? new Map() : groupRollups}
               onOpenGroup={openGroup}
               expandedGroupIds={isFlattenedRoot ? new Set() : expandedGroupIds}
@@ -5807,7 +6064,8 @@ function BoardView({
             </div>
           ) : null}
         </DragOverlay>
-      </DndContext>}
+      </DndContext>
+      </>}
     </main>
     </BoardPeopleContext.Provider>
     </StalenessContext.Provider>
@@ -5827,6 +6085,7 @@ function BoardDashboard({
   const [pendingAction, setPendingAction] = useState<{ kind: "archive" | "delete"; board: BoardRecord } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState("");
   const [busyAction, setBusyAction] = useState<"archive" | "delete" | "restore" | null>(null);
+  const [newBoardOpen, setNewBoardOpen] = useState(false);
   const [toast, setToast] = useState<{ tone: "success" | "error"; message: string; detail?: string } | null>(null);
   const boardActionDialogRef = useDialogFocus<HTMLElement>(Boolean(pendingAction));
   const activeBoards = boards.filter((board) => !board.archivedAt);
@@ -5951,7 +6210,16 @@ function BoardDashboard({
             </span>
           </button>
         ) : null}
+        {capabilities.hosted ? (
+          <button className="primary" onClick={() => setNewBoardOpen(true)}><Plus size={14} /> New board</button>
+        ) : null}
       </header>
+      {newBoardOpen ? (
+        <NewBoardModal onClose={() => setNewBoardOpen(false)} onCreated={(repoId) => {
+          setNewBoardOpen(false);
+          void onBoardsChanged().then(() => onSelectBoard(repoId));
+        }} />
+      ) : null}
       <section className="board-list">
         {visibleBoards.length > 0 ? (
           visibleBoards.map((board) => (
@@ -5963,11 +6231,11 @@ function BoardDashboard({
                     {board.kind === "demo" ? <small className="board-kind-pill">Demo</small> : null}
                     {board.archivedAt ? <small className="board-kind-pill">Archived</small> : null}
                   </span>
-                  <small>{board.cwd}</small>
+                  {capabilities.projectFolders ? <small>{board.cwd}</small> : null}
                 </span>
                 <small>{board.repoId}</small>
               </button>
-              <span className="board-list-actions">
+              {capabilities.projectFolders ? <span className="board-list-actions">
                 {board.archivedAt ? (
                   <TooltipButton
                     label={`Restore ${board.title}`}
@@ -5995,7 +6263,7 @@ function BoardDashboard({
                 >
                   <Trash2 size={14} />
                 </TooltipButton>
-              </span>
+              </span> : null}
             </article>
           ))
         ) : (
@@ -6184,6 +6452,8 @@ function App() {
   }, []);
 
   const load = useCallback(async (preserveCurrentOnError = false) => {
+    // The web's own screens (sign-in, invitations, approvals) load what they need themselves.
+    if (capabilities.hosted && webScreen()) return;
     const requestId = ++appLoadRequestRef.current;
     try {
       const [status, boardsPayload] = await Promise.all([
@@ -6193,7 +6463,7 @@ function App() {
       if (requestId !== appLoadRequestRef.current) return;
       setInitialized(status.initialized);
       setBoards(boardsPayload.boards);
-      if (isTutorialPath()) {
+      if (capabilities.tutorial && isTutorialPath()) {
         selectedRepoIdRef.current = null;
         setSelectedRepoId(null);
         setState(null);
@@ -6221,9 +6491,18 @@ function App() {
         setState(null);
       }
     } catch (loadError) {
-      if (!preserveCurrentOnError) {
-        setError(loadError instanceof Error ? loadError.message : "Failed to load");
+      if (preserveCurrentOnError) return;
+      // Signed out on the web: the board address stays, and the signed-out screen offers Log in.
+      // On a computer too, when the address names a board (its project's board needs a sign-in, or another account's).
+      const needed = (loadError as { signedOut?: SignedOut } | null)?.signedOut;
+      if (needed && (capabilities.hosted || repoIdFromPath())) {
+        const routeRepoId = repoIdFromPath();
+        selectedRepoIdRef.current = routeRepoId;
+        setSelectedRepoId(routeRepoId);
+        setSignedOut(needed);
+        return;
       }
+      setError(loadError instanceof Error ? loadError.message : "Failed to load");
     }
   }, []);
 
@@ -6232,7 +6511,8 @@ function App() {
   }, [load]);
 
   useEffect(() => {
-    if (!state) return;
+    // On the web, live updates come from the service instead (below).
+    if (!state || capabilities.hosted) return;
     let stopped = false;
     let pollTimer: number | null = null;
     const poll = async () => {
@@ -6267,9 +6547,57 @@ function App() {
     };
   }, [load, loadSelectedBoard, Boolean(state)]);
 
+  // On the web: the board's revision arrives over the service's live
+  // connection, and the board reloads only when it differs from what's shown.
+  useKeyboardInset();
+  const shownRevisionRef = useRef<number | null>(null);
+  shownRevisionRef.current = state?.roadmap.revision ?? null;
+  const [liveEpoch, setLiveEpoch] = useState(0);
+  const watchedBoard = hostedAdapter && state ? state.manifest.repoId : null;
+  useEffect(() => {
+    const adapter = hostedAdapter;
+    if (!adapter || !watchedBoard) return;
+    const boardId = watchedBoard;
+    const known = shownRevisionRef.current;
+    const watch = watchHostedBoard({
+      boardId,
+      ...(known === null ? {} : { knownRevision: known }),
+      liveToken: () => adapter.liveToken(),
+      revision: (id) => adapter.revision(id),
+      onRevision: (revision) => {
+        if (selectedRepoIdRef.current !== boardId || revision === shownRevisionRef.current) return;
+        void loadSelectedBoard(boardId, true);
+      },
+      onLost: () => {
+        if (selectedRepoIdRef.current !== boardId) return;
+        // Reloading shows why (signed out, or no longer on this board); a board that still loads is watched again.
+        void loadSelectedBoard(boardId).then((next) => {
+          if (next) setLiveEpoch((epoch) => epoch + 1);
+        });
+      },
+    });
+    return () => watch.close();
+  }, [watchedBoard, liveEpoch, loadSelectedBoard]);
+
+  // On the web, the board list is rechecked when the page regains focus.
+  useEffect(() => {
+    if (!capabilities.hosted) return;
+    const recheck = () => {
+      if (!document.hidden) void load(true);
+    };
+    window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", recheck);
+    return () => {
+      window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", recheck);
+    };
+  }, [load]);
+
   useEffect(() => {
     const onPopState = () => {
       const next = repoIdFromPath();
+      // Only the "#card=" part changed (a card link on the open board): the board itself stays.
+      if (next !== null && next === selectedRepoIdRef.current && cardIdFromHash(window.location.hash)) return;
       setSelectedRepoId(next);
       setState(null);
     };
@@ -6284,12 +6612,22 @@ function App() {
     void loadSelectedBoard(selectedRepoId);
   }, [loadSelectedBoard, selectedRepoId]);
 
+  const screen = capabilities.hosted ? webScreen() : null;
+  if (screen === "sign-in") return <SignInPage />;
+  if (screen === "invite") return <InvitePage onOpenBoard={(boardId) => window.location.assign(`/boards/${encodeURIComponent(boardId)}`)} />;
+  if (screen === "approve") return <ApprovePage />;
+  if (signedOut && !selectedRepoId && capabilities.hosted) {
+    // Signed out on the web away from a board, such as on the board list.
+    return <SignedOutScreen signedOut={signedOut} onSignedIn={() => void load()} />;
+  }
   if (signedOut && selectedRepoId) {
     const repoId = selectedRepoId;
     // Keyed by board, so a sign-in started on another board's screen can't finish on this one.
     return <SignedOutScreen key={repoId} signedOut={signedOut} onSignedIn={() => {
       if (selectedRepoIdRef.current !== repoId) return;
       setSignedOut(null);
+      // Start-up may have stopped at this board, before the list of boards loaded.
+      if (initialized === null) void load(true);
       void loadSelectedBoard(repoId);
     }} />;
   }
@@ -6312,7 +6650,11 @@ function App() {
       </main>
     );
   }
-  if (isTutorialPath()) return <TutorialPage onSelectBoard={selectBoard} />;
+  if (capabilities.tutorial && isTutorialPath()) return <TutorialPage onSelectBoard={selectBoard} />;
+  if (capabilities.hosted && !selectedRepoId) {
+    if (initialized === null) return <main className="loading-screen">Loading Planban...</main>;
+    return <HostedDashboard boards={boards} onSelectBoard={selectBoard} onBoardsChanged={load} />;
+  }
   if (!selectedRepoId && boards.length > 0) return <BoardDashboard boards={boards} onSelectBoard={selectBoard} onBoardsChanged={load} />;
   if (initialized === false && boards.length === 0) {
     return (

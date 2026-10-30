@@ -6,7 +6,7 @@ import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import { platformInvocation } from "./platform-invocation.mjs";
+import { platformInvocation, stopInvocation } from "./platform-invocation.mjs";
 
 const REQUIRED_RUNTIME_SPECIFIERS = ["tsx/esm", "express", "iconv-lite/encodings"];
 const CACHE_DIRECTORY = "planban-marketplace-dependencies";
@@ -105,7 +105,7 @@ export function runCommand(command, args, options = {}) {
     let stderr = "";
     const timeout = options.timeoutMs
       ? setTimeout(() => {
-        child.kill("SIGTERM");
+        stopInvocation(child);
         rejectRun(new Error(`${command} ${args.join(" ")} timed out`));
       }, options.timeoutMs)
       : null;
@@ -212,7 +212,9 @@ async function preserveDependencies(root, paths, marker, disableReuse) {
 }
 
 async function installDependencies(root, execute) {
-  const result = await execute("npm", ["install"], { cwd: root, timeoutMs: 180000 });
+  // Windows runners and slower machines take up to about two minutes here; this
+  // leaves room inside the update step's five minutes (updateRunner.ts).
+  const result = await execute("npm", ["install"], { cwd: root, timeoutMs: 240000 });
   if (result.exitCode !== 0) throw commandFailure("npm", ["install"], result);
   return result;
 }

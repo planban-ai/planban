@@ -6,14 +6,17 @@ import { getFunctionName } from "convex/server";
 import { authorizationResponse, approvalResponse, consentResponse, machineStartResponse, machineLaunchResponse, machineCancelResponse, consentValidityResponse } from "../online/service/convex/model/oauthConsent";
 import { serviceDiscovery, authorizationServerDiscovery } from "../online/service/convex/http";
 import { CLAUDE_CODE_CLIENT_ID, parseClientMetadata } from "../online/service/convex/model/oauthClient";
+import { openNote } from "../online/service/convex/model/signInNote";
 
 const origin = "https://planban.example", clientId = "https://chatgpt.com/oauth/codex/client.json";
 const client = { clientId, name: "Codex", native: true, redirectUris: ["http://127.0.0.1/callback"] };
 const fields = { client_id: clientId, redirect_uri: "http://127.0.0.1:54321/callback", response_type: "code", resource: origin + "/mcp", code_challenge: "a".repeat(43), code_challenge_method: "S256", scope: "planban:plan offline_access", state: "client-state" };
 const authorize = (values = fields, headers: Record<string, string> = {}) => new Request(origin + "/oauth/authorize?" + new URLSearchParams(values), { headers });
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+/** The signed note a sign-in start hands the browser, read back as the service would. */
+const noteOf = (response: Response) => openNote(new URL(response.headers.get("Location")!).searchParams.get("request")!, "consent");
 async function configured(run: () => Promise<void>) {
-  const values = { PLANBAN_PUBLIC_URL: origin, CLERK_ISSUER: "https://fixture.clerk.example", CLERK_PUBLISHABLE_KEY: "pk_test_" + btoa("fixture.clerk.example$"), CLERK_SECRET_KEY: "synthetic-fixture-only" };
+  const values = { PLANBAN_PUBLIC_URL: origin, CLERK_ISSUER: "https://fixture.clerk.example", CLERK_PUBLISHABLE_KEY: "pk_test_" + btoa("fixture.clerk.example$"), CLERK_SECRET_KEY: "synthetic-fixture-only", PLANBAN_SIGNIN_NOTE_KEY: "synthetic-sign-in-note-key-for-tests-only" };
   const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
   try { Object.assign(process.env, values); await run(); }
   finally { for (const [key, value] of Object.entries(previous)) if (value === undefined) delete process.env[key]; else process.env[key] = value; }
@@ -39,25 +42,30 @@ test("discovery names only the service issuer and explicit machine flow, and fai
 }));
 
 test("authorization freezes validated metadata and bindings, with independent host cookies and no unsafe redirect", async () => configured(async () => {
-  const stored: any[] = [];
-  const ctx: any = { runMutation: async (fn: any, args: any) => {
+  const writes: string[] = [];
+  const ctx: any = { runMutation: async (fn: any) => {
     if (getFunctionName(fn) === "oauth:reserveMetadataFetch") return true;
-    assert.equal(getFunctionName(fn), "oauth:createRequest"); stored.push(args);
+    // Caching a fetched client document is bounded by the separate fetch budget; it isn't a sign-in record.
+    if (getFunctionName(fn) === "oauth:cacheMetadataClient") return;
+    writes.push(getFunctionName(fn));
   } };
   const response = await authorizationResponse(ctx, authorize(), async () => client);
   assert.equal(response.status, 303);
   const location = new URL(response.headers.get("Location")!);
   assert.equal(location.origin, origin);
   assert.equal(location.pathname, "/oauth/consent");
-  assert.equal(stored[0].requestHash, hash(location.searchParams.get("request")!));
-  assert.equal(stored[0].clientId, clientId);
-  assert.equal(stored[0].redirectUri, fields.redirect_uri);
-  assert.equal(stored[0].challenge, fields.code_challenge);
-  assert.deepEqual(stored[0].scopes, ["planban:plan", "offline_access"]);
+  // The start stores nothing: the frozen request travels in a signed note.
+  assert.deepEqual(writes, []);
+  const note = (await noteOf(response))!;
+  assert.equal(note.clientId, clientId);
+  assert.equal(note.redirectUri, fields.redirect_uri);
+  assert.equal(note.challenge, fields.code_challenge);
+  assert.deepEqual(note.scopes, ["planban:plan", "offline_access"]);
   const cookies = response.headers.getSetCookie();
   assert.equal(cookies.length, 2);
   for (const cookie of cookies) assert.match(cookie, /^__Host-planban_\w+=pb[bs]_[A-Za-z0-9_-]{43}; Path=\/; HttpOnly; SameSite=Lax; Max-Age=600; Secure$/);
-  assert.notEqual(stored[0].browserHash, stored[0].csrfHash);
+  const browserCookie = cookies.find((cookie) => cookie.startsWith("__Host-planban_browser="))!.split(";")[0]!.split("=")[1]!;
+  assert.equal(note.browserHash, hash(browserCookie), "tied to this browser's cookie");
   const invalid = await authorizationResponse(ctx, authorize({ ...fields, redirect_uri: "https://attacker.example/callback" }), async () => client);
   assert.equal(invalid.status, 400);
   assert.equal(invalid.headers.get("Location"), null);
@@ -69,7 +77,7 @@ test("authorization freezes validated metadata and bindings, with independent ho
     assert.ok((await failed.json()).error);
   }
   assert.equal(invalidFetches, 0, "independent malformed fields never fetch publisher metadata");
-  assert.equal(stored.length, 1, "invalid requests create no pending rows");
+  assert.deepEqual(writes, [], "nothing is ever written at the start");
 }));
 
 test("exhausted metadata budget refuses valid requests before fetch, without permitting unknown clients", async () => configured(async () => {
@@ -95,9 +103,11 @@ test("Claude localhost port flexibility freezes the original callback and preser
     stored.push(args);
   } };
   const values = { ...fields, client_id: CLAUDE_CODE_CLIENT_ID, redirect_uri: "http://localhost:54114/callback", scope: "planban:read planban:plan planban:complete offline_access" };
-  assert.equal((await authorizationResponse(ctx, authorize(values), async () => code)).status, 303);
-  assert.equal(stored[0].redirectUri, values.redirect_uri);
-  assert.equal(stored[0].state, values.state);
+  const started = await authorizationResponse(ctx, authorize(values), async () => code);
+  assert.equal(started.status, 303);
+  const note = (await noteOf(started))!;
+  assert.equal(note.redirectUri, values.redirect_uri);
+  assert.equal(note.state, values.state);
   for (const override of [{ redirect_uri: "http://localhost:0/callback" }, { redirect_uri: "http://localhost:54114/a/../callback" }, { code_challenge_method: "plain" }, { code_challenge: "" }, { code_challenge: "short" }, { resource: "http://attacker.example/mcp" }]) {
     const response = await authorizationResponse(ctx, authorize({ ...values, ...override }), async () => code);
     assert.equal(response.status, 400);
@@ -105,7 +115,7 @@ test("Claude localhost port flexibility freezes the original callback and preser
   }
   const duplicate = new URL(authorize(values).url); duplicate.searchParams.append("redirect_uri", values.redirect_uri);
   assert.equal((await authorizationResponse(ctx, new Request(duplicate), async () => code)).status, 400);
-  assert.equal(stored.length, 1, "refused callbacks and malformed requests create no authorization row");
+  assert.equal(stored.length, 0, "no start writes an authorization row");
   const browser = "pbb_" + "b".repeat(43), csrf = "pbs_" + "c".repeat(43), ticket = "pbe_" + "d".repeat(43);
   const approvalCtx: any = { runMutation: async () => ({ redirectUri: values.redirect_uri, state: values.state }) };
   for (const decision of ["allow", "deny"]) {

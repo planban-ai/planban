@@ -208,7 +208,7 @@ test("resolves an installed-cache runtime from adjacent MCP metadata", async () 
     else process.env.PLANBAN_REPO_ROOT = previousRepoRoot;
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -248,6 +248,6 @@ test("falls back to the standard Codex marketplace runtime when cache MCP metada
     else process.env.PLANBAN_REPO_ROOT = previousRepoRoot;
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

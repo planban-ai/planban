@@ -50,7 +50,7 @@ test("processes that find a killed process's lock at the same time never hold it
     assert.equal(lines.length, 8);
     for (let index = 0; index < lines.length; index += 2) assert.deepEqual(lines.slice(index, index + 2), ["enter", "exit"], `overlap in ${lines.join(",")}`);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -89,7 +89,7 @@ test("an old lock whose holder is still alive is never taken away", async () => 
     assert.equal(entered, true);
   } finally {
     holder.kill("SIGKILL");
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -115,7 +115,7 @@ test("many processes taking turns on one board never overlap", async () => {
     assert.equal(lines.length, 48);
     for (let index = 0; index < lines.length; index += 2) assert.deepEqual(lines.slice(index, index + 2), ["enter", "exit"], `overlap at ${index}`);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -164,7 +164,7 @@ test("a write blocked by a stuck process says which process holds the board and 
     const created = JSON.parse((await cli(["create-card", "Unblocked", "--cwd", project, "-o", "json"])).stdout);
     assert.ok(JSON.stringify(created).includes("Unblocked"));
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -205,7 +205,7 @@ test("a lock taken part-way through an operation waits rather than giving up wit
     await init;
     assert.ok(JSON.parse(await readFile(join(home, "index.json"), "utf8")).boards.some((board: { repoId: string }) => board.repoId === "nested"));
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -230,7 +230,7 @@ test("when an older Planban version holds the board, that is the process named",
       await held.stop();
     }
   } finally {
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
 
@@ -271,6 +271,6 @@ test("a card edit from the board page gives up with the same explanation", async
   } finally {
     if (saved.home === undefined) delete process.env.PLANBAN_HOME; else process.env.PLANBAN_HOME = saved.home;
     if (saved.wait === undefined) delete process.env.PLANBAN_LOCK_WAIT_MS; else process.env.PLANBAN_LOCK_WAIT_MS = saved.wait;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
