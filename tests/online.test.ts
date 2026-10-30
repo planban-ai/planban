@@ -593,7 +593,8 @@ test("take-online sends every retained roadmap and current and historical docume
   assert.ok(expected.historyDocs!.some((doc) => doc.markdown === "# Second spec"));
   for (const version of expected.history) assert.deepEqual(version.roadmap, JSON.parse(await readFile(historyRoadmapPath(before.planningRoot, version.entry.version), "utf8")));
   assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
-  assert.equal(await storage.pathExists(before.roadmapPath), false);
+  // The live board is set aside; what is left there stops older Planban versions using it.
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
   assert.equal((await storage.loadState(cwd)).roadmap.revision, before.roadmap.revision + 1);
 });
 
@@ -841,7 +842,8 @@ test("take-online killed after the upload committed finishes on retry and report
   // The local edit is kept as recovery evidence.
   assert.ok(JSON.parse(await readFile(result.localSnapshot, "utf8")).roadmapItems.some((item: { title: string }) => item.title === "Made after the upload"));
   assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
-  assert.equal(await storage.pathExists(before.roadmapPath), false);
+  // The live board is set aside; what is left there stops older Planban versions using it.
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
 });
 
 test("take-local killed mid-download keeps the online board intact, and running it again finishes", async () => {
@@ -869,6 +871,17 @@ test("take-online killed between setting the local roadmap aside and switching t
   assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
   assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
   assert.equal([...fake.transfers.values()].filter((transfer) => transfer.state === "committed").length, 1);
+});
+
+test("take-online killed after leaving the marker finishes on retry and keeps the snapshot", async () => {
+  const before = await storage.loadState(cwd);
+  await killedAt("take-online:after-retire", ["online", "take-online", fake.url, "--cwd", cwd]);
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+  const result = await takeOnline(fake.url, cwd);
+  // The retry never takes the marker for the board: the snapshot still holds the board as it was.
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")).roadmapItems.map((item: { id: string }) => item.id), before.roadmap.roadmapItems.map((item) => item.id));
+  assert.equal((await readdir(before.planningRoot)).filter((name) => name.startsWith("roadmap.local-before-online-")).length, 1);
+  assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
 });
 
 test("take-local killed after writing the local copy resumes into the same folder", async () => {

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { normalizeRoadmap, PlanbanConflictError, PlanbanNotFoundError, PlanbanValidationError } from "../boardOperations";
 import { listHistory } from "../history";
-import { agentContextPath, defaultPlanbanRoot, defaultPlanningRoot, detachedBoardCwd, historyCarriedDocsPath, historyDocPath, historyIndexPath, historyRoadmapPath, isPathInsideRoot, manifestPath, resolveInsideRoot, slugify } from "../paths";
+import { agentContextPath, defaultPlanbanRoot, hasLiveRoadmap, RETIRED_ROADMAP, defaultPlanningRoot, detachedBoardCwd, historyCarriedDocsPath, historyDocPath, historyIndexPath, historyRoadmapPath, isPathInsideRoot, manifestPath, resolveInsideRoot, slugify } from "../paths";
 import { atomicWriteFile, isAtomicWriteTemp, LOCK_DIR, QUEUE_DIR, withBoardWriteLock } from "../persistence";
 import { registerBoardFromState } from "../registry";
 import { roadmapSchema } from "../schema";
@@ -375,7 +375,9 @@ export class PlanbanConfirmationNeeded extends PlanbanValidationError {
  * and the board only becomes live online at commit. Running it again resumes,
  * including after the upload committed but before this project switched.
  * While it runs, the board can still be read and its changes wait for the
- * board's write lock. If it fails before the online board is committed, the
+ * board's write lock; once it switches, a change that was waiting goes to
+ * the online board instead (againIfMoved), and Planban 1.x is shut out of
+ * the copy left here (RETIRED_ROADMAP). If it fails before the online board is committed, the
  * half-copied online version is removed and the board stays on this machine
  * unchanged (owner decision 15).
  */
@@ -578,7 +580,8 @@ async function finishTakeOnline(cwd: string, manifest: PlanbanProjectManifest, p
   const snapshot = journal.snapshot!;
   let unsyncedLocalChanges = journal.unsyncedLocalChanges ?? [];
   const live = join(planningRoot, "roadmap.json");
-  if (await pathExists(live)) {
+  // On a retry the marker below may already be there; it is never mistaken for the board.
+  if (await hasLiveRoadmap(planningRoot)) {
     // Still here after a crash: count any local edits made since the upload.
     if (journal.localRevision !== undefined) unsyncedLocalChanges = await localChangesAfter(planningRoot, journal.localRevision);
     // Retain every local byte, but remove the live filename so other checkouts
@@ -587,6 +590,12 @@ async function finishTakeOnline(cwd: string, manifest: PlanbanProjectManifest, p
   }
   crashPoint("take-online:after-rename");
   await atomicWriteFile(join(planningRoot, "ONLINE-BOARD.txt"), `Authority moved to ${url}, board ${boardId}.\nThe roadmap snapshot, documents and history here are recovery evidence. Do not edit them.\n`);
+  // Agents still running Planban 1.x read and write roadmap.json directly, and
+  // its `init` would put a fresh, empty board where none is. This marker makes
+  // each of them fail, saying to restart for Planban 2.0, and Planban 2.0 in
+  // another checkout still pointing here says the board moved online.
+  await atomicWriteFile(live, RETIRED_ROADMAP);
+  crashPoint("take-online:after-retire");
   // Linked first, so every request for the board (this one included) uses the account that took it online.
   await recordBoardAccountAs(url, boardId, pinned).catch(() => undefined);
   const roadmap = (await onlineRequest<{ roadmap: PlanbanResolvedState["roadmap"] }>(url, boardPath(boardId), undefined, { credentials: pinned })).roadmap;
@@ -904,7 +913,7 @@ async function setStaleCopyAside(planningRoot: string, marker: StaleCopy) {
   return withBoardWriteLock(planningRoot, async () => {
     const stamp = Date.now();
     const snapshot = join(planningRoot, `roadmap.stale-copy-${stamp}.json`);
-    if (await pathExists(join(planningRoot, "roadmap.json"))) await rename(join(planningRoot, "roadmap.json"), snapshot);
+    if (await hasLiveRoadmap(planningRoot)) await rename(join(planningRoot, "roadmap.json"), snapshot);
     const report = join(planningRoot, `STALE-COPY-REPORT-${stamp}.md`);
     await atomicWriteFile(report, [
       "# Stale local copy set aside",
