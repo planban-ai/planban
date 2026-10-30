@@ -204,8 +204,8 @@ test("GitHub merges are read from a cursor, kept between reads, and degrade with
     assert.deepEqual(offline.merges.map((merge) => merge.pr).sort(), [5, 8]);
     assert.match(offline.note ?? "", /isn't signed in here/u);
 
-    // More pull requests than one read pages through: coverage is reported as incomplete, and the
-    // next read goes back over the unscanned history instead of starting from a cursor past it.
+    // More pull requests than one read pages through, changing all the time: coverage is reported as
+    // incomplete on every check, never claimed. (Resuming older history is tested separately below.)
     clearStalenessCaches();
     const fullPage = (args: string[]) => {
       const pageNumber = Number(args.find((arg) => arg.startsWith("page="))!.slice("page=".length));
@@ -214,12 +214,12 @@ test("GitHub merges are read from a cursor, kept between reads, and degrade with
     let pagesRead = 0;
     answer = (args) => { pagesRead += 1; return fullPage(args); };
     const busy = await githubMerges("o/r", NOW - 20 * DAY, { now: NOW + 7 * DAY, exec });
-    assert.equal(pagesRead, 5);
+    assert.equal(pagesRead, 10, "what changed since the last check, then older history, five pages each");
     assert.match(busy.note ?? "", /only back to/u);
     clearStalenessCaches();
     pagesRead = 0;
     const again = await githubMerges("o/r", NOW - 20 * DAY, { now: NOW + 7 * DAY + 120_000, exec });
-    assert.equal(pagesRead, 5, "the unscanned history is read again, not skipped");
+    assert.ok(pagesRead >= 5, "the unscanned history is read, not skipped");
     assert.match(again.note ?? "", /only back to/u);
     clearStalenessCaches();
     answer = () => page([]);
@@ -229,6 +229,82 @@ test("GitHub merges are read from a cursor, kept between reads, and degrade with
     const missing = await githubMerges("o/r", NOW - 10 * DAY, { now: NOW + 6 * DAY, exec: (_command, args, options) => runCommand("planban-no-such-gh", args, options) });
     assert.deepEqual(missing.merges.map((merge) => merge.pr).sort(), [5, 8]);
     assert.match(missing.note ?? "", /the GitHub CLI \(gh\) isn't installed here/u);
+  } finally {
+    if (previousHome === undefined) delete process.env.PLANBAN_HOME;
+    else process.env.PLANBAN_HOME = previousHome;
+    clearStalenessCaches();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("GitHub merges beyond what one check reads are found by later checks, which resume where the last stopped", async () => {
+  const root = mkdtempSync(join(tmpdir(), "planban-github-backfill-"));
+  const previousHome = process.env.PLANBAN_HOME;
+  process.env.PLANBAN_HOME = root;
+  try {
+    // 600 closed pull requests, none changing between checks, newest update first. The merge
+    // a card is waiting on is row 550, on page 6.
+    const rows = Array.from({ length: 600 }, (_, index) => ({
+      number: 2000 + index,
+      merged_at: index === 550 ? iso(NOW - 40 * DAY) : null,
+      updated_at: iso(NOW - DAY - index * 60 * 60 * 1000),
+    }));
+    const pagesAsked: number[] = [];
+    const exec = async (_command: string, args: string[]) => {
+      const pageNumber = Number(args.find((arg) => arg.startsWith("page="))!.slice("page=".length));
+      pagesAsked.push(pageNumber);
+      return JSON.stringify(rows.slice((pageNumber - 1) * 100, pageNumber * 100));
+    };
+    const since = NOW - 60 * DAY;
+    const first = await githubMerges("o/r", since, { now: NOW, exec });
+    assert.deepEqual(pagesAsked, [1, 2, 3, 4, 5]);
+    assert.equal(first.merges.length, 0);
+    assert.match(first.note ?? "", /only back to/u);
+
+    clearStalenessCaches();
+    pagesAsked.length = 0;
+    const second = await githubMerges("o/r", since, { now: NOW + 2 * 60 * 1000, exec });
+    assert.equal(pagesAsked[0], 1, "recent changes are still read first");
+    assert.ok(pagesAsked.includes(6), `the scan resumes past page 5 (asked ${pagesAsked.join(", ")})`);
+    assert.deepEqual(second.merges, [{ pr: 2550, mergedAt: iso(NOW - 40 * DAY) }]);
+    assert.equal(second.note, undefined, "history back to the oldest card is now covered");
+
+    clearStalenessCaches();
+    pagesAsked.length = 0;
+    const third = await githubMerges("o/r", since, { now: NOW + 4 * 60 * 1000, exec });
+    assert.deepEqual(pagesAsked, [1], "once covered, a check reads only what changed");
+    assert.deepEqual(third.merges, [{ pr: 2550, mergedAt: iso(NOW - 40 * DAY) }], "no duplicates");
+  } finally {
+    if (previousHome === undefined) delete process.env.PLANBAN_HOME;
+    else process.env.PLANBAN_HOME = previousHome;
+    clearStalenessCaches();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resuming older GitHub history misses nothing when pull requests updated in between shift the list", async () => {
+  const root = mkdtempSync(join(tmpdir(), "planban-github-shift-"));
+  const previousHome = process.env.PLANBAN_HOME;
+  process.env.PLANBAN_HOME = root;
+  try {
+    // 700 rows; the merge a card waits on is row 520, just past the first check's five pages.
+    let rows = Array.from({ length: 700 }, (_, index) => ({
+      number: 3000 + index,
+      merged_at: index === 520 ? iso(NOW - 50 * DAY) : null,
+      updated_at: iso(NOW - DAY - index * 60 * 60 * 1000),
+    }));
+    const exec = async (_command: string, args: string[]) => {
+      const pageNumber = Number(args.find((arg) => arg.startsWith("page="))!.slice("page=".length));
+      return JSON.stringify(rows.slice((pageNumber - 1) * 100, pageNumber * 100));
+    };
+    const since = NOW - 80 * DAY;
+    await githubMerges("o/r", since, { now: NOW, exec });
+    // 150 already-read pull requests change, move to the top and shift the rest up a page and a half.
+    const moved = rows.slice(0, 150).map((row, index) => ({ ...row, updated_at: iso(NOW + 60_000 + index) }));
+    rows = [...moved.reverse(), ...rows.slice(150)];
+    clearStalenessCaches();
+    const after = await githubMerges("o/r", since, { now: NOW + 2 * 60 * 1000, exec });
+    assert.deepEqual(after.merges, [{ pr: 3520, mergedAt: iso(NOW - 50 * DAY) }]);
   } finally {
     if (previousHome === undefined) delete process.env.PLANBAN_HOME;
     else process.env.PLANBAN_HOME = previousHome;

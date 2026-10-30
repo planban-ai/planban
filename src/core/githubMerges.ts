@@ -23,11 +23,16 @@ export interface GitHubMerges {
 }
 
 interface MergeCache {
-  version: 1;
+  version: 2;
   repo: string;
-  /** Every merge between these two times has been seen. */
-  coveredFrom: string;
+  /** Every merge updated between scannedFrom and cursor has been seen. */
+  scannedFrom: string;
   cursor: string;
+  /**
+   * Where reading older history resumes, while scannedFrom is still newer than the oldest card
+   * needs: the page of GitHub's list, newest first, that held scannedFrom.
+   */
+  resumePage: number;
   checkedAt: string;
   merges: MergeRecord[];
 }
@@ -61,7 +66,7 @@ function cachePath(repo: string) {
 async function readCache(repo: string): Promise<MergeCache | null> {
   try {
     const cache = JSON.parse(await readFile(cachePath(repo), "utf8")) as MergeCache;
-    return cache.version === 1 && cache.repo === repo && Array.isArray(cache.merges) ? cache : null;
+    return cache.version === 2 && cache.repo === repo && Array.isArray(cache.merges) ? cache : null;
   } catch {
     return null;
   }
@@ -77,29 +82,50 @@ async function writeCache(cache: MergeCache) {
 
 interface PullRow { number: number; merged_at: string | null; updated_at: string }
 
-interface MergeScan {
+interface PageScan {
   merges: MergeRecord[];
-  /**
-   * The oldest update time the scan reached. It reached `since` unless more pull requests changed
-   * than MAX_PAGES pages hold; then only scannedFrom → now is covered.
-   */
-  scannedFrom: number;
+  /** Whether the scan got back to the time it was asked for, or to the end of the list. */
+  reached: boolean;
+  /** The oldest update time read. */
+  oldest: number;
+  /** The page holding `oldest`, where a later scan resumes. */
+  lastPage: number;
 }
 
-/** Merged PRs updated since `since`, newest first, from GitHub's pull request list. */
-async function fetchMergedSince(repo: string, since: number, exec: Run): Promise<MergeScan> {
+function readPage(repo: string, page: number, exec: Run): Promise<PullRow[]> {
+  return exec("gh", ["api", "--method", "GET", `repos/${repo}/pulls`, "-f", "state=closed", "-f", "sort=updated", "-f", "direction=desc",
+    "-f", `per_page=${PER_PAGE}`, "-f", `page=${page}`, "--jq", "[.[] | {number, merged_at, updated_at}]"], { timeout: GH_TIMEOUT_MS })
+    .then((text) => JSON.parse(text) as PullRow[]);
+}
+
+/**
+ * Reads GitHub's closed pull requests, newest update first, from `startPage` until updates pass
+ * `stopAt`, reading at most MAX_PAGES pages. A PR's last update is never before its merge, so once
+ * updates pass a time, so have merges.
+ *
+ * Resuming older history (`continueFrom` set) starts one page back and checks that page still
+ * holds something updated at or after that time: pull requests updated since move to the top and
+ * shift the rest up, so this proves no row slipped past between the two reads.
+ */
+async function scanPages(repo: string, exec: Run, startPage: number, stopAt: number, continueFrom?: number): Promise<PageScan> {
   const merges: MergeRecord[] = [];
-  for (let page = 1; page <= MAX_PAGES; page += 1) {
-    const text = await exec("gh", ["api", "--method", "GET", `repos/${repo}/pulls`, "-f", "state=closed", "-f", "sort=updated", "-f", "direction=desc",
-      "-f", `per_page=${PER_PAGE}`, "-f", `page=${page}`, "--jq", "[.[] | {number, merged_at, updated_at}]"], { timeout: GH_TIMEOUT_MS });
-    const rows = JSON.parse(text) as PullRow[];
+  let page = continueFrom === undefined ? startPage : Math.max(1, startPage - 1);
+  let oldest = Infinity;
+  let checking = continueFrom !== undefined;
+  for (let read = 0; read < MAX_PAGES; read += 1) {
+    const rows = await readPage(repo, page, exec);
+    if (checking && page > 1 && !rows.some((row) => Date.parse(row.updated_at) >= continueFrom!)) {
+      page -= 1;
+      continue;
+    }
+    checking = false;
     for (const row of rows) if (row.merged_at) merges.push({ pr: row.number, mergedAt: row.merged_at });
-    // A PR's last update is never before its merge, so once updates pass the cursor, so have merges.
-    const oldest = rows.at(-1);
-    if (rows.length < PER_PAGE || !oldest || Date.parse(oldest.updated_at) < since) return { merges, scannedFrom: since };
-    if (page === MAX_PAGES) return { merges, scannedFrom: Date.parse(oldest.updated_at) };
+    const last = rows.at(-1);
+    if (last) oldest = Math.min(oldest, Date.parse(last.updated_at));
+    if (rows.length < PER_PAGE || oldest < stopAt) return { merges, reached: true, oldest, lastPage: page };
+    page += 1;
   }
-  return { merges, scannedFrom: since };
+  return { merges, reached: false, oldest, lastPage: page - 1 };
 }
 
 function why(error: unknown): string {
@@ -128,9 +154,11 @@ export function useGitHubRunner(exec?: Run) {
 }
 
 /**
- * Merged PRs for `repo` from `since` on: only what is new since the last read is fetched, and
- * merged with what earlier reads saw. Refreshes at most once a minute per process; the cursor and
- * merges persist between processes, so a short-lived hook can still answer when GitHub can't.
+ * Merged PRs for `repo` from `since` on, merged with what earlier reads saw. Each check reads what
+ * changed since the last one, then, while older history is still unread, continues it from where
+ * the last check stopped: a busy repository is covered over a few checks, never skipped. Refreshes
+ * at most once a minute per process; the position and merges persist between processes, so a
+ * short-lived hook can still answer when GitHub can't.
  */
 export function githubMerges(repo: string, since: number, options: { now?: number; exec?: Run } = {}): Promise<GitHubMerges> {
   const now = options.now ?? Date.now();
@@ -138,24 +166,41 @@ export function githubMerges(repo: string, since: number, options: { now?: numbe
   if (cached && now - cached.at < REFRESH_AFTER_MS) return cached.result;
   const result = (async (): Promise<GitHubMerges> => {
     const saved = await readCache(repo);
-    // Earlier reads cover since → cursor: fetch only what is newer. Otherwise read back to `since`.
-    const covered = saved && Date.parse(saved.coveredFrom) <= since;
-    const from = covered ? Date.parse(saved.cursor) - CURSOR_OVERLAP_MS : since;
+    const exec = options.exec ?? ghRunner;
     try {
-      const scan = await fetchMergedSince(repo, from, options.exec ?? ghRunner);
       const byPr = new Map((saved?.merges ?? []).map((merge) => [merge.pr, merge]));
-      for (const merge of scan.merges) byPr.set(merge.pr, merge);
+      const keep = (scan: PageScan) => { for (const merge of scan.merges) byPr.set(merge.pr, merge); };
+      // A first check reads from the top; later ones resume older history where the last stopped.
+      let scannedFrom: number | null = null;
+      let resumePage = 1;
+      if (saved) {
+        // What changed since the last check.
+        const recent = await scanPages(repo, exec, 1, Date.parse(saved.cursor) - CURSOR_OVERLAP_MS);
+        keep(recent);
+        if (recent.reached) {
+          scannedFrom = Date.parse(saved.scannedFrom);
+          resumePage = saved.resumePage;
+        } else {
+          // More changed than one read holds: what was read before is no longer joined up to now.
+          scannedFrom = recent.oldest;
+          resumePage = recent.lastPage;
+        }
+      }
+      if (scannedFrom === null || scannedFrom > since) {
+        const older = scannedFrom === null
+          ? await scanPages(repo, exec, 1, since)
+          : await scanPages(repo, exec, resumePage, since, scannedFrom);
+        keep(older);
+        scannedFrom = older.reached ? Math.min(since, older.oldest) : older.oldest;
+        resumePage = older.lastPage;
+      }
       const merges = [...byPr.values()];
       const at = new Date(now).toISOString();
-      // Only history actually scanned counts as covered. A scan stopped by the page limit covers
-      // scannedFrom → now alone, so the next read goes back over the rest rather than skipping it.
-      const complete = scan.scannedFrom <= from;
-      const coveredFrom = complete ? (covered ? saved.coveredFrom : new Date(since).toISOString()) : new Date(scan.scannedFrom).toISOString();
-      await writeCache({ version: 1, repo, coveredFrom, cursor: at, checkedAt: at, merges }).catch(() => undefined);
-      if (complete) return { merges };
+      await writeCache({ version: 2, repo, scannedFrom: new Date(scannedFrom).toISOString(), cursor: at, resumePage, checkedAt: at, merges }).catch(() => undefined);
+      if (scannedFrom <= since) return { merges };
       return {
         merges,
-        note: `Merged-PR warnings checked GitHub only back to ${new Date(scan.scannedFrom).toISOString().slice(0, 10)}: more pull requests changed than one check reads. Older merges may be missing.`,
+        note: `Merged-PR warnings checked GitHub only back to ${new Date(scannedFrom).toISOString().slice(0, 10)} so far, as more pull requests changed than one check reads; later checks continue further back. Older merges may be missing.`,
       };
     } catch (error) {
       const seen = saved ? ` since ${saved.checkedAt.slice(0, 10)}` : "";
