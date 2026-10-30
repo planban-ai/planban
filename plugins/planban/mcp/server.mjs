@@ -777,7 +777,7 @@ const tools = [
       nextAction: { type: ["string", "null"], description: "New next action, or null to clear." },
       tags: { type: "array", items: { type: "string" }, description: "Replacement tag list." },
       blockedBy: { type: ["string", "null"], description: "Blocking card id or null." },
-      metadata: { type: ["object", "null"], description: "Replacement metadata object or null to clear." },
+      metadata: { type: ["object", "null"], description: "Metadata keys to set; other keys are kept. A key set to null is removed; null clears all metadata." },
     }, ["cardId"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },

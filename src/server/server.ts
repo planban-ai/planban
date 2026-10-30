@@ -81,6 +81,7 @@ import { updatePreflight } from "../core/updatePreflight";
 import { runPlanbanUpdate, type UpdateRunSnapshot } from "../core/updateRunner";
 import { PlanbanActivityStore } from "../core/activity";
 import { collectStaleness } from "../core/stalenessSources";
+import { keptProgress } from "../core/boardOperations";
 import { PlanbanEditConflictError } from "../core/conflicts";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -265,6 +266,7 @@ function updateItemCodexThreadMeta(
       },
     },
     updatedAt: new Date().toISOString(),
+    ...keptProgress(item),
   };
 }
 

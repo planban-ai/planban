@@ -241,7 +241,7 @@ export const TOOLS: ToolDefinition[] = [
       nextAction: { type: ["string", "null"] },
       tags: { type: "array", items: { type: "string" } },
       blockedBy: { type: ["string", "null"] },
-      metadata: { type: ["object", "null"] },
+      metadata: { type: ["object", "null"], description: "Metadata keys to set; other keys are kept. A key set to null is removed; null clears all metadata." },
       baseRevision,
       idempotencyKey,
     }, ["boardId", "cardId", "baseRevision"]),

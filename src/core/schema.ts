@@ -39,6 +39,7 @@ const roadmapItemBaseSchema = z.object({
     completedAt: z.string().nullable().default(null),
     reviewState: z.enum(["not-ready", "ready-for-review"]).nullish(),
     updatedAt: z.string().nullable().default(null),
+    progressNotedAt: z.string().nullish(),
     metadata: z.record(z.string(), z.unknown()).optional(),
   });
 
