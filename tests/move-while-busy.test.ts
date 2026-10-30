@@ -300,9 +300,14 @@ test("a page request whose writer died after saving, before recording its answer
     const { planningRoot } = await loadState(cwd);
     await runIdempotentBoardMutation({ planningRoot, idempotencyKey: "page-create-3", scope: "POST /api/cards",
       fingerprint: idempotencyFingerprint({ params: {}, body: ${JSON.stringify(body)} }),
-      run: async () => { await createCard({ cwd, ...${JSON.stringify(body)} }); process.kill(process.pid, "SIGKILL"); } });`;
+      run: async () => {
+        await createCard({ cwd, ...${JSON.stringify(body)} });
+        // Windows has no kill signals: exit at once with the code a killed process would have.
+        if (process.platform === "win32") process.exit(137);
+        process.kill(process.pid, "SIGKILL");
+      } });`;
   const killed = await promisify(execFile)(process.execPath, ["--import", "tsx/esm", "--input-type=module", "-e", script], { env: process.env }).then(() => null, (error) => error);
-  assert.equal(killed?.signal, "SIGKILL", String(killed?.stderr ?? "it finished"));
+  assert.ok(killed?.signal === "SIGKILL" || (process.platform === "win32" && killed?.code === 137), String(killed?.stderr ?? "it finished"));
   await takeOnline(bridge.url, cwd);
   const reservation = createServer();
   await new Promise<void>((resolve) => reservation.listen(0, "127.0.0.1", resolve));
