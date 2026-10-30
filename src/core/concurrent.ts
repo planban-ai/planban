@@ -41,13 +41,39 @@ function wholeCardChanged(read: PlanbanRoadmapItem | undefined, current: Planban
 
 type Input = Record<string, unknown>;
 
+/**
+ * A field's value as an edit compares it. A metadata key that is missing is not the same as one
+ * stored as null: a stored null can be removed, and storing one is a change.
+ */
+type FieldState = { present: boolean; value: unknown };
+
+function fieldState(card: PlanbanRoadmapItem | undefined, field: string): FieldState {
+  if (!field.startsWith("metadata.")) return { present: true, value: fieldValue(card, field) };
+  const key = field.slice("metadata.".length);
+  const metadata = card?.metadata ?? {};
+  return Object.hasOwn(metadata, key) ? { present: true, value: metadata[key] } : { present: false, value: undefined };
+}
+
+function sameState(a: FieldState, b: FieldState) {
+  return a.present === b.present && (!a.present || same(a.value, b.value));
+}
+
+/** What a metadata patch entry asks for: null removes the key. */
+const patchState = (value: unknown): FieldState => value === null ? { present: false, value: undefined } : { present: true, value };
+
+/** A metadata edit as a patch against what was read: null (clear all) removes each key that was read. */
+function metadataPatch(metadata: unknown, read: Record<string, unknown>): Record<string, unknown> {
+  if (metadata === null) return Object.fromEntries(Object.keys(read).map((key) => [key, null]));
+  return (metadata ?? {}) as Record<string, unknown>;
+}
+
 /** The edit's intended values, by field, so a clash can say what it wanted and a same-value change isn't a clash. */
-function intended(op: string, input: Input, read: PlanbanRoadmap): Array<TouchedField & { value: unknown }> | null {
+function intended(op: string, input: Input, read: PlanbanRoadmap): Array<TouchedField & { value: unknown; state?: FieldState }> | null {
   const cardId = typeof input.cardId === "string" ? input.cardId : "";
   const card = read.roadmapItems.find((item) => item.id === cardId);
   switch (op) {
     case "updateCard": {
-      const out: Array<TouchedField & { value: unknown }> = [];
+      const out: Array<TouchedField & { value: unknown; state?: FieldState }> = [];
       const text = (value: unknown) => typeof value === "string" ? value.trim() || null : value ?? null;
       if (input.title !== undefined) out.push({ cardId, field: "title", value: typeof input.title === "string" ? input.title.trim() : input.title });
       if (input.summary !== undefined) out.push({ cardId, field: "summary", value: text(input.summary) });
@@ -55,11 +81,11 @@ function intended(op: string, input: Input, read: PlanbanRoadmap): Array<Touched
       if (input.tags !== undefined) out.push({ cardId, field: "tags", value: Array.isArray(input.tags) ? input.tags.map((tag) => String(tag).trim()).filter(Boolean) : input.tags });
       if (input.blockedBy !== undefined) out.push({ cardId, field: "blockedBy", value: text(input.blockedBy) });
       if (input.metadata !== undefined) {
-        // Metadata replaces the whole object; only the keys it changes from what was read are touched.
-        const before = card?.metadata ?? {};
-        const after = (input.metadata ?? {}) as Record<string, unknown>;
-        for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
-          if (!same(before[key], after[key])) out.push({ cardId, field: `metadata.${key}`, value: after[key] });
+        // Metadata is a patch; only the keys it changes from what was read are touched.
+        for (const [key, value] of Object.entries(metadataPatch(input.metadata, card?.metadata ?? {}))) {
+          const field = `metadata.${key}`;
+          const state = patchState(value);
+          if (!sameState(fieldState(card, field), state)) out.push({ cardId, field, value: state.value, state });
         }
       }
       return out;
@@ -122,9 +148,10 @@ export function rebaseEdit(op: string, input: Input, read: PlanbanRoadmap, curre
       clashes.push({ cardId: want.cardId, field: want.field, read: fieldValue(was, want.field) ?? null, current: "(card removed)", yours: want.value ?? null });
       continue;
     }
-    const before = fieldValue(was, want.field);
-    const after = fieldValue(now, want.field);
-    if (!same(before, after) && !same(after, want.value)) clashes.push({ cardId: want.cardId, field: want.field, read: before ?? null, current: after ?? null, yours: want.value ?? null });
+    const before = fieldState(was, want.field);
+    const after = fieldState(now, want.field);
+    const wanted = want.state ?? { present: true, value: want.value };
+    if (!sameState(before, after) && !sameState(after, wanted)) clashes.push({ cardId: want.cardId, field: want.field, read: before.value ?? null, current: after.value ?? null, yours: want.value ?? null });
   }
   const touched = wants.map(({ cardId, field }) => ({ cardId, field }));
   if (clashes.length) return { ok: false, clashes, touched };
@@ -133,20 +160,13 @@ export function rebaseEdit(op: string, input: Input, read: PlanbanRoadmap, curre
 
 /** The same intent, expressed against the current board. */
 function adaptToCurrent(op: string, input: Input, read: PlanbanRoadmap, current: PlanbanRoadmap): Input {
-  const currentCards = new Map(current.roadmapItems.map((item) => [item.id, item]));
   if (op === "updateCard" && input.metadata !== undefined) {
-    // Apply only the keys this edit changed, onto the metadata as it is now;
+    // Apply only the keys this edit changed from what was read, onto the metadata as it is now;
     // clearing it (null) removes only the keys that were read, never ones added since.
     const card = read.roadmapItems.find((item) => item.id === input.cardId);
-    const before = card?.metadata ?? {};
-    const after = (input.metadata ?? {}) as Record<string, unknown>;
-    const merged = { ...(currentCards.get(String(input.cardId))?.metadata ?? {}) };
-    for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
-      if (same(before[key], after[key])) continue;
-      if (key in after) merged[key] = after[key];
-      else delete merged[key];
-    }
-    return { ...input, metadata: Object.keys(merged).length ? merged : null };
+    const patch = Object.fromEntries(Object.entries(metadataPatch(input.metadata, card?.metadata ?? {}))
+      .filter(([key, value]) => !sameState(fieldState(card, `metadata.${key}`), patchState(value))));
+    return { ...input, metadata: patch };
   }
   if (op === "moveCard" || op === "setCardParent") return placeAfterNeighbour(input, current);
   if (op === "reorderCards") return { ...input, items: reorderOnto(input.items as Array<{ id: string; status: PlanbanStatus }>, read, current) };
@@ -199,7 +219,7 @@ export function settlingFields(op: string, input: Record<string, unknown>, roadm
   if (!touched || op !== "updateCard" || input.metadata === undefined) return touched;
   const cardId = String(input.cardId ?? "");
   const card = roadmap.roadmapItems.find((item) => item.id === cardId);
-  const keys = input.metadata === null ? Object.keys(card?.metadata ?? {}) : Object.keys(input.metadata as Record<string, unknown>);
+  const keys = Object.keys(metadataPatch(input.metadata, card?.metadata ?? {}));
   const stated = keys.map((key) => ({ cardId, field: `metadata.${key}` }));
   const seen = new Set(touched.map((entry) => entry.field));
   return [...touched, ...stated.filter((entry) => !seen.has(entry.field))];

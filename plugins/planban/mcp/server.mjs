@@ -34,7 +34,7 @@ const { PLANBAN_STATUSES } = typesModule;
 const { queryWorkItems } = queryModule;
 const { ensureDemoBoard } = demoModule;
 const { PLANBAN_MCP_VERSION } = versionModule;
-const { stalenessAttention, stalenessLine } = stalenessModule;
+const { largeDocNote, stalenessAttention, stalenessLine } = stalenessModule;
 const { collectStaleness, projectStaleness } = stalenessSourcesModule;
 const { HOW_TO_REFER } = contentRulesModule;
 const { moveFilesOut } = moveFilesOutModule;
@@ -292,11 +292,18 @@ async function boardResult(text, repoId, structuredContent) {
 
 // Stale signals are advisory: they never block or fail a read.
 async function boardStaleness(state) {
-  return await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems });
+  return await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems, storage: state.manifest.storage });
 }
 
 function withLine(text, line) {
   return line ? `${text}\n${line}` : text;
+}
+
+// A Spec or Plan over 100 KB is being appended to; say so whenever an agent reads or writes it.
+function docSizeLine(payload) {
+  if (typeof payload?.markdown !== "string" || (payload.kind !== "spec" && payload.kind !== "plan")) return null;
+  const note = largeDocNote(payload.kind, Buffer.byteLength(payload.markdown, "utf8"));
+  return note ? `${note}.` : null;
 }
 
 function signalsLine(signals) {
@@ -777,7 +784,7 @@ const tools = [
       nextAction: { type: ["string", "null"], description: "New next action, or null to clear." },
       tags: { type: "array", items: { type: "string" }, description: "Replacement tag list." },
       blockedBy: { type: ["string", "null"], description: "Blocking card id or null." },
-      metadata: { type: ["object", "null"], description: "Replacement metadata object or null to clear." },
+      metadata: { type: ["object", "null"], description: "Metadata keys to set; other keys are kept. A key set to null is removed; null clears all metadata." },
     }, ["cardId"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
@@ -891,7 +898,7 @@ async function callToolImpl(name, args) {
     const attention = board ? stalenessAttention(board.staleness, board.items) : null;
     const goals = status.initialized ? await readGoalsBlock(status.cwd) : null;
     return await boardResult(
-      withLine(withLine(status.initialized ? `Planban is initialized for ${status.cwd}.` : `Planban is not initialized for ${status.cwd}.`, attention && stalenessLine(attention)), goals),
+      withLine(withLine(status.initialized ? `Planban is initialized for ${status.cwd}.` : `Planban is not initialized for ${status.cwd}.`, attention && stalenessLine(attention, "attention in this result")), goals),
       status.initialized ? status.repoId : null,
       // The Planban accounts signed in on this computer and which boards use each (emails only).
       { ...status, ...(attention ? { attention } : {}), ...(goals ? { goals } : {}), onlineAccounts: await accountsModule.listAccounts().catch(() => []) },
@@ -945,7 +952,7 @@ async function callToolImpl(name, args) {
     // A board using features this Planban can't show: say so plainly, and how to update.
     const behind = state.planbanBehind ? `${state.planbanBehind.notice} ${UPDATE_HOW}` : null;
     return await boardResult(
-      withLine(withLine(withLine(`Loaded Planban board ${state.manifest.repoId} at revision ${state.roadmap.revision}.`, behind), goals), stalenessLine(attention)),
+      withLine(withLine(withLine(`Loaded Planban board ${state.manifest.repoId} at revision ${state.roadmap.revision}.`, behind), goals), stalenessLine(attention, "attention in this result")),
       state.manifest.repoId,
       { ...summarizeBoard(state), attention, ...(goals ? { goals } : {}), ...(behind ? { planbanBehind: { ...state.planbanBehind, notice: behind } } : {}) },
     );
@@ -970,15 +977,17 @@ async function callToolImpl(name, args) {
     const board = await boardStaleness(state);
     const staleness = Object.fromEntries(result.matches.flatMap((entry) => board.cards[entry.item.id] ? [[entry.item.id, board.cards[entry.item.id]]] : []));
     const staleCount = Object.keys(staleness).length;
-    return textResult(withLine(
+    const stalenessNotes = board.notes ?? [];
+    return textResult(withLine(withLine(
       `Matched ${result.matches.length} Planban Work Items at revision ${state.roadmap.revision}.`,
       staleCount ? `${staleCount} matched Item${staleCount === 1 ? " has" : "s have"} stale signals (see staleness).` : null,
-    ), {
+    ), stalenessNotes.join(" ") || null), {
       cwd: state.cwd,
       repoId: state.manifest.repoId,
       revision: state.roadmap.revision,
       ...result,
       staleness,
+      ...(stalenessNotes.length ? { stalenessNotes } : {}),
     });
   }
 
@@ -987,8 +996,11 @@ async function callToolImpl(name, args) {
     const cardId = requireString(args.cardId, "cardId");
     const state = await loadState(cwd);
     const card = findCard(state, cardId);
-    const staleness = (await boardStaleness(state)).cards[card.id] ?? [];
-    return textResult(withLine(`Loaded Planban card ${card.id}.`, signalsLine(staleness)), {
+    const board = await boardStaleness(state);
+    const staleness = board.cards[card.id] ?? [];
+    // Why some warnings may be missing (GitHub out of reach, not signed in, not fully checked yet).
+    const stalenessNotes = board.notes ?? [];
+    return textResult(withLine(withLine(`Loaded Planban card ${card.id}.`, signalsLine(staleness)), stalenessNotes.join(" ") || null), {
       cwd: state.cwd,
       repoId: state.manifest.repoId,
       revision: state.roadmap.revision,
@@ -996,6 +1008,7 @@ async function callToolImpl(name, args) {
       card,
       ancestry: cardAncestry(state.roadmap, cardId),
       staleness,
+      ...(stalenessNotes.length ? { stalenessNotes } : {}),
       // Edits to this card that were refused and still wait, and who else is working on it (online boards; Spec point 20).
       ...await unresolvedFor(cwd, cardId),
       ...await workingFor(cwd, cardId),
@@ -1072,7 +1085,7 @@ async function callToolImpl(name, args) {
     });
     void notePresence({ cwd, cardId: payload.cardId, agentName: clientAgentName ?? undefined }).catch(() => undefined);
     return textResult(
-      payload.exists ? `Read ${payload.kind} document for ${payload.cardId}.` : `No ${payload.kind} document exists for ${payload.cardId}.`,
+      payload.exists ? withLine(`Read ${payload.kind} document for ${payload.cardId}.`, docSizeLine(payload)) : `No ${payload.kind} document exists for ${payload.cardId}.`,
       payload,
     );
   }
@@ -1223,7 +1236,7 @@ async function callToolImpl(name, args) {
         affectedDocs: [{ cardId, kind, path: `items/${cardId}/${kind}.md` }],
       },
     });
-    return await boardResult(`Wrote ${payload.kind} document for ${payload.cardId}.`, repoIdFromCwd(cwd), { ...payload, doc: payload });
+    return await boardResult(withLine(`Wrote ${payload.kind} document for ${payload.cardId}.`, docSizeLine(payload)), repoIdFromCwd(cwd), { ...payload, doc: payload });
   }
 
   if (name === "planban_write_doc_section") {
@@ -1236,7 +1249,7 @@ async function callToolImpl(name, args) {
       expectedSectionVersion: expected, markdown: requireText(args.markdown, "markdown"), after: optionalString(args.after, "after"),
       actor: "agent", idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
     });
-    return await boardResult(`Wrote the "${args.heading}" section of the ${payload.kind} for ${payload.cardId}.`, repoIdFromCwd(cwd), { ...payload, doc: payload });
+    return await boardResult(withLine(`Wrote the "${args.heading}" section of the ${payload.kind} for ${payload.cardId}.`, docSizeLine(payload)), repoIdFromCwd(cwd), { ...payload, doc: payload });
   }
 
   if (name === "planban_move_files_out") {

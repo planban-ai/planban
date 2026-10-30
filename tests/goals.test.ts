@@ -374,9 +374,10 @@ test("board content of any shape goes online and comes back: over 1,024 metadata
     await storage.updateCard({ cwd, cardId: "alpha", metadata: { narrow: true }, baseRevision: await revision() });
     await onlineLogin(bridge.url, { devUser: "ana" });
     await takeOnline(bridge.url, cwd);
-    // An edit with that shape online, and reads of the board and its history.
+    // An edit with that shape online, and reads of the board and its history. Metadata edits are
+    // patches, so the narrow key set in between stays: 1,101 keys.
     await storage.updateCard({ cwd, cardId: "alpha", metadata: wide, baseRevision: await revision() });
-    assert.equal(Object.keys((await storage.loadState(cwd)).roadmap.roadmapItems[0]!.metadata!).length, 1_100);
+    assert.equal(Object.keys((await storage.loadState(cwd)).roadmap.roadmapItems[0]!.metadata!).length, 1_101);
     const history = await storage.historyPayload(cwd);
     assert.ok(history.entries.length > 0);
     // Goals whose record of changed fields passes 1,024 entries.
@@ -389,7 +390,7 @@ test("board content of any shape goes online and comes back: over 1,024 metadata
     assert.ok((await storage.readGoals({ cwd })).page.retired.length >= 345);
     await refreshBackup(bridge.url, "revival", { force: true });
     await takeLocal(cwd);
-    assert.equal(Object.keys((await storage.loadState(cwd)).roadmap.roadmapItems[0]!.metadata!).length, 1_100);
+    assert.equal(Object.keys((await storage.loadState(cwd)).roadmap.roadmapItems[0]!.metadata!).length, 1_101);
     assert.ok((await storage.readGoals({ cwd })).page.retired.length >= 345);
   } finally {
     await bridge.close();

@@ -623,6 +623,22 @@ test("Planban MCP write doc uses stale protection and records agent history", as
   });
 });
 
+test("Planban MCP says rewrite, don't append, when a Spec or Plan passes 100 KB", async () => {
+  await withPlanbanProject(async ({ cwd, planbanHome, cardId }) => {
+    const before = await readDoc({ cwd, cardId, kind: "plan" });
+    const markdown = `# Plan\n\n${"Another appended update.\n".repeat(5000)}`;
+    const responses = runMcpServer([
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "planban_write_doc", arguments: { cwd, cardId, kind: "plan", markdown, expectedMtimeMs: before.mtimeMs } } },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "planban_read_doc", arguments: { cwd, cardId, kind: "plan" } } },
+      { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "planban_read_doc", arguments: { cwd, cardId, kind: "spec" } } },
+    ], { PLANBAN_HOME: planbanHome });
+    assert.match(responses[1].result.content[0].text, /^Wrote plan document for alpha-card\.\nPlan is 122 KB; rewrite it to the current state, don't append\./u);
+    assert.match(responses[2].result.content[0].text, /^Read plan document for alpha-card\.\nPlan is 122 KB; rewrite it to the current state, don't append\.$/u);
+    assert.equal(responses[3].result.content[0].text, "Read spec document for alpha-card.");
+  });
+});
+
 test("Planban MCP move card guards completion", async () => {
   await withPlanbanProject(async ({ cwd, planbanHome, cardId }) => {
     const responses = runMcpServer([

@@ -8,6 +8,7 @@
 import { ConvexError } from "convex/values";
 import { sectionList } from "../../../../src/core/docSections";
 import { PLANBAN_STATUSES, type PlanbanDocPayload, type PlanbanHistoryPayload, type PlanbanRoadmap } from "../../../../src/core/types";
+import { boardOnlyStaleness, cardPrRefs, isActiveStatus, largeDocNote, stalenessAttention } from "../../../../src/core/staleness";
 import { cardAncestry } from "../../../../src/core/boardOperations";
 import { queryWorkItems, type WorkItemQuery } from "../../../../src/core/workItemQuery";
 import { internal } from "../_generated/api";
@@ -241,7 +242,7 @@ export const TOOLS: ToolDefinition[] = [
       nextAction: { type: ["string", "null"] },
       tags: { type: "array", items: { type: "string" } },
       blockedBy: { type: ["string", "null"] },
-      metadata: { type: ["object", "null"] },
+      metadata: { type: ["object", "null"], description: "Metadata keys to set; other keys are kept. A key set to null is removed; null clears all metadata." },
       baseRevision,
       idempotencyKey,
     }, ["boardId", "cardId", "baseRevision"]),
@@ -475,7 +476,9 @@ async function callTool(service: McpService, origin: string, name: string, args:
       const goals = goalsBlock({ ...emptyGoals(), goals: page.goals });
       const board = compactBoard(roadmap);
       const { roadmapItems, ...head } = board;
-      return goals ? { ...head, goals, roadmapItems } : board;
+      // The same freshness list as the local tools, from the board alone (no GitHub here, said in its notes).
+      const attention = stalenessAttention(boardOnlyStaleness(roadmap.roadmapItems, Date.now()), roadmap.roadmapItems);
+      return { ...head, ...(goals ? { goals } : {}), attention, roadmapItems };
     }
     case "planban_read_goals": {
       const { page, revision } = await service.goals(stringArg(args, "boardId"));
@@ -506,8 +509,12 @@ async function callTool(service: McpService, origin: string, name: string, args:
       await service.notePresence(boardId, cardId);
       const [{ changes }, { working }] = await Promise.all([service.unresolved(boardId, cardId), service.working(boardId, cardId)]);
       const others = working[cardId] ?? [];
+      const freshness = boardOnlyStaleness(roadmap.roadmapItems, Date.now());
       return {
         revision: roadmap.revision, card, ancestry: cardAncestry(roadmap, cardId),
+        // The note only for an active card that names a PR, whose merge this view can't check.
+        staleness: freshness.cards[cardId] ?? [],
+        ...(freshness.notes?.length && isActiveStatus(card.status) && cardPrRefs(card).length ? { stalenessNote: freshness.notes.join(" ") } : {}),
         ...(others.length ? { workingOn: others } : {}), ...(changes.length ? { unresolvedChanges: changes } : {}),
       };
     }
@@ -523,8 +530,9 @@ async function callTool(service: McpService, origin: string, name: string, args:
     case "planban_read_doc": {
       const doc = await service.readDoc(stringArg(args, "boardId"), stringArg(args, "cardId"), args.kind === "plan" ? "plan" : "spec");
       await service.notePresence(stringArg(args, "boardId"), stringArg(args, "cardId"));
-      // Each section's own version, for planban_write_doc_section.
-      return { ...doc, sections: sectionList(doc.markdown) };
+      // Each section's own version, for planban_write_doc_section; and, past 100 KB, rewrite rather than append.
+      const sizeNote = doc.exists ? largeDocNote(doc.kind, new TextEncoder().encode(doc.markdown).length) : null;
+      return { ...doc, sections: sectionList(doc.markdown), ...(sizeNote ? { note: `${sizeNote}.` } : {}) };
     }
     case "planban_history": {
       const history = await service.history(stringArg(args, "boardId"));

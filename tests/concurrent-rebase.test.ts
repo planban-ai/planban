@@ -57,6 +57,53 @@ test("metadata clashes per key, and an edit to another key keeps theirs", () => 
   assert.deepEqual("clashes" in same && same.clashes.map((clash) => clash.field), ["metadata.a"]);
 });
 
+test("metadata is a patch: keys given are set, a key given as null is removed, null clears all", () => {
+  const start = update(board("Alpha"), { cardId: "alpha", metadata: { a: 1, b: 1 } });
+  assert.deepEqual(update(start, { cardId: "alpha", metadata: { c: 3 } }).roadmapItems[0]!.metadata, { a: 1, b: 1, c: 3 });
+  assert.deepEqual(update(start, { cardId: "alpha", metadata: { a: null, b: 2 } }).roadmapItems[0]!.metadata, { b: 2 });
+  assert.equal(update(start, { cardId: "alpha", metadata: { a: null, b: null } }).roadmapItems[0]!.metadata, undefined);
+  assert.equal(update(start, { cardId: "alpha", metadata: null }).roadmapItems[0]!.metadata, undefined);
+});
+
+test("a metadata patch from an older read keeps keys others added, and removing a key they changed clashes", () => {
+  const read = update(board("Alpha"), { cardId: "alpha", metadata: { a: 1, b: 1 } });
+  const current = update(read, { cardId: "alpha", metadata: { c: 3 } });
+  const removal = rebaseEdit("updateCard", { cardId: "alpha", metadata: { a: null } }, read, current);
+  assert.ok(removal.ok);
+  assert.deepEqual(update(current, removal.input).roadmapItems[0]!.metadata, { b: 1, c: 3 });
+  const cleared = rebaseEdit("updateCard", { cardId: "alpha", metadata: null }, read, current);
+  assert.ok(cleared.ok);
+  assert.deepEqual(update(current, cleared.input).roadmapItems[0]!.metadata, { c: 3 }, "clearing removes only the keys that were read");
+  const changed = update(read, { cardId: "alpha", metadata: { b: 9 } });
+  const clash = rebaseEdit("updateCard", { cardId: "alpha", metadata: { b: null } }, read, changed);
+  assert.equal(clash.ok, false);
+  assert.deepEqual("clashes" in clash && clash.clashes.map((entry) => entry.field), ["metadata.b"]);
+  // A key the edit sets to what was read is not touched, so their change to it stands.
+  const unchanged = rebaseEdit("updateCard", { cardId: "alpha", metadata: { b: 1, d: 4 } }, read, changed);
+  assert.ok(unchanged.ok);
+  assert.deepEqual(update(changed, unchanged.input).roadmapItems[0]!.metadata, { a: 1, b: 9, d: 4 });
+});
+
+test("a metadata key stored as null is not the same as a missing key", () => {
+  // A stored null, from before metadata edits were patches, can still be removed from an older read.
+  const withNull = (roadmap: PlanbanRoadmap, value: Record<string, unknown>) => ({ ...roadmap, roadmapItems: roadmap.roadmapItems.map((item) => ({ ...item, metadata: value })) });
+  const read = withNull(board("Alpha"), { old: null, keep: 1 });
+  const removal = rebaseEdit("updateCard", { cardId: "alpha", metadata: { old: null } }, read, read);
+  assert.ok(removal.ok);
+  assert.deepEqual(removal.touched.map((entry) => entry.field), ["metadata.old"]);
+  assert.deepEqual(update(read, removal.input).roadmapItems[0]!.metadata, { keep: 1 });
+
+  // Someone stored a null where the key was missing: setting it from the older read is a clash.
+  const before = withNull(board("Alpha"), { keep: 1 });
+  const changed = withNull(board("Alpha"), { keep: 1, k: null });
+  const clash = rebaseEdit("updateCard", { cardId: "alpha", metadata: { k: 5 } }, before, changed);
+  assert.equal(clash.ok, false);
+  assert.deepEqual("clashes" in clash && clash.clashes.map((entry) => entry.field), ["metadata.k"]);
+  // And removing a key they had just stored as null is already done.
+  const gone = rebaseEdit("updateCard", { cardId: "alpha", metadata: { k: null } }, changed, before);
+  assert.ok(gone.ok);
+});
+
 test("moves never clash: two agents rearranging different cards both land", () => {
   const read = board("A", "B", "C", "D");
   // One agent puts D first; another, from the same read, puts A after C.

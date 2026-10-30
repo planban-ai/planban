@@ -49,6 +49,12 @@ export interface PlanbanRoadmapItem {
   planDoc: string | null;
   completedAt: string | null;
   updatedAt: string | null;
+  /**
+   * When the card last noted progress: its summary or next action changed, or it was completed.
+   * A merged PR it names is flagged until then; touches and metadata edits leave it alone.
+   * Absent on cards written before Planban 2.0, where updatedAt stands in.
+   */
+  progressNotedAt?: string | null | undefined;
   isGroup: boolean;
   parentId: string | null;
   boardRank: number | null;

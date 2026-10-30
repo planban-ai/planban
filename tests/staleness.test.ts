@@ -1,20 +1,26 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   computeStaleness,
+  LARGE_DOC_BYTES,
+  largeDocNote,
   parseMergeLog,
   prNumbersInText,
+  prRefsInText,
   stalenessAttention,
   stalenessChipLabel,
   stalenessLine,
   type StalenessInput,
 } from "../src/core/staleness";
 import { clearStalenessCaches, collectStaleness, readMergeLog } from "../src/core/stalenessSources";
-import { createCard, initializeProject, loadState } from "../src/core/storage";
+import { createCard, initializeProject, loadState, updateCard } from "../src/core/storage";
+import { committedRoadmap, createEmptyRoadmap, planCreateCard, planMoveCard, planUpdateCard } from "../src/core/boardOperations";
+import { githubMerges, githubRepoFromRemote, runCommand } from "../src/core/githubMerges";
+import { pathToFileURL } from "node:url";
 import type { PlanbanRoadmapItem } from "../src/core/types";
 import { planbanStalenessLine } from "../plugins/planban/scripts/claude-session-context.mjs";
 
@@ -100,6 +106,346 @@ test("merged: only PRs merged after the card first appears in history count", ()
   assert.equal(result.cards["late-card"], undefined);
 });
 
+test("merged: only a change to the summary or next action, or completing the card, settles a merge", () => {
+  let clock = NOW - 3 * DAY;
+  const at = () => new Date(clock).toISOString();
+  const step = (plan: (roadmap: ReturnType<typeof createEmptyRoadmap>) => { roadmap: ReturnType<typeof createEmptyRoadmap> }) => {
+    clock += 60 * 60 * 1000;
+    board = committedRoadmap(plan(board).roadmap, at());
+  };
+  let board = createEmptyRoadmap({ repoId: "r", title: "R", now: at() });
+  step((roadmap) => planCreateCard(roadmap, { title: "Ship", status: "in-progress", nextAction: "Merge PR 41." }, { now: at() }));
+  const merge = { pr: 41, mergedAt: iso(clock + 30 * 60 * 1000) };
+  const signals = () => compute({ items: board.roadmapItems, merges: [merge] }).cards.ship?.map((signal) => signal.kind) ?? [];
+  step((roadmap) => ({ roadmap }));
+  assert.deepEqual(signals(), ["merged"]);
+
+  // A metadata-only update and a no-op update are touches: the merge stays flagged.
+  step((roadmap) => planUpdateCard(roadmap, { cardId: "ship", metadata: { thread: "t1" } }, { now: at() }));
+  assert.deepEqual(signals(), ["merged"], "a metadata edit doesn't settle the merge");
+  const before = board.roadmapItems[0]!.updatedAt;
+  step((roadmap) => planUpdateCard(roadmap, { cardId: "ship", nextAction: "Merge PR 41." }, { now: at() }));
+  assert.equal(board.roadmapItems[0]!.updatedAt, before, "an update that changes nothing isn't activity");
+  assert.deepEqual(signals(), ["merged"]);
+
+  // Changing the next action settles it.
+  step((roadmap) => planUpdateCard(roadmap, { cardId: "ship", nextAction: "Deploy what PR 41 merged." }, { now: at() }));
+  assert.deepEqual(signals(), []);
+
+  // Completing settles a later merge, and moving back doesn't bring it back.
+  step((roadmap) => planUpdateCard(roadmap, { cardId: "ship", summary: "Follow-up in PR 42." }, { now: at() }));
+  const later = { pr: 42, mergedAt: iso(clock + 30 * 60 * 1000) };
+  step((roadmap) => ({ roadmap }));
+  assert.deepEqual(compute({ items: board.roadmapItems, merges: [later] }).cards.ship?.map((signal) => signal.kind), ["merged"]);
+  step((roadmap) => planMoveCard(roadmap, { cardId: "ship", status: "complete" }, { now: at() }));
+  step((roadmap) => planMoveCard(roadmap, { cardId: "ship", status: "in-progress" }, { now: at() }));
+  assert.equal(compute({ items: board.roadmapItems, merges: [later] }).cards.ship, undefined);
+});
+
+test("merged: a card written before progressNotedAt keeps its last update as the floor when touched", () => {
+  const old = item({ id: "legacy", nextAction: "Merge PR 7.", updatedAt: iso(NOW - 3 * DAY) });
+  const board = { ...createEmptyRoadmap({ repoId: "r", title: "R", now: iso(NOW - 3 * DAY) }), roadmapItems: [old] };
+  const touched = planUpdateCard(board, { cardId: "legacy", metadata: { a: 1 } }, { now: iso(NOW - DAY) }).roadmap.roadmapItems;
+  assert.equal(touched[0]!.progressNotedAt, iso(NOW - 3 * DAY));
+  assert.deepEqual(compute({ items: touched, merges: [{ pr: 7, mergedAt: iso(NOW - 2 * DAY) }] }).cards.legacy?.map((signal) => signal.kind), ["merged"]);
+});
+
+test("quiet: a real update clears it, a metadata-only one included", () => {
+  const board = { ...createEmptyRoadmap({ repoId: "r", title: "R", now: iso(NOW - 9 * DAY) }), roadmapItems: [item({ id: "q", updatedAt: iso(NOW - 9 * DAY) })] };
+  assert.deepEqual(compute({ items: board.roadmapItems }).cards.q?.map((signal) => signal.kind), ["quiet"]);
+  const updated = planUpdateCard(board, { cardId: "q", metadata: { checked: true } }, { now: iso(NOW - 1000) }).roadmap.roadmapItems;
+  assert.equal(compute({ items: updated }).cards.q, undefined);
+});
+
+test("large-doc: a Spec or Plan over 100 KB says rewrite, don't append", () => {
+  assert.equal(largeDocNote("plan", LARGE_DOC_BYTES), null);
+  assert.equal(largeDocNote("plan", 150 * 1024), "Plan is 150 KB; rewrite it to the current state, don't append");
+  const result = compute({
+    items: [item({ id: "big", updatedAt: iso(NOW - 1000) }), item({ id: "small", updatedAt: iso(NOW - 1000) })],
+    docMtimes: [
+      { cardId: "big", kind: "spec", mtimeMs: NOW - 2000, bytes: 120 * 1024 },
+      { cardId: "small", kind: "plan", mtimeMs: NOW - 2000, bytes: 20 * 1024 },
+    ],
+  });
+  assert.deepEqual(result.cards.big, [{ kind: "large-doc", detail: "Spec is 120 KB; rewrite it to the current state, don't append", since: iso(NOW - 2000) }]);
+  assert.equal(result.cards.small, undefined);
+  assert.equal(stalenessAttention(result, [item({ id: "big" })]).total, 1, "agents are asked to fix it");
+});
+
+test("GitHub remotes are read in every form git writes them", () => {
+  for (const remote of ["https://github.com/planban-ai/planban.git", "https://github.com/planban-ai/planban", "git@github.com:planban-ai/planban.git", "ssh://git@github.com/planban-ai/planban.git", "https://token@github.com/planban-ai/planban.git\n"]) {
+    assert.equal(githubRepoFromRemote(remote), "planban-ai/planban", remote);
+  }
+  assert.equal(githubRepoFromRemote("https://gitlab.com/o/r.git"), null);
+});
+
+/**
+ * A stand-in GitHub. `prs` holds each pull request's merge time (null: open) by "owner/name#123";
+ * repositories in `hidden` answer 404 like a private one the account can't see; `fail` makes one
+ * pull request's lookup fail with that error text.
+ */
+function fakeGitHub(prs: Map<string, string | null>, options: { hidden?: Set<string>; fail?: Map<string, string> } = {}) {
+  const asked: string[] = [];
+  let failure: Error | null = null;
+  const exec = async (_command: string, args: string[]) => {
+    if (failure) throw failure;
+    const path = args.find((arg) => arg.startsWith("repos/"))!;
+    const match = /^repos\/([\w.-]+\/[\w.-]+)(?:\/pulls\/(\d+))?$/u.exec(path);
+    assert.ok(match, `only one pull request or repository is asked for at a time, never a list (${path})`);
+    const repo = match[1]!;
+    asked.push(match[2] ? `${repo}#${match[2]}` : repo);
+    const notFound = () => Object.assign(new Error("gh exited 1"), { stderr: "gh: Not Found (HTTP 404)" });
+    if (options.hidden?.has(repo)) throw notFound();
+    if (!match[2]) return JSON.stringify(repo);
+    const key = `${repo}#${match[2]}`;
+    if (options.fail?.has(key)) throw Object.assign(new Error("gh exited 1"), { stderr: options.fail.get(key) });
+    if (!prs.has(key)) throw notFound();
+    return JSON.stringify({ number: Number(match[2]), merged_at: prs.get(key) });
+  };
+  return { exec, asked, fail(error: Error | null) { failure = error; } };
+}
+
+async function withPlanbanHome(run: (home: string) => Promise<void>) {
+  const root = mkdtempSync(join(tmpdir(), "planban-github-"));
+  const previousHome = process.env.PLANBAN_HOME;
+  process.env.PLANBAN_HOME = root;
+  try {
+    clearStalenessCaches();
+    await run(root);
+  } finally {
+    if (previousHome === undefined) delete process.env.PLANBAN_HOME;
+    else process.env.PLANBAN_HOME = previousHome;
+    clearStalenessCaches();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const refs = (...keys: string[]) => keys.map((key) => ({ repo: key.split("#")[0]!, number: Number(key.split("#")[1]) }));
+const prsOf = (result: { merges: Array<{ repo: string; number: number }> }) => result.merges.map((merge) => `${merge.repo}#${merge.number}`).sort();
+
+test("references keep their repository: owner/name#123 and github.com addresses name theirs, #123 names this project's", () => {
+  const found = prRefsInText("See other/lib#42, https://github.com/acme/site/pull/43 and #44; PR 45.");
+  assert.deepEqual(found.map((ref) => `${ref.repo ?? ""}#${ref.number}`).sort(), ["#44", "#45", "acme/site#43", "other/lib#42"]);
+  // A merge of other/lib#42 flags the card naming it, not one naming this project's #42.
+  const result = compute({
+    items: [
+      item({ id: "theirs", updatedAt: iso(NOW - 2 * DAY), nextAction: "Wait for other/lib#42." }),
+      item({ id: "ours", updatedAt: iso(NOW - 2 * DAY), nextAction: "Wait for #42." }),
+    ],
+    merges: [{ pr: 42, repo: "Other/Lib", mergedAt: iso(NOW - DAY) }],
+  });
+  assert.equal(result.cards.theirs?.[0]?.detail, "other/lib#42 merged 30 Sep");
+  assert.equal(result.cards.ours, undefined);
+});
+
+test("GitHub merges are looked up per pull request: kept for good once merged, open ones asked about again later", async () => {
+  await withPlanbanHome(async () => {
+    const prs = new Map<string, string | null>([["o/r#2550", iso(NOW - 40 * DAY)], ["o/r#41", null], ["acme/site#7", iso(NOW - DAY)]]);
+    const github = fakeGitHub(prs);
+    const first = await githubMerges(refs("o/r#2550", "o/r#41", "o/r#999999", "acme/site#7"), { now: NOW, exec: github.exec });
+    assert.deepEqual(prsOf(first), ["acme/site#7", "o/r#2550"]);
+    assert.deepEqual(first.notes, [], "a number that isn't a pull request, in a repository the account can see, is not a failure");
+    assert.deepEqual(github.asked.sort(), ["acme/site#7", "o/r", "o/r#2550", "o/r#41", "o/r#999999"], "the repository is checked once before a 404 counts as absent");
+
+    // PR 41 merges. Within a minute nothing is asked again; after it, only what isn't merged.
+    prs.set("o/r#41", iso(NOW + DAY));
+    github.asked.length = 0;
+    await githubMerges(refs("o/r#2550", "o/r#41", "o/r#999999"), { now: NOW + 30_000, exec: github.exec });
+    assert.deepEqual(github.asked, []);
+    const later = await githubMerges(refs("o/r#2550", "o/r#41", "o/r#999999"), { now: NOW + 2 * DAY, exec: github.exec });
+    assert.deepEqual(github.asked.sort(), ["o/r", "o/r#41", "o/r#999999"], "a day on, the repository is checked again before a 404 counts");
+    assert.deepEqual(prsOf(later), ["o/r#2550", "o/r#41"], "no duplicates");
+
+    // GitHub out of reach: the merges seen so far, and a note saying why.
+    github.fail(Object.assign(new Error("gh failed"), { stderr: "To get started with GitHub CLI, please run:  gh auth login" }));
+    const offline = await githubMerges(refs("o/r#2550", "o/r#41", "o/r#7"), { now: NOW + 4 * DAY, exec: github.exec });
+    assert.deepEqual(prsOf(offline), ["o/r#2550", "o/r#41"]);
+    assert.match(offline.notes.join(" "), /isn't signed in here/u);
+
+    // gh not installed, with a real spawn on every platform: a note, never an error or a silent gap.
+    const missing = await githubMerges(refs("o/r#2550", "o/r#8"), { now: NOW + 6 * DAY, exec: (_command, args, options) => runCommand("planban-no-such-gh", args, options) });
+    assert.deepEqual(prsOf(missing), ["o/r#2550"]);
+    assert.match(missing.notes.join(" "), /the GitHub CLI \(gh\) isn't installed here/u);
+  });
+});
+
+test("one failing lookup doesn't lose the others, and is retried later with a growing wait", async () => {
+  await withPlanbanHome(async () => {
+    const prs = new Map<string, string | null>([["o/r#1", iso(NOW - DAY)], ["o/r#2", iso(NOW - DAY)], ["o/r#3", iso(NOW - DAY)]]);
+    const github = fakeGitHub(prs, { fail: new Map([["o/r#2", "gh: Server Error (HTTP 502)"]]) });
+    const first = await githubMerges(refs("o/r#1", "o/r#2", "o/r#3"), { now: NOW, exec: github.exec });
+    assert.deepEqual(prsOf(first), ["o/r#1", "o/r#3"], "the answers that came back are kept");
+    assert.match(first.notes.join(" "), /GitHub couldn't be reached/u);
+    github.asked.length = 0;
+    const waiting = await githubMerges(refs("o/r#1", "o/r#2", "o/r#3"), { now: NOW + 90_000, exec: github.exec });
+    assert.deepEqual(github.asked, [], "a failed lookup waits two minutes before it's tried again");
+    assert.match(waiting.notes.join(" "), /GitHub couldn't be reached/u, "and the note stays while it waits");
+    await githubMerges(refs("o/r#1", "o/r#2", "o/r#3"), { now: NOW + 3 * 60_000, exec: github.exec });
+    assert.deepEqual(github.asked, ["o/r#2"]);
+    github.asked.length = 0;
+    await githubMerges(refs("o/r#2"), { now: NOW + 5 * 60_000, exec: github.exec });
+    assert.deepEqual(github.asked, [], "after a second failure, four minutes");
+  });
+});
+
+test("a 404 from a repository the account can't see is reported, not read as no such pull request", async () => {
+  await withPlanbanHome(async () => {
+    const github = fakeGitHub(new Map([["o/r#5", iso(NOW - DAY)]]), { hidden: new Set(["secret/app"]) });
+    const result = await githubMerges(refs("secret/app#12", "o/r#5"), { now: NOW, exec: github.exec });
+    assert.deepEqual(prsOf(result), ["o/r#5"]);
+    assert.deepEqual(result.notes, ["Merged-PR warnings can't see secret/app: the GitHub CLI (gh) account here has no access to it."]);
+    // Never trusted from memory: the next check asks again, and says so again.
+    github.asked.length = 0;
+    const again = await githubMerges(refs("secret/app#12"), { now: NOW + 2 * 60_000, exec: github.exec });
+    assert.deepEqual(github.asked, ["secret/app#12", "secret/app"]);
+    assert.match(again.notes.join(" "), /can't see secret\/app/u);
+  });
+});
+
+test("repositories take turns across calls, oldest due first, so the twenty-first isn't starved", async () => {
+  await withPlanbanHome(async () => {
+    const keys = Array.from({ length: 21 }, (_, index) => `org/repo${index + 1}#1`);
+    const github = fakeGitHub(new Map(keys.map((key) => [key, null])));
+    const first = await githubMerges(refs(...keys), { now: NOW, exec: github.exec });
+    assert.equal(github.asked.length, 20);
+    assert.ok(!github.asked.includes("org/repo21#1"));
+    assert.match(first.notes.join(" "), /^1 merge check was deferred/u);
+    github.asked.length = 0;
+    await githubMerges(refs(...keys), { now: NOW + 61_000, exec: github.exec });
+    assert.equal(github.asked[0], "org/repo21#1", "the repository waiting longest goes first");
+  });
+});
+
+test("hung repositories can't use up a call's time: each request gets a third of it", async () => {
+  await withPlanbanHome(async () => {
+    const hung = ["h1/r#1", "h2/r#1", "h3/r#1", "h4/r#1"];
+    const exec = async (_command: string, args: string[]) => {
+      const path = args.find((arg) => arg.startsWith("repos/"))!;
+      if (!path.startsWith("repos/ok/")) return new Promise<string>(() => undefined);
+      return JSON.stringify({ number: 1, merged_at: iso(NOW - DAY) });
+    };
+    const started = Date.now();
+    const result = await githubMerges(refs(...hung, "ok/r#1"), { now: NOW, exec, deadlineMs: 900 });
+    assert.ok(Date.now() - started < 1_500);
+    assert.deepEqual(prsOf(result), ["ok/r#1"], "the healthy repository is still checked");
+    assert.match(result.notes.join(" "), /^4 merge checks were deferred/u);
+  });
+});
+
+test("access checks count toward a call's request limit", async () => {
+  await withPlanbanHome(async () => {
+    const keys = Array.from({ length: 20 }, (_, index) => `org/repo${index + 1}#404`);
+    const github = fakeGitHub(new Map());
+    const result = await githubMerges(refs(...keys), { now: NOW, exec: github.exec });
+    assert.equal(github.asked.length, 20, "pull requests and repositories together");
+    assert.match(result.notes.join(" "), /merge checks were deferred/u);
+  });
+});
+
+test("GitHub's rate limit pauses that repository's lookups, and the pause is said", async () => {
+  await withPlanbanHome(async () => {
+    const github = fakeGitHub(new Map([["o/r#1", null], ["acme/site#2", iso(NOW - DAY)]]), { fail: new Map([["o/r#1", "gh: API rate limit exceeded for user ID 1. (HTTP 403)"]]) });
+    const first = await githubMerges(refs("o/r#1"), { now: NOW, exec: github.exec });
+    assert.match(first.notes.join(" "), /rate limit was reached for o\/r, so its merge checks pause until 00:15 UTC/u);
+    github.asked.length = 0;
+    const paused = await githubMerges(refs("o/r#1", "o/r#2", "acme/site#2"), { now: NOW + 5 * 60_000, exec: github.exec });
+    assert.deepEqual(github.asked, ["acme/site#2"], "only the paused repository waits");
+    assert.deepEqual(prsOf(paused), ["acme/site#2"]);
+    assert.match(paused.notes.join(" "), /pause until 00:15 UTC/u);
+  });
+});
+
+/**
+ * Runs githubMerges in a separate Node process, against a stand-in GitHub that logs each request:
+ * `merged` pull requests answer with a merge time, `missing` ones and `hidden` repositories with
+ * 404s, the rest as open. `delayMs` slows each answer; `hang` never answers, ignoring the abort.
+ */
+function childLookup(home: string, world: { keys: string[]; merged?: string[]; missing?: string[]; hidden?: string[]; delayMs?: number; hang?: boolean; now: number; deadlineMs?: number }) {
+  const script = join(home, "child-lookup.mts");
+  writeFileSync(script, `
+import { appendFileSync } from "node:fs";
+import { githubMerges } from ${JSON.stringify(pathToFileURL(join(process.cwd(), "src/core/githubMerges.ts")).href)};
+const world = JSON.parse(process.argv[2]);
+const notFound = () => Object.assign(new Error("gh exited 1"), { stderr: "gh: Not Found (HTTP 404)" });
+const exec = async (_command, args) => {
+  const path = args.find((arg) => arg.startsWith("repos/"));
+  appendFileSync(world.log, path + "\\n");
+  if (world.hang) return new Promise(() => undefined);
+  if (world.delayMs) await new Promise((resolve) => setTimeout(resolve, world.delayMs));
+  const [, repo, number] = /^repos\\/([^/]+\\/[^/]+)(?:\\/pulls\\/(\\d+))?$/.exec(path);
+  if ((world.hidden ?? []).includes(repo)) throw notFound();
+  if (!number) return JSON.stringify(repo);
+  const key = repo + "#" + number;
+  if ((world.missing ?? []).includes(key)) throw notFound();
+  return JSON.stringify({ number: Number(number), merged_at: (world.merged ?? []).includes(key) ? "2026-09-01T00:00:00.000Z" : null });
+};
+const refs = world.keys.map((key) => ({ repo: key.split("#")[0], number: Number(key.split("#")[1]) }));
+const started = Date.now();
+const result = await githubMerges(refs, { now: world.now, exec, ...(world.deadlineMs ? { deadlineMs: world.deadlineMs } : {}) });
+process.stdout.write(JSON.stringify({ ...result, elapsedMs: Date.now() - started }));
+process.exit(0);
+`);
+  const log = join(home, "requests.log");
+  return new Promise<{ merges: Array<{ repo: string; number: number }>; notes: string[]; elapsedMs: number }>((resolveChild, rejectChild) => {
+    execFile(process.execPath, ["--import", "tsx/esm", script, JSON.stringify({ ...world, log })], { env: { ...process.env, PLANBAN_HOME: home }, timeout: 30_000 }, (error, stdout, stderr) => {
+      if (error) rejectChild(new Error(`${error.message}\n${stderr}`));
+      else resolveChild(JSON.parse(stdout));
+    });
+  });
+}
+const requestLog = (home: string) => { try { return readFileSync(join(home, "requests.log"), "utf8").trim().split("\n").filter(Boolean); } catch { return []; } };
+
+test("a process writing while another looks up: both answers are kept, and nothing waits on anything", async () => {
+  await withPlanbanHome(async (home) => {
+    const slow = ["o/r#1", "o/r#2", "o/r#3"];
+    const fast = ["o/r#11", "o/r#12", "o/r#13"];
+    // The slow one reads the memory first and writes last, after the fast one has written.
+    await Promise.all([
+      childLookup(home, { keys: slow, merged: slow, delayMs: 2_000, now: NOW, deadlineMs: 9_000 }),
+      childLookup(home, { keys: fast, merged: fast, now: NOW }),
+    ]);
+    const github = fakeGitHub(new Map());
+    const after = await githubMerges(refs(...slow, ...fast), { now: NOW + 30_000, exec: github.exec });
+    assert.deepEqual(prsOf(after).length, 6, "the later write merged with the earlier one");
+    assert.deepEqual(github.asked, []);
+  });
+});
+
+test("a slow or hung GitHub can't hold a check past its deadline", async () => {
+  await withPlanbanHome(async (home) => {
+    const hung = await childLookup(home, { keys: ["o/r#1", "o/r#2", "acme/site#3"], hang: true, now: NOW, deadlineMs: 500 });
+    assert.ok(hung.elapsedMs < 1_500, `returned after ${hung.elapsedMs} ms`);
+    assert.match(hung.notes.join(" "), /^3 merge checks were deferred to a later check/u);
+    const slow = await childLookup(home, { keys: ["o/r#4"], merged: ["o/r#4"], delayMs: 3_000, now: NOW, deadlineMs: 800 });
+    assert.ok(slow.elapsedMs < 1_800, `returned after ${slow.elapsedMs} ms`);
+    assert.match(slow.notes.join(" "), /1 merge check was deferred/u);
+  });
+});
+
+test("two repositories wanting more checks than one call makes both get their turn", async () => {
+  await withPlanbanHome(async (home) => {
+    const busy = Array.from({ length: 30 }, (_, index) => `big/repo#${index + 1}`);
+    const small = Array.from({ length: 5 }, (_, index) => `small/repo#${index + 1}`);
+    const first = await childLookup(home, { keys: [...busy, ...small], now: NOW });
+    const asked = requestLog(home);
+    assert.equal(asked.length, 20);
+    assert.equal(asked.filter((path) => path.startsWith("repos/small/")).length, 5, "the smaller repository isn't starved");
+    assert.match(first.notes.join(" "), /^15 merge checks were deferred/u);
+    // The next call, a minute on, asks the never-asked first; then everything has been asked about.
+    await childLookup(home, { keys: [...busy, ...small], now: NOW + 61_000 });
+    assert.equal(new Set(requestLog(home)).size, 35);
+  });
+});
+
+test("after access to a repository is lost, a 404 brings a note, not a quiet \"no such pull request\"", async () => {
+  await withPlanbanHome(async (home) => {
+    const first = await childLookup(home, { keys: ["team/app#9"], missing: ["team/app#9"], now: NOW });
+    assert.deepEqual(first.notes, [], "while the repository can be seen, a 404 is just a number that isn't a pull request");
+    const revoked = await childLookup(home, { keys: ["team/app#9"], hidden: ["team/app"], now: NOW + 2 * 60_000 });
+    assert.deepEqual(revoked.notes, ["Merged-PR warnings can't see team/app: the GitHub CLI (gh) account here has no access to it."]);
+  });
+});
+
 test("doc-edited: a doc changed outside Planban after its last tool write and the card's update", () => {
   const lastWrite = NOW - 3 * DAY;
   const history = [{ createdAt: iso(lastWrite), affectedCards: ["a", "b", "c"], affectedDocs: [
@@ -174,7 +520,7 @@ test("group-behind: a Group updated more than a day before a child", () => {
   assert.equal(result.cards.group?.some((signal) => signal.kind === "quiet"), false, "Groups are never quiet");
 });
 
-test("wip is reported above twelve In Progress Items, and attention is capped and ordered", () => {
+test("wip is reported above twelve In Progress Items, and attention lists every card in order", () => {
   const items = Array.from({ length: 13 }, (_, index) => item({ id: `card-${index}`, updatedAt: iso(NOW - (index < 11 ? 7 : 1) * DAY) }));
   items.push(item({ id: "merged-card", status: "up-next", summary: "PR 9", updatedAt: iso(NOW - DAY) }));
   items.push(item({ id: "owner-card", status: "up-next", nextAction: "Owner: review", updatedAt: iso(NOW - DAY) }));
@@ -182,18 +528,19 @@ test("wip is reported above twelve In Progress Items, and attention is capped an
   assert.deepEqual(staleness.wip, { count: 13, threshold: 12 });
   const attention = stalenessAttention(staleness, items);
   assert.equal(attention.total, 12);
-  assert.equal(attention.cards.length, 10);
+  assert.equal(attention.cards.length, 12, "the full list, never capped");
   assert.equal(attention.cards[0]?.id, "merged-card");
   assert.equal(attention.awaitingOwner, 1);
   assert.equal(attention.cards.some((card) => card.id === "owner-card"), false, "awaiting-owner alone is not stale");
   assert.match(stalenessLine(attention) ?? "", /^12 active cards look stale \(merged-card, card-0, .*\+7 more\); fix any you touch\. 13 Items are In Progress \(over 12\)\.$/u);
+  assert.match(stalenessLine(attention, "planban_status") ?? "", /\+7 more; planban_status lists them all\); fix any you touch\./u);
   assert.equal(stalenessLine(stalenessAttention(compute({ items: [] }), [])), null);
   assert.equal(compute({ items: items.slice(0, 12) }).wip, null);
 });
 
 test("chip labels are short", () => {
   assert.equal(stalenessChipLabel({ kind: "awaiting-owner", detail: "", since: iso(NOW) }), "Needs you");
-  for (const kind of ["merged", "doc-edited", "quiet", "group-behind"] as const) {
+  for (const kind of ["merged", "doc-edited", "quiet", "group-behind", "large-doc"] as const) {
     assert.equal(stalenessChipLabel({ kind, detail: "", since: iso(NOW) }), null, kind);
   }
 });
@@ -237,6 +584,62 @@ test("the merge log comes from remote-tracking branches and fails closed", async
     assert.deepEqual(staleness.cards.a?.map((signal) => signal.kind), ["quiet"]);
   } finally {
     clearStalenessCaches();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an edit that changes nothing is not activity, with the saved history included", async () => {
+  const root = mkdtempSync(join(tmpdir(), "planban-staleness-noop-"));
+  const previousHome = process.env.PLANBAN_HOME;
+  process.env.PLANBAN_HOME = join(root, "home");
+  try {
+    const cwd = join(root, "repo");
+    await initializeProject({ cwd, repoId: "noop-test", title: "No-op Test", updateAgents: false });
+    await createCard({ cwd, title: "Parked", status: "in-progress", nextAction: "Wait for the supplier." });
+    // Push the card and its history a month into the past.
+    const { roadmapPath } = await loadState(cwd);
+    const roadmap = JSON.parse(readFileSync(roadmapPath, "utf8"));
+    roadmap.roadmapItems[0].updatedAt = iso(Date.now() - 30 * DAY);
+    writeFileSync(roadmapPath, JSON.stringify(roadmap));
+    const indexPath = join(process.env.PLANBAN_HOME, "repos/noop-test/history/index.json");
+    const index = JSON.parse(readFileSync(indexPath, "utf8"));
+    for (const entry of index.entries) entry.createdAt = iso(Date.now() - 30 * DAY);
+    writeFileSync(indexPath, JSON.stringify(index));
+    const month = new Date(Date.now() - 30 * DAY);
+    utimesSync(join((await loadState(cwd)).planningRoot, "items/parked/spec.md"), month, month);
+    const kinds = async () => {
+      clearStalenessCaches();
+      const state = await loadState(cwd);
+      return (await collectStaleness({ cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems })).cards.parked?.map((signal) => signal.kind) ?? [];
+    };
+    assert.deepEqual(await kinds(), ["quiet"]);
+    await updateCard({ cwd, cardId: "parked", nextAction: "Wait for the supplier." });
+    assert.deepEqual(await kinds(), ["quiet"], "the same next action again is not activity");
+    await updateCard({ cwd, cardId: "parked", nextAction: "Chase the supplier." });
+    assert.deepEqual(await kinds(), []);
+  } finally {
+    if (previousHome === undefined) delete process.env.PLANBAN_HOME;
+    else process.env.PLANBAN_HOME = previousHome;
+    clearStalenessCaches();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the session-start line says when it ran out of time, with the last warnings it saw", async () => {
+  const root = mkdtempSync(join(tmpdir(), "planban-staleness-slow-"));
+  const previousHome = process.env.PLANBAN_HOME;
+  process.env.PLANBAN_HOME = join(root, "home");
+  try {
+    const cwd = join(root, "repo");
+    await initializeProject({ cwd, repoId: "slow-test", title: "Slow Test", updateAgents: false });
+    const never = () => new Promise<string | null>(() => undefined);
+    assert.equal(await planbanStalenessLine({ projectDir: cwd, budgetMs: 10, compute: never }), "Planban couldn't check which cards look stale in time; check with planban_status.");
+    await planbanStalenessLine({ projectDir: cwd, compute: async () => "2 active cards look stale (a, b); fix any you touch." });
+    assert.match(await planbanStalenessLine({ projectDir: cwd, budgetMs: 10, compute: never }) ?? "",
+      /^Planban couldn't check which cards look stale in time; at the last check \(\d{4}-\d\d-\d\d \d\d:\d\d UTC\): 2 active cards look stale \(a, b\); fix any you touch\.$/u);
+  } finally {
+    if (previousHome === undefined) delete process.env.PLANBAN_HOME;
+    else process.env.PLANBAN_HOME = previousHome;
     rmSync(root, { recursive: true, force: true });
   }
 });

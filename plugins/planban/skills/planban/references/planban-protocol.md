@@ -536,6 +536,12 @@ When changing roadmap state:
 - Create a separate plan doc only when the work is complex enough to need one.
 - If a tool result shows stale signals for a card you own or touch, re-read it and fix
   it in the same mutation batch.
+- A merged-PR signal clears only when the card's summary or next action changes to
+  say what the merge means, or the card is completed. Touching the card or editing its
+  metadata leaves it in place. A Spec or Plan over 100 KB is flagged too: rewrite it to
+  the current state rather than appending.
+- Card metadata edits are patches: the keys you send are set, a key sent as `null` is
+  removed, other keys are kept, and `metadata: null` clears it all.
 
 ### Post-mutation handoff
 
