@@ -543,6 +543,28 @@ When changing roadmap state:
 - Card metadata edits are patches: the keys you send are set, a key sent as `null` is
   removed, other keys are kept, and `metadata: null` clears it all.
 
+### Landing notes and the merge inbox
+
+An Online Board whose owner linked a GitHub repository (`planban online github link
+<owner/name>`) records merged pull requests itself, whichever computer is on:
+
+- A merge that names a card, as `#123` (a pull request in the board's first linked
+  repository), `owner/name#123` or its github.com address, in the summary, next action,
+  metadata `prs` list or (for In Progress and Up Next cards) Spec, adds a dated
+  **landing note** to that card: its
+  `landings` list, which `get-card` and `planban_get_card` show (`landingNotes` reads them
+  as sentences). The note never changes the person's text. Nobody edits it directly.
+- The card's freshness then reads "Landed: needs a wrap-up". Write what the merge means
+  into the summary or next action: what is now true, and what is next. That clears it;
+  completing the card does too. Touching the card or editing its metadata doesn't.
+- A merge that names no card goes to the board's **inbox**: `landingInbox` in
+  `planban_get_board` (and `planban inbox`), counted in its attention section and the
+  session-start line. For each one, write what it finished into the right card and
+  assign it there (`planban_clear_landing` with `cardId`, or `planban clear-landing
+  <owner/name#123> --card <id>`), or dismiss it with a reason when it needs no card,
+  such as a release or dependency merge. Don't leave the inbox for the person: they
+  don't see it.
+
 ### Post-mutation handoff
 
 After a successful user-requested Planban creation or material mutation, wait until

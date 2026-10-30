@@ -20,6 +20,7 @@ import { MACHINE_CLIENT_ID } from "./oauth";
 import { authenticateApiRequest, webSessionResponse, webSignOutResponse } from "./model/webAuth";
 import { deviceAuthorizationResponse, deviceDecision, devicePreview } from "./model/deviceFlow";
 import { clerkWebhookResponse } from "./model/signInEmail";
+import { GITHUB_HOOK_PREFIX, githubWebhookResponse } from "./model/githubWebhook";
 
 const STATUS_FOR: Record<ServiceErrorData["code"], number> = {
   rate_limited: 429,
@@ -318,6 +319,24 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
     const agentName = url.searchParams.get("agent") ?? undefined;
     return json(await ctx.runQuery(internal.boards.working, { connectionId, boardId, ...(cardId ? { cardId } : {}), ...(agentName ? { agentName } : {}) }));
   }
+  if (rest[0] === "github" && rest.length === 1 && method === "GET") return json(await ctx.runQuery(internal.github.links, { connectionId, boardId }));
+  if (rest[0] === "github" && rest[1] === "links" && rest.length === 2 && method === "POST") {
+    // The link's secret is made here and returned this once, to the owner's own sign-in, for
+    // their computer to hand to GitHub. It is never shown again.
+    const input = await body(request);
+    const linkId = randomSecret("ghl_");
+    const secret = randomSecret("");
+    const created = await ctx.runMutation(internal.github.createLink, { connectionId, boardId, repo: String(input.repo ?? ""), linkId, secret });
+    return json({ ...created, linkId, webhookUrl: `${publicOrigin()}${GITHUB_HOOK_PREFIX}${linkId}`, secret }, 201);
+  }
+  if (rest[0] === "github" && rest[1] === "links" && rest[3] === "hook" && rest.length === 4 && method === "POST") {
+    const input = await body(request);
+    return json(await ctx.runMutation(internal.github.setHook, { connectionId, boardId, linkId: rest[2]!, hookId: Number(input.hookId) }));
+  }
+  if (rest[0] === "github" && rest[1] === "unlink" && rest.length === 2 && method === "POST") {
+    const input = await body(request);
+    return json(await ctx.runMutation(internal.github.removeLink, { connectionId, boardId, repo: String(input.repo ?? "") }));
+  }
   if (rest[0] === "goals" && rest.length === 1 && method === "GET") return json(unpacked(await ctx.runQuery(internal.boards.goals, { connectionId, boardId })));
   if (rest[0] === "unresolved" && rest.length === 1 && method === "GET") {
     const cardId = url.searchParams.get("card") ?? undefined;
@@ -337,6 +356,8 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
 /** Every /api/v1 request: a bearer credential or the browser's session, then the route. */
 export async function apiResponse(ctx: ActionCtx, request: Request): Promise<Response> {
   try {
+    // GitHub's deliveries carry no Planban credential: each is checked against its link's own secret.
+    if (new URL(request.url).pathname.startsWith(GITHUB_HOOK_PREFIX)) return await githubWebhookResponse(ctx, request);
     const auth = await authenticateApiRequest(ctx, request);
     if (!auth) return unauthorized();
     return await handleApi(ctx, request, auth);

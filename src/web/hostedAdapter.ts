@@ -52,11 +52,12 @@ export interface HostedBoardState {
 }
 
 /**
- * Freshness from the board alone: the web page has no git or GitHub, so it checks every signal but
- * merged PRs and says so when a card names one. The board shows the notes that need a person.
+ * Freshness from the board alone: the web page has no git or GitHub, so merges come only from the
+ * landing notes a board with a linked GitHub repository records itself, and a note says when a card
+ * names a pull request nothing checks. The board shows the notes that need a person.
  */
-function pageStaleness(roadmap: PlanbanRoadmap) {
-  const { cards, notes } = boardOnlyStaleness(roadmap.roadmapItems, Date.now());
+function pageStaleness(roadmap: PlanbanRoadmap, linkedRepos: string[] = []) {
+  const { cards, notes } = boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], linkedRepos);
   return { cards, ...(notes?.length ? { notes } : {}) };
 }
 
@@ -129,6 +130,8 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
   const attemptTimeoutMs = options.attemptTimeoutMs ?? 20_000;
   /** The person's role on each board, from the last time the service said. */
   const roles = new Map<string, { role: BoardRole | null; authority: string | null }>();
+  // The GitHub repositories each board links, from its last read: their merges show on the page.
+  const linked = new Map<string, string[]>();
 
   /**
    * Calls the service. A request that fails on the network is resent once
@@ -219,7 +222,7 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
     const outcome = await op(boardId, name, input, request);
     if (!outcome.ok) return outcome.reply;
     const { roadmap, result, replayed, originalRevision } = outcome.value;
-    const state: HostedBoardState & Record<string, unknown> = { ...boardState(boardId, roadmap), staleness: pageStaleness(roadmap), ...(withResult && result ? result : {}) };
+    const state: HostedBoardState & Record<string, unknown> = { ...boardState(boardId, roadmap), staleness: pageStaleness(roadmap, linked.get(boardId)), ...(withResult && result ? result : {}) };
     if (replayed) state.onlineReplay = { replayed: true, ...(originalRevision === undefined ? {} : { originalRevision }) };
     return reply(state);
   }
@@ -231,10 +234,11 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
   }
 
   async function loadBoard(boardId: string, request?: PageRequest): Promise<PageReply> {
-    const board = await get<{ roadmap: PlanbanRoadmap; authority?: string; role?: BoardRole }>(serviceBoard(boardId), request);
+    const board = await get<{ roadmap: PlanbanRoadmap; authority?: string; role?: BoardRole; linkedRepos?: string[] }>(serviceBoard(boardId), request);
     if (!board.ok) return board.reply;
     roles.set(boardId, { role: board.value.role ?? roles.get(boardId)?.role ?? null, authority: board.value.authority ?? null });
-    return reply({ ...boardState(boardId, board.value.roadmap), staleness: pageStaleness(board.value.roadmap) });
+    linked.set(boardId, board.value.linkedRepos ?? []);
+    return reply({ ...boardState(boardId, board.value.roadmap), staleness: pageStaleness(board.value.roadmap, linked.get(boardId)) });
   }
 
   const routes: Route[] = [

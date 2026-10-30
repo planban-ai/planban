@@ -36,6 +36,7 @@ const BOARD_ROWS = [
   ["docs", "by_board_card_kind"], ["retiredIds", "by_board_card"], ["boardFingerprints", "by_board_generation"],
   ["cardChanges", "by_board_generation_card"], ["boardSizes", "by_board_generation"], ["boardState", "by_board_generation"],
   ["presence", "by_board_card"], ["unresolvedChanges", "by_board_card"],
+  ["githubLinks", "by_board"], ["githubMerges", "by_board_key"],
 ] as const;
 const LARGE_TABLES = new Set(["historyDocs", "historyPayloads", "docs", "boardState"]);
 

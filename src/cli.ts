@@ -9,6 +9,7 @@ import {
   initializeProject,
   loadState,
   dropChange,
+  clearLanding,
   moveCard,
   unresolvedChanges,
   readDoc,
@@ -44,6 +45,8 @@ import { onlineLogin } from "./core/online/login";
 import { onlineStatus } from "./core/online/credentials";
 import { createKey, listConnections, onlineLogout, revokeConnection } from "./core/online/connections";
 import { invitePeople, joinBoard, listPeople, setMyAgents } from "./core/online/people";
+import { gitHubLinkStatus, linkGitHubRepo, unlinkGitHubRepo } from "./core/online/github";
+import { inboxForAgents, parseLandingRef } from "./core/landings";
 import { attachOnline, exportOnline, keepLocalCopy, keepSeparateBoard, restoreBackup, stopTakeOnline, takeLocal, takeOnline } from "./core/online/transfers";
 
 function cwdOption(value: string | undefined) {
@@ -224,6 +227,17 @@ online.command("my-agents <level>").description("choose what your own agents may
     if (!["read", "plan", "complete"].includes(level)) throw new Error("level must be read, plan or complete.");
     print(await setMyAgents(cwdOption(options.cwd), level), {});
   });
+const github = online.command("github").description("link GitHub repositories, so this Online Board records merged pull requests itself");
+github.command("link <repo>").description("link owner/name: adds a webhook with the GitHub CLI (gh) signed in here; needs admin access to the repository")
+  .option("--cwd <path>", "project directory")
+  .action(async (repo, options) => print(await linkGitHubRepo(cwdOption(options.cwd), repo), {}));
+github.command("unlink <repo>").description("stop recording owner/name's merges, and remove its webhook from GitHub")
+  .option("--cwd <path>", "project directory")
+  .action(async (repo, options) => print(await unlinkGitHubRepo(cwdOption(options.cwd), repo), {}));
+github.command("status").description("the repositories linked to this board, and the last delivery from each")
+  .option("--cwd <path>", "project directory")
+  .option("-o, --output <format>", "output format")
+  .action(async (options) => print(await gitHubLinkStatus(cwdOption(options.cwd)), options));
 online.command("keep-local-copy").description("keep an older copy of an online board as a separate board; this project then uses the online board")
   .requiredOption("--cwd <path>", "project directory")
   .option("--title <title>", "name for the separate board")
@@ -717,6 +731,34 @@ program
   .option("--cwd <path>", "project directory")
   .option("-o, --output <format>", "output format")
   .action(async (changeId, options) => print(await dropChange({ cwd: cwdOption(options.cwd), changeId, reason: options.reason, baseRevision: options.baseRevision, actor: "agent", idempotencyKey: options.idempotencyKey }), options));
+
+program
+  .command("inbox")
+  .description("on an Online Board with a linked GitHub repository: merged pull requests that named no card, waiting to be assigned or dismissed")
+  .option("--cwd <path>", "project directory")
+  .option("-o, --output <format>", "output format")
+  .action(async (options) => {
+    const state = await loadState(cwdOption(options.cwd));
+    print({ revision: state.roadmap.revision, landingInbox: inboxForAgents(state.roadmap.landingInbox) }, options);
+  });
+
+program
+  .command("clear-landing")
+  .description("take a merge out of the inbox: assign it to the card it finished (--card), or dismiss it (--dismiss)")
+  .argument("<pullRequest>", "the merge as owner/name#123, as the inbox lists it")
+  .option("--card <cardId>", "the card it finished; it gets the merge as a landing note")
+  .option("--dismiss", "it needs no card")
+  .option("--reason <reason>", "why it is dismissed, in a sentence")
+  .option("--idempotency-key <key>", "reuse only to retry the same change after a lost reply")
+  .option("--cwd <path>", "project directory")
+  .option("-o, --output <format>", "output format")
+  .action(async (pullRequest, options) => {
+    const ref = parseLandingRef(pullRequest);
+    if (!ref) throw new Error("Name the merge as owner/name#123, as the inbox lists it.");
+    if (!options.card === !options.dismiss) throw new Error("Say either --card <cardId> or --dismiss.");
+    const state = await clearLanding({ cwd: cwdOption(options.cwd), ...ref, cardId: options.card, reason: options.reason, actor: "agent", idempotencyKey: options.idempotencyKey });
+    print({ revision: state.roadmap.revision, inboxLeft: state.roadmap.landingInbox?.length ?? 0, ...(options.card ? { card: state.roadmap.roadmapItems.find((item) => item.id === options.card) } : {}) }, options);
+  });
 
 program
   .command("goals")

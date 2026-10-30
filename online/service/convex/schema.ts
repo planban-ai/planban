@@ -409,6 +409,43 @@ export default defineSchema({
     doneAt: v.optional(v.string()),
   }).index("by_kind", ["kind"]).index("by_user", ["userId"]).index("by_board", ["boardId"]),
 
+  /**
+   * A GitHub repository linked to an Online Board: GitHub sends its pull
+   * request merges to /api/v1/github/hooks/<linkId>, signed with this link's
+   * own secret. The secret never leaves the service after the owner's
+   * computer hands it to GitHub once, and is gone when the link is removed.
+   */
+  githubLinks: defineTable({
+    linkId: v.string(),
+    boardId: v.string(),
+    /** "owner/name" as the owner typed it; repoKey is it lower-cased. */
+    repo: v.string(),
+    repoKey: v.string(),
+    secret: v.string(),
+    /** The repository webhook's id on GitHub, so unlinking can remove it. */
+    hookId: v.optional(v.number()),
+    createdBy: v.string(),
+    createdAt: v.string(),
+    lastDelivery: v.optional(v.object({ at: v.string(), event: v.string(), outcome: v.string() })),
+    /** Merges recorded in the current hour, for the per-link limit. */
+    hour: v.optional(v.number()),
+    hourCount: v.optional(v.number()),
+  }).index("by_linkId", ["linkId"]).index("by_board", ["boardId"]),
+
+  /** GitHub delivery ids already handled, so a replayed or redelivered request does nothing. Kept for a week. */
+  githubDeliveries: defineTable({
+    deliveryId: v.string(),
+    linkId: v.string(),
+    at: v.string(),
+  }).index("by_delivery", ["deliveryId"]).index("by_at", ["at"]),
+
+  /** Pull requests a board has recorded, one row per repository and number, so each is recorded once. */
+  githubMerges: defineTable({
+    boardId: v.string(),
+    key: v.string(),
+    at: v.string(),
+  }).index("by_board_key", ["boardId", "key"]),
+
   /** Counters shared across boards. Generations are numbered globally so rows of a deleted and re-created board never collide. */
   counters: defineTable({
     name: v.string(),

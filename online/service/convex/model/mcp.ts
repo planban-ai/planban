@@ -10,6 +10,7 @@ import { sectionList } from "../../../../src/core/docSections";
 import { PLANBAN_STATUSES, type PlanbanDocPayload, type PlanbanHistoryPayload, type PlanbanRoadmap } from "../../../../src/core/types";
 import { boardOnlyStaleness, cardPrRefs, isActiveStatus, largeDocNote, stalenessAttention } from "../../../../src/core/staleness";
 import { cardAncestry } from "../../../../src/core/boardOperations";
+import { inboxForAgents, landingNote, parseLandingRef } from "../../../../src/core/landings";
 import { queryWorkItems, type WorkItemQuery } from "../../../../src/core/workItemQuery";
 import { internal } from "../_generated/api";
 import { HOW_TO_REFER } from "../../../../src/core/contentRules";
@@ -42,6 +43,9 @@ const META_SERVER_INFO = "io.modelcontextprotocol/serverInfo";
 /** The protocol's Goals section, shortened (src/core/goals.ts). */
 export { GOALS_GUIDANCE };
 
+/** What landing notes and the merge inbox are, and what agents do with them. */
+export const LANDINGS_GUIDANCE = "On a board with a linked GitHub repository, Planban records merged pull requests itself. A merge that names a card adds a dated landing note to it (planban_get_card's landingNotes), and its freshness reads \"Landed: needs a wrap-up\": write what the merge means into the card's summary or next action, which clears it. A merge that names no card waits in the board's inbox (planban_get_board's landingInbox): write what it finished into the right card and assign it there, or dismiss it, with planban_clear_landing.";
+
 const INSTRUCTIONS = [
   "These tools read and edit Planban Online Boards shared across devices and people.",
   "Call planban_list_boards first to find the boardId.",
@@ -58,6 +62,7 @@ const INSTRUCTIONS = [
   "A refusal says why: a viewer can't change the board; the person's agents may be limited to read or plan (they can change that in the board's People settings); this connection may reach only some boards; some steps are for the owner's own sign-in. Tell the person instead of working around it.",
   "Deleting cards and taking a board back to Local Mode are not available to agents.",
   `Planban is an index, not storage: boards hold text only (cards, Specs, Plans and history). Never put files, images or encoded data in a card or document. ${HOW_TO_REFER} Edits that embed files are refused.`,
+  LANDINGS_GUIDANCE,
   GOALS_GUIDANCE,
 ].join(" ");
 
@@ -93,7 +98,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "planban_get_board",
     title: "Get Planban Board",
-    description: "Load one Online Board, including its revision and every Work Item.",
+    description: "Load one Online Board, including its revision and every Work Item. Its attention section lists cards whose freshness needs fixing, and merged pull requests waiting in the board's inbox (landingInbox) to be assigned to a card or dismissed.",
     inputSchema: object({ boardId }, ["boardId"]),
     annotations: read,
   },
@@ -117,7 +122,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "planban_get_card",
     title: "Get Planban Card",
-    description: "Read one Work Item with its Group ancestry.",
+    description: "Read one Work Item with its Group ancestry, its freshness, and its landing notes (pull requests that merged naming it, recorded by the board's linked GitHub repository).",
     inputSchema: object({ boardId, cardId: { type: "string" } }, ["boardId", "cardId"]),
     annotations: read,
   },
@@ -140,6 +145,19 @@ export const TOOLS: ToolDefinition[] = [
     title: "Drop Planban Unresolved Change",
     description: "Drop an unresolved change that is no longer needed (already covered, or overtaken), with a short reason. The card's history records it. Tell the person too.",
     inputSchema: object({ boardId, changeId: { type: "string" }, reason: { type: "string", description: "Why it is dropped, in a sentence." }, baseRevision, idempotencyKey }, ["boardId", "changeId", "reason", "baseRevision"]),
+    annotations: write,
+  },
+  {
+    name: "planban_clear_landing",
+    title: "Clear a Planban Inbox Merge",
+    description: "Take one merged pull request out of the board's inbox (planban_get_board's landingInbox): assign it to the card it finished, which gets it as a landing note, or dismiss it with a reason when it needs no card (a release or dependency merge, say). Write what the merge means into the card first. Board history records it.",
+    inputSchema: object({
+      boardId,
+      pullRequest: { type: "string", description: "The inbox merge as owner/name#123, as the inbox lists it." },
+      cardId: { type: "string", description: "The card it finished. Leave out to dismiss it." },
+      reason: { type: "string", description: "Why it is dismissed, in a sentence." },
+      idempotencyKey,
+    }, ["boardId", "pullRequest"]),
     annotations: write,
   },
   {
@@ -388,8 +406,13 @@ export class McpService {
   }
 
   async getBoard(boardId: string): Promise<PlanbanRoadmap> {
-    const board = unpacked(await this.call(() => this.ctx.runQuery(internal.boards.getBoard, { connectionId: this.connectionId, boardId })));
-    return (board as { roadmap: PlanbanRoadmap }).roadmap;
+    return (await this.board(boardId)).roadmap;
+  }
+
+  /** The board, and the GitHub repositories whose merges it records itself. */
+  async board(boardId: string): Promise<{ roadmap: PlanbanRoadmap; linkedRepos: string[] }> {
+    const board = unpacked<{ roadmap: PlanbanRoadmap; linkedRepos?: string[] }>(await this.call(() => this.ctx.runQuery(internal.boards.getBoard, { connectionId: this.connectionId, boardId })));
+    return { roadmap: board.roadmap, linkedRepos: board.linkedRepos ?? [] };
   }
 
   readDoc(boardId: string, cardId: string, kind: "spec" | "plan"): Promise<PlanbanDocPayload> {
@@ -471,14 +494,16 @@ async function callTool(service: McpService, origin: string, name: string, args:
       return { boards: await service.listBoards() };
     case "planban_get_board": {
       const boardIdArg = stringArg(args, "boardId");
-      const [roadmap, { page }] = await Promise.all([service.getBoard(boardIdArg), service.goals(boardIdArg)]);
+      const [{ roadmap, linkedRepos }, { page }] = await Promise.all([service.board(boardIdArg), service.goals(boardIdArg)]);
       // The goal statements only, when the board has goals; planban_read_goals has the rest.
       const goals = goalsBlock({ ...emptyGoals(), goals: page.goals });
       const board = compactBoard(roadmap);
       const { roadmapItems, ...head } = board;
-      // The same freshness list as the local tools, from the board alone (no GitHub here, said in its notes).
-      const attention = stalenessAttention(boardOnlyStaleness(roadmap.roadmapItems, Date.now()), roadmap.roadmapItems);
-      return { ...head, ...(goals ? { goals } : {}), attention, roadmapItems };
+      // The same freshness list as the local tools, from the board alone: merges come from the board's
+      // own landing notes, and its notes say what can't be checked here.
+      const attention = stalenessAttention(boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], linkedRepos), roadmap.roadmapItems, roadmap.landingInbox);
+      const inbox = inboxForAgents(roadmap.landingInbox);
+      return { ...head, ...(goals ? { goals } : {}), attention, ...(inbox.length ? { landingInbox: inbox } : {}), roadmapItems };
     }
     case "planban_read_goals": {
       const { page, revision } = await service.goals(stringArg(args, "boardId"));
@@ -500,7 +525,7 @@ async function callTool(service: McpService, origin: string, name: string, args:
       return { boardId: roadmap.project.id, revision: roadmap.revision, ...queryWorkItems(roadmap.roadmapItems, query as WorkItemQuery) };
     }
     case "planban_get_card": {
-      const roadmap = await service.getBoard(stringArg(args, "boardId"));
+      const { roadmap, linkedRepos } = await service.board(stringArg(args, "boardId"));
       const cardId = stringArg(args, "cardId");
       const card = roadmap.roadmapItems.find((item) => item.id === cardId);
       if (!card) throw new ToolError(`not_found: Card not found: ${cardId}`);
@@ -509,9 +534,10 @@ async function callTool(service: McpService, origin: string, name: string, args:
       await service.notePresence(boardId, cardId);
       const [{ changes }, { working }] = await Promise.all([service.unresolved(boardId, cardId), service.working(boardId, cardId)]);
       const others = working[cardId] ?? [];
-      const freshness = boardOnlyStaleness(roadmap.roadmapItems, Date.now());
+      const freshness = boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], linkedRepos);
       return {
         revision: roadmap.revision, card, ancestry: cardAncestry(roadmap, cardId),
+        ...(card.landings?.length ? { landingNotes: card.landings.map(landingNote) } : {}),
         // The note only for an active card that names a PR, whose merge this view can't check.
         staleness: freshness.cards[cardId] ?? [],
         ...(freshness.notes?.length && isActiveStatus(card.status) && cardPrRefs(card).length ? { stalenessNote: freshness.notes.join(" ") } : {}),
@@ -521,6 +547,21 @@ async function callTool(service: McpService, origin: string, name: string, args:
     case "planban_unresolved_changes": {
       const cardId = typeof args.cardId === "string" ? args.cardId : undefined;
       return await service.unresolved(stringArg(args, "boardId"), cardId);
+    }
+    case "planban_clear_landing": {
+      const ref = parseLandingRef(stringArg(args, "pullRequest"));
+      if (!ref) throw new ToolError("validation: Name the merge as owner/name#123, as the inbox lists it.");
+      const boardIdArg = stringArg(args, "boardId");
+      const key = typeof args.idempotencyKey === "string" ? args.idempotencyKey : undefined;
+      const cardId = typeof args.cardId === "string" && args.cardId ? args.cardId : undefined;
+      const outcome = await service.run(boardIdArg, "clearLanding", {
+        repo: ref.repo, number: ref.number, ...(cardId ? { cardId } : {}), ...(typeof args.reason === "string" ? { reason: args.reason } : {}), actor: "agent",
+      }, false, key);
+      return {
+        revision: outcome.roadmap.revision, ...(outcome.result as Record<string, unknown>),
+        ...(cardId ? { card: outcome.roadmap.roadmapItems.find((item) => item.id === cardId) } : {}),
+        inboxLeft: outcome.roadmap.landingInbox?.length ?? 0, ...handoff(origin, boardIdArg, cardId),
+      };
     }
     case "planban_drop_change": {
       const key = typeof args.idempotencyKey === "string" ? args.idempotencyKey : undefined;

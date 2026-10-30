@@ -87,7 +87,7 @@ async function computeLine(projectDir) {
   const { stalenessAttention, stalenessLine } = await import(pathToFileURL(join(runtimeRoot, "src/core/staleness.ts")).href);
   // GitHub gets two seconds of the hook's three, so a slow answer still leaves a line with a note.
   const board = await projectStaleness(projectDir, { githubDeadlineMs: 2_000 });
-  return board ? stalenessLine(stalenessAttention(board.staleness, board.items), "planban_status") : null;
+  return board ? stalenessLine(stalenessAttention(board.staleness, board.items, board.inbox), "planban_status") : null;
 }
 
 // One line naming stale active cards, from the same core function as the MCP tools and the board chip.

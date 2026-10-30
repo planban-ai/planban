@@ -60,6 +60,23 @@ export interface PlanbanRoadmapItem {
   boardRank: number | null;
   groupRank: number | null;
   metadata?: Record<string, unknown>;
+  /**
+   * Landing notes: pull requests that merged naming this card, newest first, recorded by the
+   * GitHub integration of an Online Board. Never written by people or agents directly.
+   */
+  landings?: PlanbanLanding[] | undefined;
+}
+
+/** A merged pull request, as a landing note on a card or an item in the board's inbox. */
+export interface PlanbanLanding {
+  /** "owner/name", as GitHub spells it. */
+  repo: string;
+  number: number;
+  title: string;
+  mergedAt: string;
+  url: string;
+  /** When Planban recorded it. */
+  recordedAt: string;
 }
 
 export interface PlanbanRoadmap {
@@ -70,6 +87,11 @@ export interface PlanbanRoadmap {
   project: PlanbanProject;
   columns: PlanbanColumn[];
   roadmapItems: PlanbanRoadmapItem[];
+  /**
+   * Merged pull requests from a linked GitHub repository that named no card, newest first.
+   * Agents assign each to a card or dismiss it; people never see the list.
+   */
+  landingInbox?: PlanbanLanding[] | undefined;
 }
 
 export interface PlanbanResolvedState {

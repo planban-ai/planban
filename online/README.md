@@ -113,6 +113,30 @@ node --import tsx/esm online/scripts/limits-convex.ts                    # board
 online/scripts/demo-convex.sh                                            # two machines, CLI and local MCP
 ```
 
+## GitHub merges (linked repositories)
+
+`convex/github.ts` and `convex/model/githubWebhook.ts`. A board's owner links a
+repository from their computer: the service makes the link and a random secret,
+returns the secret once to the owner's own sign-in (never to a browser session
+or an agent), and the computer passes it to GitHub on `gh`'s standard input when
+it adds the repository webhook. The secret lives only in its `githubLinks` row;
+unlinking deletes the row.
+
+GitHub posts to `/api/v1/github/hooks/<linkId>` (through the edge's existing
+`/api/v1/` route). The handler limits the body to 1 MB, checks
+`X-Hub-Signature-256` with a constant-time compare, and gives an unknown link, a
+bad or missing signature and another repository's delivery the same 401. Only
+`ping` and `pull_request` closed with `merged: true` reach a mutation. Delivery
+ids are remembered for a week, each pull request is recorded once per board,
+and a link records at most 120 merges an hour; a refused or failed delivery is
+not remembered, so it can be redelivered from GitHub.
+
+A merge becomes a landing note on each card that names it, or an item in the
+board's inbox (`src/core/landings.ts`), as one board change credited to GitHub.
+The webhook needs an address GitHub can reach: a local backend on 127.0.0.1
+can't receive real deliveries; `tests/github-webhook.test.ts` drives the real
+handlers in memory instead.
+
 ## Planban is an index, not storage
 
 Online Boards hold text only (owner decision 18). The service has no file

@@ -10,7 +10,7 @@ import { githubMerges, githubRepoFor } from "./githubMerges";
 import { boardPath, onlineRequest } from "./online/client";
 import { defaultPlanningRoot, expandHome, historyIndexPath, resolveInsideRoot, roadmapPath } from "./paths";
 import { cardPrRefs, computeStaleness, isActiveStatus, parseMergeLog, type BoardStaleness, type DocMtime, type MergeRecord } from "./staleness";
-import type { PlanbanHistoryEntry, PlanbanHistoryPayload, PlanbanProjectManifest, PlanbanRoadmap, PlanbanRoadmapItem } from "./types";
+import type { PlanbanHistoryEntry, PlanbanHistoryPayload, PlanbanLanding, PlanbanProjectManifest, PlanbanRoadmap, PlanbanRoadmapItem } from "./types";
 
 type Storage = PlanbanProjectManifest["storage"];
 type OnlineStorage = Extract<NonNullable<Storage>, { kind: "online" }>;
@@ -187,7 +187,7 @@ export async function collectStaleness(input: {
  * Read-only staleness for a project directory, for callers that must not load or migrate the board
  * (the session-start hook). Returns null when the project has no readable Planban board.
  */
-export async function projectStaleness(projectDir: string, options: { githubDeadlineMs?: number } = {}): Promise<{ items: PlanbanRoadmapItem[]; staleness: BoardStaleness } | null> {
+export async function projectStaleness(projectDir: string, options: { githubDeadlineMs?: number } = {}): Promise<{ items: PlanbanRoadmapItem[]; staleness: BoardStaleness; inbox?: PlanbanLanding[] | undefined } | null> {
   try {
     const manifest = JSON.parse(await readFile(join(projectDir, ".planban/project.json"), "utf8")) as {
       repoId?: unknown;
@@ -203,7 +203,11 @@ export async function projectStaleness(projectDir: string, options: { githubDead
       if (!read) return { items: [], staleness: { cards: {}, wip: null, notes: ["Planban couldn't reach the Online Board to check which cards look stale."] } };
       const { roadmap } = read;
       const items = roadmap.roadmapItems;
-      return { items, staleness: await collectStaleness({ cwd: projectDir, planningRoot: projectDir, items, storage, githubDeadlineMs: options.githubDeadlineMs }) };
+      // Merges from a linked GitHub repository that named no card, for agents to assign or dismiss.
+      return {
+        items, staleness: await collectStaleness({ cwd: projectDir, planningRoot: projectDir, items, storage, githubDeadlineMs: options.githubDeadlineMs }),
+        ...(roadmap.landingInbox?.length ? { inbox: roadmap.landingInbox } : {}),
+      };
     }
     const planningRoot = typeof manifest.storage?.root === "string" && manifest.storage.root
       ? resolve(expandHome(manifest.storage.root))
