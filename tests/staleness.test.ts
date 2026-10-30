@@ -379,6 +379,25 @@ test("the merge log comes from remote-tracking branches and fails closed", async
   }
 });
 
+test("the session-start line says when it ran out of time, with the last warnings it saw", async () => {
+  const root = mkdtempSync(join(tmpdir(), "planban-staleness-slow-"));
+  const previousHome = process.env.PLANBAN_HOME;
+  process.env.PLANBAN_HOME = join(root, "home");
+  try {
+    const cwd = join(root, "repo");
+    await initializeProject({ cwd, repoId: "slow-test", title: "Slow Test", updateAgents: false });
+    const never = () => new Promise<string | null>(() => undefined);
+    assert.equal(await planbanStalenessLine({ projectDir: cwd, budgetMs: 10, compute: never }), "Planban couldn't check which cards look stale in time; check with planban_status.");
+    await planbanStalenessLine({ projectDir: cwd, compute: async () => "2 active cards look stale (a, b); fix any you touch." });
+    assert.match(await planbanStalenessLine({ projectDir: cwd, budgetMs: 10, compute: never }) ?? "",
+      /^Planban couldn't check which cards look stale in time; at the last check \(\d{4}-\d\d-\d\d \d\d:\d\d UTC\): 2 active cards look stale \(a, b\); fix any you touch\.$/u);
+  } finally {
+    if (previousHome === undefined) delete process.env.PLANBAN_HOME;
+    else process.env.PLANBAN_HOME = previousHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the session-start line names stale cards and stays silent otherwise", async () => {
   const root = mkdtempSync(join(tmpdir(), "planban-staleness-hook-"));
   const previousHome = process.env.PLANBAN_HOME;

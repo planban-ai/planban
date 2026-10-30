@@ -771,6 +771,10 @@ test("an Online Board shows freshness warnings everywhere a local one does, with
     clearStalenessCaches();
     assert.match(await planbanStalenessLine({ projectDir: cwd }) ?? "", /^Merged-PR warnings may be missing merges: the GitHub CLI \(gh\) isn't signed in here\./u);
 
+    // The board itself out of reach: a note, not a board with nothing stale.
+    fake.failNextBoardRead();
+    assert.deepEqual((await projectStaleness(cwd))?.staleness.notes, ["Planban couldn't reach the Online Board to check which cards look stale."]);
+
   } finally {
     useGitHubRunner();
     clearStalenessCaches();

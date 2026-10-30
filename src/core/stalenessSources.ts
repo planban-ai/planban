@@ -186,7 +186,10 @@ export async function projectStaleness(projectDir: string): Promise<{ items: Pla
     const storage = (manifest.storage as Storage | undefined);
     if (storage?.kind === "online" && typeof storage.url === "string" && typeof storage.boardId === "string") {
       // The board as the service has it, read without the backup and account-linking a full load does.
-      const { roadmap } = await onlineRequest<{ roadmap: PlanbanRoadmap }>(storage.url, boardPath(storage.boardId));
+      const read = await onlineRequest<{ roadmap: PlanbanRoadmap }>(storage.url, boardPath(storage.boardId)).catch(() => null);
+      // Out of reach (offline, signed out): say so rather than reporting a board with nothing stale.
+      if (!read) return { items: [], staleness: { cards: {}, wip: null, notes: ["Planban couldn't reach the Online Board to check which cards look stale."] } };
+      const { roadmap } = read;
       const items = roadmap.roadmapItems;
       return { items, staleness: await collectStaleness({ cwd: projectDir, planningRoot: projectDir, items, storage }) };
     }

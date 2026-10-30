@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Claude Code SessionStart hook: when the project uses Planban, add one short orientation line to the session context.
 // Output goes to stdout, which Claude Code adds as context. Never fail the session: exit 0 on any error.
-import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolvePlanbanProjectDir } from "./project-dir.mjs";
@@ -51,24 +53,62 @@ export function planbanSessionContext({ projectDir: requestedDir, port = 4317 })
   ].join("\n");
 }
 
-// One line naming stale active cards, from the same core function as the MCP tools and the board chip.
-// Best effort: returns null when the runtime, board or git is unavailable, or when it runs out of time.
-export async function planbanStalenessLine({ projectDir: requestedDir }) {
-  const line = (async () => {
-    const projectDir = resolvePlanbanProjectDir(requestedDir).projectDir;
-    if (!existsSync(join(projectDir, ".planban/project.json"))) return null;
-    const runtimeRoot = resolvePlanbanRuntime(PLUGIN_ROOT);
-    if (!existsSync(join(runtimeRoot, "node_modules/tsx"))) return null;
-    await loadRuntimeTypescript(runtimeRoot);
-    const { projectStaleness } = await import(pathToFileURL(join(runtimeRoot, "src/core/stalenessSources.ts")).href);
-    const { stalenessAttention, stalenessLine } = await import(pathToFileURL(join(runtimeRoot, "src/core/staleness.ts")).href);
-    const board = await projectStaleness(projectDir);
-    return board ? stalenessLine(stalenessAttention(board.staleness, board.items), "planban_status") : null;
-  })().catch(() => null);
-  let timer;
-  const timeout = new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout(null), STALENESS_BUDGET_MS); });
+// The last line worked out for each project, so a check that runs out of time can still say what it last saw.
+function lastLinePath(projectDir) {
+  const root = process.env.PLANBAN_HOME ? resolve(process.env.PLANBAN_HOME) : join(homedir(), ".planban");
+  return join(root, "session-lines", `${createHash("sha256").update(projectDir).digest("hex").slice(0, 24)}.json`);
+}
+
+function saveLastLine(projectDir, line) {
   try {
-    return await Promise.race([line, timeout]);
+    const path = lastLinePath(projectDir);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(`${path}.${process.pid}.tmp`, JSON.stringify({ line, at: new Date().toISOString() }));
+    renameSync(`${path}.${process.pid}.tmp`, path);
+  } catch {
+    // Best effort: the next session just has no earlier line to fall back on.
+  }
+}
+
+function readLastLine(projectDir) {
+  try {
+    const saved = JSON.parse(readFileSync(lastLinePath(projectDir), "utf8"));
+    return typeof saved.line === "string" && typeof saved.at === "string" ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+async function computeLine(projectDir) {
+  const runtimeRoot = resolvePlanbanRuntime(PLUGIN_ROOT);
+  if (!existsSync(join(runtimeRoot, "node_modules/tsx"))) return null;
+  await loadRuntimeTypescript(runtimeRoot);
+  const { projectStaleness } = await import(pathToFileURL(join(runtimeRoot, "src/core/stalenessSources.ts")).href);
+  const { stalenessAttention, stalenessLine } = await import(pathToFileURL(join(runtimeRoot, "src/core/staleness.ts")).href);
+  const board = await projectStaleness(projectDir);
+  return board ? stalenessLine(stalenessAttention(board.staleness, board.items), "planban_status") : null;
+}
+
+// One line naming stale active cards, from the same core function as the MCP tools and the board chip.
+// Returns null when the project has no board or nothing needs attention. If the check runs out of
+// time (an Online Board or GitHub being slow), it says so, with the last warnings it saw if any.
+export async function planbanStalenessLine({ projectDir: requestedDir, budgetMs = STALENESS_BUDGET_MS, compute = computeLine }) {
+  const projectDir = resolvePlanbanProjectDir(requestedDir).projectDir;
+  if (!existsSync(join(projectDir, ".planban/project.json"))) return null;
+  const TIMED_OUT = Symbol("timed out");
+  const line = compute(projectDir).then((value) => {
+    saveLastLine(projectDir, value ?? null);
+    return value ?? null;
+  }, () => null);
+  let timer;
+  const timeout = new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout(TIMED_OUT), budgetMs); });
+  try {
+    const result = await Promise.race([line, timeout]);
+    if (result !== TIMED_OUT) return result;
+    const last = readLastLine(projectDir);
+    const lead = "Planban couldn't check which cards look stale in time";
+    if (!last?.line) return `${lead}; check with planban_status.`;
+    return `${lead}; at the last check (${last.at.slice(0, 10)} ${last.at.slice(11, 16)} UTC): ${last.line}`;
   } finally {
     clearTimeout(timer);
   }
