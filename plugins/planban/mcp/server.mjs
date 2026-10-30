@@ -977,15 +977,17 @@ async function callToolImpl(name, args) {
     const board = await boardStaleness(state);
     const staleness = Object.fromEntries(result.matches.flatMap((entry) => board.cards[entry.item.id] ? [[entry.item.id, board.cards[entry.item.id]]] : []));
     const staleCount = Object.keys(staleness).length;
-    return textResult(withLine(
+    const stalenessNotes = board.notes ?? [];
+    return textResult(withLine(withLine(
       `Matched ${result.matches.length} Planban Work Items at revision ${state.roadmap.revision}.`,
       staleCount ? `${staleCount} matched Item${staleCount === 1 ? " has" : "s have"} stale signals (see staleness).` : null,
-    ), {
+    ), stalenessNotes.join(" ") || null), {
       cwd: state.cwd,
       repoId: state.manifest.repoId,
       revision: state.roadmap.revision,
       ...result,
       staleness,
+      ...(stalenessNotes.length ? { stalenessNotes } : {}),
     });
   }
 
@@ -994,8 +996,11 @@ async function callToolImpl(name, args) {
     const cardId = requireString(args.cardId, "cardId");
     const state = await loadState(cwd);
     const card = findCard(state, cardId);
-    const staleness = (await boardStaleness(state)).cards[card.id] ?? [];
-    return textResult(withLine(`Loaded Planban card ${card.id}.`, signalsLine(staleness)), {
+    const board = await boardStaleness(state);
+    const staleness = board.cards[card.id] ?? [];
+    // Why some warnings may be missing (GitHub out of reach, not signed in, not fully checked yet).
+    const stalenessNotes = board.notes ?? [];
+    return textResult(withLine(withLine(`Loaded Planban card ${card.id}.`, signalsLine(staleness)), stalenessNotes.join(" ") || null), {
       cwd: state.cwd,
       repoId: state.manifest.repoId,
       revision: state.roadmap.revision,
@@ -1003,6 +1008,7 @@ async function callToolImpl(name, args) {
       card,
       ancestry: cardAncestry(state.roadmap, cardId),
       staleness,
+      ...(stalenessNotes.length ? { stalenessNotes } : {}),
       // Edits to this card that were refused and still wait, and who else is working on it (online boards; Spec point 20).
       ...await unresolvedFor(cwd, cardId),
       ...await workingFor(cwd, cardId),

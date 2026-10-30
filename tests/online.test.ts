@@ -775,6 +775,26 @@ test("an Online Board shows freshness warnings everywhere a local one does, with
     fake.failNextBoardRead();
     assert.deepEqual((await projectStaleness(cwd))?.staleness.notes, ["Planban couldn't reach the Online Board to check which cards look stale."]);
 
+    // planban_get_card through the real MCP server keeps why warnings may be missing, in its text
+    // and its result. With no GitHub origin, a bare #41 can only be checked against this computer's git.
+    await execFileAsync("git", ["remote", "remove", "origin"], { cwd });
+    const requests = [
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "planban_get_card", arguments: { cwd, cardId: "alpha" } } },
+    ];
+    const child = spawn(process.execPath, [join(process.cwd(), "plugins/planban/scripts/start-planban-mcp.mjs")], {
+      env: { ...process.env, PLANBAN_REPO_ROOT: process.cwd(), PLANBAN_ACTIVITY_URL: "http://127.0.0.1:9" }, stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+    child.stdin.end(`${requests.map((request) => JSON.stringify(request)).join("\n")}\n`);
+    await exited;
+    const card = stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line)).find((response) => response.id === 2).result;
+    const note = "Merged-PR warnings for pull requests named as #123 use only this computer's git history: this project has no GitHub origin remote.";
+    assert.deepEqual(card.structuredContent.stalenessNotes, [note]);
+    assert.ok(card.content[0].text.includes(note), card.content[0].text);
+
   } finally {
     useGitHubRunner();
     clearStalenessCaches();
