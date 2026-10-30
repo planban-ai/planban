@@ -16,7 +16,7 @@ import {
   type StalenessInput,
 } from "../src/core/staleness";
 import { clearStalenessCaches, collectStaleness, readMergeLog } from "../src/core/stalenessSources";
-import { createCard, initializeProject, loadState } from "../src/core/storage";
+import { createCard, initializeProject, loadState, updateCard } from "../src/core/storage";
 import { committedRoadmap, createEmptyRoadmap, planCreateCard, planMoveCard, planUpdateCard } from "../src/core/boardOperations";
 import { githubMerges, githubRepoFromRemote, runCommand } from "../src/core/githubMerges";
 import type { PlanbanRoadmapItem } from "../src/core/types";
@@ -374,6 +374,43 @@ test("the merge log comes from remote-tracking branches and fails closed", async
     });
     assert.deepEqual(staleness.cards.a?.map((signal) => signal.kind), ["quiet"]);
   } finally {
+    clearStalenessCaches();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an edit that changes nothing is not activity, with the saved history included", async () => {
+  const root = mkdtempSync(join(tmpdir(), "planban-staleness-noop-"));
+  const previousHome = process.env.PLANBAN_HOME;
+  process.env.PLANBAN_HOME = join(root, "home");
+  try {
+    const cwd = join(root, "repo");
+    await initializeProject({ cwd, repoId: "noop-test", title: "No-op Test", updateAgents: false });
+    await createCard({ cwd, title: "Parked", status: "in-progress", nextAction: "Wait for the supplier." });
+    // Push the card and its history a month into the past.
+    const { roadmapPath } = await loadState(cwd);
+    const roadmap = JSON.parse(readFileSync(roadmapPath, "utf8"));
+    roadmap.roadmapItems[0].updatedAt = iso(Date.now() - 30 * DAY);
+    writeFileSync(roadmapPath, JSON.stringify(roadmap));
+    const indexPath = join(process.env.PLANBAN_HOME, "repos/noop-test/history/index.json");
+    const index = JSON.parse(readFileSync(indexPath, "utf8"));
+    for (const entry of index.entries) entry.createdAt = iso(Date.now() - 30 * DAY);
+    writeFileSync(indexPath, JSON.stringify(index));
+    const month = new Date(Date.now() - 30 * DAY);
+    utimesSync(join((await loadState(cwd)).planningRoot, "items/parked/spec.md"), month, month);
+    const kinds = async () => {
+      clearStalenessCaches();
+      const state = await loadState(cwd);
+      return (await collectStaleness({ cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems })).cards.parked?.map((signal) => signal.kind) ?? [];
+    };
+    assert.deepEqual(await kinds(), ["quiet"]);
+    await updateCard({ cwd, cardId: "parked", nextAction: "Wait for the supplier." });
+    assert.deepEqual(await kinds(), ["quiet"], "the same next action again is not activity");
+    await updateCard({ cwd, cardId: "parked", nextAction: "Chase the supplier." });
+    assert.deepEqual(await kinds(), []);
+  } finally {
+    if (previousHome === undefined) delete process.env.PLANBAN_HOME;
+    else process.env.PLANBAN_HOME = previousHome;
     clearStalenessCaches();
     rmSync(root, { recursive: true, force: true });
   }

@@ -523,10 +523,13 @@ export function planUpdateCard(roadmap: PlanbanRoadmap, input: UpdateCardInput, 
     history: {
       actor: input.actor ?? "user",
       operation: "card.update",
-      summary: title !== undefined && title !== item.title
-        ? `Renamed ${item.title} to ${title}`
-        : `Updated ${item.title}`,
-      affectedCards: [item.id],
+      summary: !real
+        ? `Saved ${item.title} unchanged`
+        : title !== undefined && title !== item.title
+          ? `Renamed ${item.title} to ${title}`
+          : `Updated ${item.title}`,
+      // An edit that changes nothing touches no card, so freshness checks never count it as activity.
+      affectedCards: real ? [item.id] : [],
     },
     docWrites: [],
   };
