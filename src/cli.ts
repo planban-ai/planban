@@ -502,7 +502,7 @@ program
   .option("--tag <tag>", "replacement tag; repeat for multiple tags", collectOption)
   .option("--blocked-by <cardId>", "replace the blocking card")
   .option("--clear-blocked-by", "clear the blocking card")
-  .option("--metadata-json <json>", "replace metadata with a JSON object")
+  .option("--metadata-json <json>", "set metadata keys from a JSON object; a key set to null is removed")
   .option("--clear-metadata", "clear card metadata")
   .option("--base-revision <revision>", "roadmap revision for stale-write protection (required for Online Boards)", parseRevisionOption)
   .option("--cwd <path>", "project directory")

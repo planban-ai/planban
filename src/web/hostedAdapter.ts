@@ -19,6 +19,7 @@
 // becomes the page's 422; a missing or ended browser session (401) carries
 // signInNeeded, so the page shows its signed-out screen.
 import type { PlanbanRoadmap } from "../core/types";
+import { boardOnlyStaleness, type StalenessSignal } from "../core/staleness";
 
 /** One request to the online service, at a path under its own address. */
 export type ServiceSend = (path: string, init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<Response>;
@@ -47,6 +48,16 @@ export interface HostedBoardState {
   roadmap: PlanbanRoadmap;
   hosted: { boardId: string; role: BoardRole | null; authority: string | null };
   onlineReplay?: { replayed: true; originalRevision?: number };
+  staleness?: { cards: Record<string, StalenessSignal[]>; notes?: string[] };
+}
+
+/**
+ * Freshness from the board alone: the web page has no git or GitHub, so it checks every signal but
+ * merged PRs and says so when a card names one. The board shows the notes that need a person.
+ */
+function pageStaleness(roadmap: PlanbanRoadmap) {
+  const { cards, notes } = boardOnlyStaleness(roadmap.roadmapItems, Date.now());
+  return { cards, ...(notes?.length ? { notes } : {}) };
 }
 
 export interface LiveToken {
@@ -208,7 +219,7 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
     const outcome = await op(boardId, name, input, request);
     if (!outcome.ok) return outcome.reply;
     const { roadmap, result, replayed, originalRevision } = outcome.value;
-    const state: HostedBoardState & Record<string, unknown> = { ...boardState(boardId, roadmap), ...(withResult && result ? result : {}) };
+    const state: HostedBoardState & Record<string, unknown> = { ...boardState(boardId, roadmap), staleness: pageStaleness(roadmap), ...(withResult && result ? result : {}) };
     if (replayed) state.onlineReplay = { replayed: true, ...(originalRevision === undefined ? {} : { originalRevision }) };
     return reply(state);
   }
@@ -223,7 +234,7 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
     const board = await get<{ roadmap: PlanbanRoadmap; authority?: string; role?: BoardRole }>(serviceBoard(boardId), request);
     if (!board.ok) return board.reply;
     roles.set(boardId, { role: board.value.role ?? roles.get(boardId)?.role ?? null, authority: board.value.authority ?? null });
-    return reply(boardState(boardId, board.value.roadmap));
+    return reply({ ...boardState(boardId, board.value.roadmap), staleness: pageStaleness(board.value.roadmap) });
   }
 
   const routes: Route[] = [
