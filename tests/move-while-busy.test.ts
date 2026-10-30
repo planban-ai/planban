@@ -10,6 +10,11 @@ import * as storage from "../src/core/storage";
 import { onlineLogin } from "../src/core/online/login";
 import { resetCopyChecks } from "../src/core/online/copyCheck";
 import { stopTakeOnline, takeOnline } from "../src/core/online/transfers";
+import { onlineCacheRoot } from "../src/core/online/adapter";
+import { carryIdempotencyRecords, idempotencyFingerprint } from "../src/core/persistence";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { writeFile } from "node:fs/promises";
 import { startServer } from "../src/server/server";
 import { createServer } from "node:http";
 import { serviceBridge } from "./service-bridge";
@@ -229,6 +234,86 @@ test("a board-page change applied just before the move is not applied again when
     // The reply was lost, say: the page sends the same request again, now that the board is online.
     const retried = await create();
     assert.equal(retried.status, 200, await retried.clone().text());
+    const titles = (await storage.loadState(cwd)).roadmap.roadmapItems.map((item) => item.title);
+    assert.deepEqual(titles.filter((title) => title === "Beta"), ["Beta"], `applied once: ${titles.join(", ")}`);
+  } finally { await server.close(); }
+});
+
+// Retry records cross the move with the same meaning they had here.
+const record = (key: string, fingerprint: string, response?: unknown) => ({
+  key, scope: "POST /api/cards", fingerprint, createdAt: new Date().toISOString(),
+  ...(response === undefined ? {} : { completedAt: new Date().toISOString(), response }),
+});
+async function stores(local: unknown[], online: unknown[]) {
+  const from = join(root, "from");
+  const to = join(root, "to");
+  await mkdir(from, { recursive: true });
+  await mkdir(to, { recursive: true });
+  await writeFile(join(from, ".idempotency.json"), JSON.stringify({ version: 1, records: local }));
+  await writeFile(join(to, ".idempotency.json"), JSON.stringify({ version: 1, records: online }));
+  return { from, to, carried: async () => JSON.parse(await readFile(join(to, ".idempotency.json"), "utf8")).records as Array<{ key: string; fingerprint: string; response?: unknown }> };
+}
+
+test("carried retry records: a completed record replaces a pending one with the same request", async () => {
+  const { from, to, carried } = await stores([record("k", "same", { ok: 1 })], [record("k", "same")]);
+  await carryIdempotencyRecords(from, to);
+  assert.deepEqual((await carried()).map((entry) => entry.response), [{ ok: 1 }]);
+});
+
+test("carried retry records: a pending record never replaces a completed one, and two completed ones count as one", async () => {
+  let { from, to, carried } = await stores([record("k", "same")], [record("k", "same", { ok: 1 })]);
+  await carryIdempotencyRecords(from, to);
+  assert.deepEqual((await carried()).map((entry) => entry.response), [{ ok: 1 }]);
+  ({ from, to, carried } = await stores([record("k", "same", { ok: 1 })], [record("k", "same", { ok: 1 })]));
+  await carryIdempotencyRecords(from, to);
+  assert.equal((await carried()).length, 1);
+});
+
+test("carried retry records: a pending record crosses as pending", async () => {
+  const { from, to, carried } = await stores([record("k", "same")], []);
+  await carryIdempotencyRecords(from, to);
+  assert.deepEqual((await carried()).map((entry) => [entry.key, "response" in entry]), [["k", false]]);
+});
+
+test("the same retry key recorded for different requests here and online refuses the move, which leaves the board unchanged", async () => {
+  const cwd = await localBoard("Alpha");
+  const before = await storage.loadState(cwd);
+  await writeFile(join(before.planningRoot, ".idempotency.json"), JSON.stringify({ version: 1, records: [record("k", "here", { ok: 1 })] }));
+  const cache = onlineCacheRoot({ kind: "online", url: bridge.url, boardId: "roadmap" });
+  await mkdir(cache, { recursive: true });
+  await writeFile(join(cache, ".idempotency.json"), JSON.stringify({ version: 1, records: [record("k", "elsewhere", { ok: 2 })] }));
+  await assert.rejects(takeOnline(bridge.url, cwd), /retry key/);
+  assert.equal((await storage.readManifest(cwd))?.storage?.kind ?? "local", "local");
+  assert.deepEqual(JSON.parse(await readFile(before.roadmapPath, "utf8")), before.roadmap, "still the live board, unchanged");
+  assert.equal(await storage.pathExists(join(before.planningRoot, "online-transfer.json")), false);
+});
+
+test("a page request whose writer died after saving, before recording its answer, is not applied again when retried after the move", async () => {
+  const cwd = await localBoard("Alpha");
+  const read = (await storage.loadState(cwd)).roadmap.revision;
+  const body = { title: "Beta", baseRevision: read };
+  // The board server's own steps for that request, in a process killed right after the card is saved.
+  const script = `
+    import { runIdempotentBoardMutation, idempotencyFingerprint } from "./src/core/persistence.ts";
+    import { createCard, loadState } from "./src/core/storage.ts";
+    const cwd = ${JSON.stringify(cwd)};
+    const { planningRoot } = await loadState(cwd);
+    await runIdempotentBoardMutation({ planningRoot, idempotencyKey: "page-create-3", scope: "POST /api/cards",
+      fingerprint: idempotencyFingerprint({ params: {}, body: ${JSON.stringify(body)} }),
+      run: async () => { await createCard({ cwd, ...${JSON.stringify(body)} }); process.kill(process.pid, "SIGKILL"); } });`;
+  const killed = await promisify(execFile)(process.execPath, ["--import", "tsx/esm", "--input-type=module", "-e", script], { env: process.env }).then(() => null, (error) => error);
+  assert.equal(killed?.signal, "SIGKILL", String(killed?.stderr ?? "it finished"));
+  await takeOnline(bridge.url, cwd);
+  const reservation = createServer();
+  await new Promise<void>((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = (reservation.address() as any).port;
+  await new Promise<void>((resolve) => reservation.close(() => resolve()));
+  const server = await startServer({ cwd, port, useVite: false });
+  try {
+    const retried = await fetch(`${server.url}/api/cards`, { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "page-create-3" }, body: JSON.stringify(body) });
+    // As on this machine: the request's answer is unknown, so it is refused rather than applied again.
+    assert.notEqual(retried.status, 200);
+    assert.match(await retried.text(), /already in progress/);
     const titles = (await storage.loadState(cwd)).roadmap.roadmapItems.map((item) => item.title);
     assert.deepEqual(titles.filter((title) => title === "Beta"), ["Beta"], `applied once: ${titles.join(", ")}`);
   } finally { await server.close(); }

@@ -5,7 +5,7 @@ import { z } from "zod";
 import { normalizeRoadmap, PlanbanConflictError, PlanbanNotFoundError, PlanbanValidationError } from "../boardOperations";
 import { listHistory } from "../history";
 import { agentContextPath, defaultPlanbanRoot, hasLiveRoadmap, isRetiredRoadmap, RETIRED_ROADMAP, defaultPlanningRoot, detachedBoardCwd, historyCarriedDocsPath, historyDocPath, historyIndexPath, historyRoadmapPath, isPathInsideRoot, manifestPath, resolveInsideRoot, slugify } from "../paths";
-import { atomicWriteFile, carryIdempotencyRecords, isAtomicWriteTemp, LOCK_DIR, QUEUE_DIR, withBoardWriteLock } from "../persistence";
+import { atomicWriteFile, carryIdempotencyRecords, checkIdempotencyCarry, isAtomicWriteTemp, LOCK_DIR, QUEUE_DIR, withBoardWriteLock } from "../persistence";
 import { registerBoardFromState } from "../registry";
 import { roadmapSchema } from "../schema";
 import { docPathForItem, loadState, pathExists, readLocalGoals, readManifest, refreshAgentsBlock, resolveProjectCwd, resolvePlanningRoot, saveRoadmap } from "../storage";
@@ -420,6 +420,8 @@ export async function takeOnline(urlInput: string, cwdInput: string, options: Mo
       // moves until it is tidy, including when resuming an interrupted move.
       const report = await indexReport(await buildLocalBundle(cwd, journal?.phase === "sealed" ? journal.snapshot : undefined), planningRoot);
       if (!report.clean) throw new PlanbanNotReadyForOnline(report);
+      // Retry records cross with the board; two that name different requests would change a retry's meaning.
+      await checkIdempotencyCarry(planningRoot, onlineCacheRoot({ kind: "online", url, boardId }));
     }
     // Resuming continues as the account that started the upload, and only as it.
     if (journal?.userId && journal.userId !== pinned.person) {
