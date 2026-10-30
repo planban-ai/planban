@@ -204,6 +204,26 @@ test("GitHub merges are read from a cursor, kept between reads, and degrade with
     assert.deepEqual(offline.merges.map((merge) => merge.pr).sort(), [5, 8]);
     assert.match(offline.note ?? "", /isn't signed in here/u);
 
+    // More pull requests than one read pages through: coverage is reported as incomplete, and the
+    // next read goes back over the unscanned history instead of starting from a cursor past it.
+    clearStalenessCaches();
+    const fullPage = (args: string[]) => {
+      const pageNumber = Number(args.find((arg) => arg.startsWith("page="))!.slice("page=".length));
+      return page(Array.from({ length: 100 }, (_, index) => ({ number: 1000 + pageNumber * 100 + index, merged_at: null, updated_at: iso(NOW + 7 * DAY - pageNumber * 60_000 - index) })));
+    };
+    let pagesRead = 0;
+    answer = (args) => { pagesRead += 1; return fullPage(args); };
+    const busy = await githubMerges("o/r", NOW - 20 * DAY, { now: NOW + 7 * DAY, exec });
+    assert.equal(pagesRead, 5);
+    assert.match(busy.note ?? "", /only back to/u);
+    clearStalenessCaches();
+    pagesRead = 0;
+    const again = await githubMerges("o/r", NOW - 20 * DAY, { now: NOW + 7 * DAY + 120_000, exec });
+    assert.equal(pagesRead, 5, "the unscanned history is read again, not skipped");
+    assert.match(again.note ?? "", /only back to/u);
+    clearStalenessCaches();
+    answer = () => page([]);
+
     // gh not installed, with a real spawn on every platform: a note, never an error or a silent gap.
     clearStalenessCaches();
     const missing = await githubMerges("o/r", NOW - 10 * DAY, { now: NOW + 6 * DAY, exec: (_command, args, options) => runCommand("planban-no-such-gh", args, options) });
