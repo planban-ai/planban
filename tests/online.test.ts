@@ -972,6 +972,20 @@ test("a shut board whose marker was deleted gets it back on resume, and the move
   assert.deepEqual(fake.bundle.roadmap.roadmapItems.map((item) => item.id), before.roadmap.roadmapItems.map((item) => item.id));
 });
 
+for (const point of ["take-online:before-restore", "take-online:after-restore", "take-online:after-snapshot-removed"]) {
+  test(`a stop killed while putting the board back (${point}) never undoes edits made after it`, async () => {
+    const before = await storage.loadState(cwd);
+    await killedAt("take-online:after-seal", ["online", "take-online", fake.url, "--cwd", cwd]);
+    await killedAt(point, ["online", "stop-take-online", "--cwd", cwd]);
+    // Running stop again (or take-online) finishes putting it back; then the board is live, and an edit is acknowledged.
+    if (point === "take-online:before-restore") assert.equal((await stopTakeOnline(cwd)).stopped, true);
+    await storage.updateCard({ cwd, cardId: "alpha", summary: "kept after the stop", baseRevision: (await storage.loadState(cwd)).roadmap.revision });
+    await takeOnline(fake.url, cwd);
+    assert.equal(fake.bundle.roadmap.roadmapItems.find((item) => item.id === "alpha")?.summary, "kept after the stop", "the edit went online, not an older snapshot");
+    assert.equal((await readdir(before.planningRoot)).filter((name) => name.startsWith("roadmap.stray-")).length, 0, "the restored board is not stray");
+  });
+}
+
 test("take-online killed after copying the snapshot, before shutting the local board, finishes on retry with one snapshot", async () => {
   const before = await storage.loadState(cwd);
   await killedAt("take-online:after-snapshot", ["online", "take-online", fake.url, "--cwd", cwd]);

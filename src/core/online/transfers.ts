@@ -86,7 +86,7 @@ const journalSchema = z.object({
    */
   snapshot: z.string().optional(),
   unsyncedLocalChanges: z.array(z.object({ version: z.number(), createdAt: z.string(), summary: z.string() })).optional(),
-  phase: z.enum(["uploading", "sealing", "sealed", "committed", "fencing", "fenced", "staged", "published"]),
+  phase: z.enum(["uploading", "sealing", "sealed", "restoring", "committed", "fencing", "fenced", "staged", "published"]),
   startedAt: z.string(),
   /** Take Online: the account that started the upload. Only it can see, finish or cancel that upload. */
   userId: z.string().optional(),
@@ -586,8 +586,14 @@ async function setStrayAside(planningRoot: string): Promise<string | undefined> 
 }
 
 /** On resuming a Take Online: where the board here stands, from the record of the move. */
-async function settleShutBoard(planningRoot: string, journal: TransferJournal): Promise<{ journal: TransferJournal; stray?: string }> {
+async function settleShutBoard(planningRoot: string, journal: TransferJournal): Promise<{ journal: TransferJournal | null; stray?: string }> {
   if (journal.direction !== "online") return { journal };
+  if (journal.phase === "restoring") {
+    // A cancelled move cut short while putting the board back: finish that, then this is a new move.
+    await reopenLocalBoard(planningRoot, journal);
+    await rm(transferJournalPath(planningRoot), { force: true });
+    return { journal: null };
+  }
   if (journal.phase === "sealing") {
     // Cut short while shutting: the marker is written only once the snapshot is complete.
     journal = { ...journal, phase: await isRetiredRoadmap(join(planningRoot, "roadmap.json")) ? "sealed" : "uploading" };
@@ -600,15 +606,28 @@ async function settleShutBoard(planningRoot: string, journal: TransferJournal): 
   return stray ? { journal, stray } : { journal };
 }
 
-/** Puts the board back on this machine once the service confirmed the move is cancelled. */
+/**
+ * Puts the board back on this machine once the service confirmed the move is
+ * cancelled. "restoring" is recorded first: from then on the roadmap here is
+ * the board again, so a resume finishes putting it back and never takes edits
+ * made since for strays, or restores the older snapshot over them.
+ */
 async function reopenLocalBoard(planningRoot: string, journal: TransferJournal) {
   const live = join(planningRoot, "roadmap.json");
   const { snapshot } = journal;
-  if (!snapshot || !(await pathExists(snapshot))) return;
+  if (journal.phase === "uploading") {
+    // Never shut: only a copy from an attempt cut short may be left.
+    if (snapshot && await sameBytes(snapshot, live)) await rm(snapshot, { force: true });
+    return;
+  }
   if (journal.phase === "sealed") await setStrayAside(planningRoot);
-  if (await isRetiredRoadmap(live)) await atomicWriteFile(live, await readFile(snapshot));
-  // The board is live again from the same bytes: the copy is no longer needed.
-  if (await sameBytes(snapshot, live)) await rm(snapshot, { force: true });
+  if (journal.phase !== "restoring") await writeJournal(planningRoot, { ...journal, phase: "restoring" });
+  crashPoint("take-online:before-restore");
+  if (snapshot && await isRetiredRoadmap(live) && await pathExists(snapshot)) await atomicWriteFile(live, await readFile(snapshot));
+  crashPoint("take-online:after-restore");
+  // The board is live here again, perhaps edited since: the copy from before the move is no longer needed.
+  if (snapshot && await hasLiveRoadmap(planningRoot)) await rm(snapshot, { force: true });
+  crashPoint("take-online:after-snapshot-removed");
 }
 
 /**
@@ -625,6 +644,12 @@ export async function stopTakeOnline(cwdInput: string) {
   return withBoardWriteLock(planningRoot, async () => {
     const journal = await readJournal(planningRoot);
     if (!journal || journal.direction !== "online") return { stopped: false, message: "No Take Online is in progress for this board." };
+    if (journal.phase === "restoring") {
+      // Already cancelled with the service; this finishes putting the board back.
+      await reopenLocalBoard(planningRoot, journal);
+      await rm(transferJournalPath(planningRoot), { force: true });
+      return { stopped: true, message: "Take Online stopped. The board is on this machine, unchanged, and the partly copied online version was removed." };
+    }
     if (!BEFORE_COMMIT.has(journal.phase)) throw new PlanbanValidationError("This board already reached the online service. Run take-online again to finish switching to it.");
     const outcome = await cancelUpload(journal.url, journal);
     if (outcome === "committed") throw new PlanbanValidationError("This board already reached the online service. Run take-online again to finish switching to it.");
