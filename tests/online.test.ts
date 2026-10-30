@@ -28,6 +28,7 @@ import { listHistory } from "../src/core/history";
 import { checkIndexCard, checkIndexDocument, checkIndexValue } from "../src/core/contentRules";
 import type { PlanbanDocPayload, PlanbanRoadmap } from "../src/core/types";
 import { clearStalenessCaches, collectStaleness, projectStaleness } from "../src/core/stalenessSources";
+import { useGitHubRunner } from "../src/core/githubMerges";
 import { planbanStalenessLine } from "../plugins/planban/scripts/claude-session-context.mjs";
 const CMD = planbanCommand().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -721,16 +722,17 @@ test("an Online Board shows freshness warnings everywhere a local one does, with
   // This project's origin is on GitHub; a stand-in gh answers for it.
   await execFileAsync("git", ["init", "-q"], { cwd });
   await execFileAsync("git", ["remote", "add", "origin", "git@github.com:example/demo.git"], { cwd });
-  const bin = join(root, "bin");
-  await mkdir(bin, { recursive: true });
-  const ghLog = join(root, "gh-calls.log");
-  const pathBefore = process.env.PATH;
-  const fakeGh = async (script: string) => {
-    await writeFile(join(bin, "gh"), `#!/bin/sh\necho "$@" >> "${ghLog}"\n${script}\n`, { mode: 0o755 });
+  // A stand-in for gh, recording what it was asked; a real spawn is covered by the "not installed" check below.
+  const ghCalls: string[][] = [];
+  const fakeGh = async (answer: () => string) => {
+    useGitHubRunner(async (command, args) => {
+      assert.equal(command, "gh");
+      ghCalls.push(args);
+      return answer();
+    });
     clearStalenessCaches();
     await rm(join(process.env.PLANBAN_HOME!, "online", "github"), { recursive: true, force: true });
   };
-  process.env.PATH = `${bin}:${pathBefore}`;
   try {
     await storage.setCardStatus(cwd, "alpha", "in-progress");
     await storage.updateCard({ cwd, cardId: "alpha", nextAction: "Merge PR 41, then deploy." });
@@ -738,14 +740,14 @@ test("an Online Board shows freshness warnings everywhere a local one does, with
     await takeOnline(fake.url, cwd);
     await new Promise((resolve) => setTimeout(resolve, 20));
     const mergedAt = new Date(Date.now() - 5).toISOString();
-    await fakeGh(`echo '[{"number":41,"merged_at":"${mergedAt}","updated_at":"${mergedAt}"},{"number":40,"merged_at":null,"updated_at":"${mergedAt}"}]'`);
+    await fakeGh(() => JSON.stringify([{ number: 41, merged_at: mergedAt, updated_at: mergedAt }, { number: 40, merged_at: null, updated_at: mergedAt }]));
 
     // planban_status and the session-start hook read the board from the service, not a local file.
     const board = await projectStaleness(cwd);
     assert.deepEqual(board?.staleness.cards.alpha?.map((signal) => signal.kind), ["merged"]);
     assert.deepEqual(board?.staleness.cards["sign-off"]?.map((signal) => signal.kind), ["awaiting-owner"]);
     assert.equal(board?.staleness.notes, undefined);
-    assert.match(await readFile(ghLog, "utf8"), /api --method GET repos\/example\/demo\/pulls/u);
+    assert.deepEqual(ghCalls[0]!.slice(0, 4), ["api", "--method", "GET", "repos/example/demo/pulls"]);
     clearStalenessCaches();
     assert.equal(await planbanStalenessLine({ projectDir: cwd }), "1 active card looks stale (alpha); fix any you touch.");
 
@@ -761,15 +763,16 @@ test("an Online Board shows freshness warnings everywhere a local one does, with
     assert.deepEqual((await projectStaleness(cwd))?.staleness.cards.alpha?.map((signal) => signal.kind), ["merged"]);
 
     // GitHub out of reach: no error, the merges already seen here, and a note saying why.
-    await fakeGh(`echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4`);
+    await fakeGh(() => { throw Object.assign(new Error("gh exited 4"), { stderr: "To get started with GitHub CLI, please run:  gh auth login" }); });
     const degraded = await projectStaleness(cwd);
     assert.equal(degraded?.staleness.cards.alpha, undefined);
     assert.deepEqual(degraded?.staleness.cards["sign-off"]?.map((signal) => signal.kind), ["awaiting-owner"]);
     assert.match(degraded?.staleness.notes?.[0] ?? "", /isn't signed in here/u);
     clearStalenessCaches();
     assert.match(await planbanStalenessLine({ projectDir: cwd }) ?? "", /^Merged-PR warnings may be missing merges: the GitHub CLI \(gh\) isn't signed in here\./u);
+
   } finally {
-    process.env.PATH = pathBefore;
+    useGitHubRunner();
     clearStalenessCaches();
   }
 });

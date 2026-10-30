@@ -18,7 +18,7 @@ import {
 import { clearStalenessCaches, collectStaleness, readMergeLog } from "../src/core/stalenessSources";
 import { createCard, initializeProject, loadState } from "../src/core/storage";
 import { committedRoadmap, createEmptyRoadmap, planCreateCard, planMoveCard, planUpdateCard } from "../src/core/boardOperations";
-import { githubMerges, githubRepoFromRemote } from "../src/core/githubMerges";
+import { githubMerges, githubRepoFromRemote, runCommand } from "../src/core/githubMerges";
 import type { PlanbanRoadmapItem } from "../src/core/types";
 import { planbanStalenessLine } from "../plugins/planban/scripts/claude-session-context.mjs";
 
@@ -203,6 +203,12 @@ test("GitHub merges are read from a cursor, kept between reads, and degrade with
     const offline = await githubMerges("o/r", NOW - 10 * DAY, { now: NOW + 4 * DAY, exec });
     assert.deepEqual(offline.merges.map((merge) => merge.pr).sort(), [5, 8]);
     assert.match(offline.note ?? "", /isn't signed in here/u);
+
+    // gh not installed, with a real spawn on every platform: a note, never an error or a silent gap.
+    clearStalenessCaches();
+    const missing = await githubMerges("o/r", NOW - 10 * DAY, { now: NOW + 6 * DAY, exec: (_command, args, options) => runCommand("planban-no-such-gh", args, options) });
+    assert.deepEqual(missing.merges.map((merge) => merge.pr).sort(), [5, 8]);
+    assert.match(missing.note ?? "", /the GitHub CLI \(gh\) isn't installed here/u);
   } finally {
     if (previousHome === undefined) delete process.env.PLANBAN_HOME;
     else process.env.PLANBAN_HOME = previousHome;

@@ -32,9 +32,9 @@ interface MergeCache {
   merges: MergeRecord[];
 }
 
-type Run = (command: string, args: string[], options: { cwd?: string; timeout: number }) => Promise<string>;
+export type Run = (command: string, args: string[], options: { cwd?: string; timeout: number }) => Promise<string>;
 
-const run: Run = (command, args, options) => new Promise((resolveRun, rejectRun) => {
+export const runCommand: Run = (command, args, options) => new Promise((resolveRun, rejectRun) => {
   execFile(command, args, { ...options, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GH_PROMPT_DISABLED: "1", NO_COLOR: "1" } },
     (error, stdout, stderr) => error ? rejectRun(Object.assign(error, { stderr: String(stderr) })) : resolveRun(String(stdout)));
 });
@@ -46,7 +46,7 @@ export function githubRepoFromRemote(remote: string): string | null {
 }
 
 /** The GitHub repository a project folder's origin remote points at, or null. */
-export async function githubRepoFor(cwd: string, exec: Run = run): Promise<string | null> {
+export async function githubRepoFor(cwd: string, exec: Run = runCommand): Promise<string | null> {
   try {
     return githubRepoFromRemote(await exec("git", ["remote", "get-url", "origin"], { cwd, timeout: GIT_TIMEOUT_MS }));
   } catch {
@@ -107,6 +107,16 @@ export function clearGitHubMergeCache() {
   memory.clear();
 }
 
+// gh is run directly, never through a shell: every Windows install of it is gh.exe, and its
+// --jq argument holds characters cmd.exe would read as commands.
+let ghRunner: Run = runCommand;
+
+/** Replaces how gh is run, for tests; no argument restores the real one. */
+export function useGitHubRunner(exec?: Run) {
+  ghRunner = exec ?? runCommand;
+  memory.clear();
+}
+
 /**
  * Merged PRs for `repo` from `since` on: only what is new since the last read is fetched, and
  * merged with what earlier reads saw. Refreshes at most once a minute per process; the cursor and
@@ -122,7 +132,7 @@ export function githubMerges(repo: string, since: number, options: { now?: numbe
     const covered = saved && Date.parse(saved.coveredFrom) <= since;
     const from = covered ? Date.parse(saved.cursor) - CURSOR_OVERLAP_MS : since;
     try {
-      const fresh = await fetchMergedSince(repo, from, options.exec ?? run);
+      const fresh = await fetchMergedSince(repo, from, options.exec ?? ghRunner);
       const byPr = new Map((saved?.merges ?? []).map((merge) => [merge.pr, merge]));
       for (const merge of fresh) byPr.set(merge.pr, merge);
       const merges = [...byPr.values()];
