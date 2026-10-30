@@ -109,10 +109,14 @@ test("the web page marks cards that wait on a person, and a metadata edit throug
     assert.deepEqual(created.body.staleness.cards[cardId].map((signal: Json) => signal.kind), ["awaiting-owner"], "an edit's answer carries the notes too");
     const state = await page(adapter, boardPath(boardId, "/state"));
     assert.deepEqual(state.body.staleness.cards[cardId].map((signal: Json) => signal.kind), ["awaiting-owner"]);
+    assert.equal(state.body.staleness.notes, undefined, "no card names a PR, so there is nothing to say about merges");
+    const named = await page(adapter, cardPath(boardId, cardId), { method: "PATCH", body: { summary: "Waits on PR 41.", baseRevision: 2 } });
+    assert.equal(named.status, 200, JSON.stringify(named.body));
+    assert.match(named.body.staleness.notes.join(" "), /Merged-PR warnings aren't checked here/u);
 
-    const first = await page(adapter, cardPath(boardId, cardId), { method: "PATCH", body: { metadata: { thread: "t1", pr: 4 }, baseRevision: 2 } });
+    const first = await page(adapter, cardPath(boardId, cardId), { method: "PATCH", body: { metadata: { thread: "t1", pr: 4 }, baseRevision: 3 } });
     assert.equal(first.status, 200, JSON.stringify(first.body));
-    const second = await page(adapter, cardPath(boardId, cardId), { method: "PATCH", body: { metadata: { pr: null, owner: "olive" }, baseRevision: 3 } });
+    const second = await page(adapter, cardPath(boardId, cardId), { method: "PATCH", body: { metadata: { pr: null, owner: "olive" }, baseRevision: 4 } });
     assert.equal(second.status, 200, JSON.stringify(second.body));
     assert.deepEqual(second.body.roadmap.roadmapItems.find((item: Json) => item.id === cardId).metadata, { thread: "t1", owner: "olive" });
   });

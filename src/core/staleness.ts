@@ -270,6 +270,19 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
   };
 }
 
+/** Said wherever merged-PR warnings can't be worked out, so their absence is never read as "nothing merged". */
+export const MERGES_NOT_CHECKED_NOTE = "Merged-PR warnings aren't checked here, because this view can't see GitHub. Planban on a computer with the GitHub CLI (gh) signed in checks them, for example planban_status or planban_get_board from a coding agent.";
+
+/**
+ * Freshness from the board alone, for the hosted web page and the hosted MCP tools, which have no
+ * git or GitHub: every signal but "merged" (and "edited outside Planban", which can't happen online),
+ * with a note when an active card names a PR.
+ */
+export function boardOnlyStaleness(items: PlanbanRoadmapItem[], now: number, history: StalenessInput["history"] = []): BoardStaleness {
+  const namesPr = items.some((item) => ACTIVE_STATUSES.has(item.status) && cardPrNumbers(item).length > 0);
+  return computeStaleness({ items, history, docMtimes: [], merges: [], now, notes: namesPr ? [MERGES_NOT_CHECKED_NOTE] : [] });
+}
+
 export interface StalenessAttention {
   /** Every active card an agent could fix, most stale first. */
   cards: Array<{ id: string; title: string; status: string; signals: StalenessSignal[] }>;

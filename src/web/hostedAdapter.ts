@@ -19,7 +19,7 @@
 // becomes the page's 422; a missing or ended browser session (401) carries
 // signInNeeded, so the page shows its signed-out screen.
 import type { PlanbanRoadmap } from "../core/types";
-import { computeStaleness, type StalenessSignal } from "../core/staleness";
+import { boardOnlyStaleness, type StalenessSignal } from "../core/staleness";
 
 /** One request to the online service, at a path under its own address. */
 export type ServiceSend = (path: string, init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<Response>;
@@ -48,15 +48,16 @@ export interface HostedBoardState {
   roadmap: PlanbanRoadmap;
   hosted: { boardId: string; role: BoardRole | null; authority: string | null };
   onlineReplay?: { replayed: true; originalRevision?: number };
-  staleness?: { cards: Record<string, StalenessSignal[]> };
+  staleness?: { cards: Record<string, StalenessSignal[]>; notes?: string[] };
 }
 
 /**
- * The board's notes that need a person, from the board alone: the web page has no git or GitHub,
- * and its notes show only what waits on someone ("Needs you").
+ * Freshness from the board alone: the web page has no git or GitHub, so it checks every signal but
+ * merged PRs and says so when a card names one. The board shows the notes that need a person.
  */
 function pageStaleness(roadmap: PlanbanRoadmap) {
-  return { cards: computeStaleness({ items: roadmap.roadmapItems, history: [], docMtimes: [], merges: [], now: Date.now() }).cards };
+  const { cards, notes } = boardOnlyStaleness(roadmap.roadmapItems, Date.now());
+  return { cards, ...(notes?.length ? { notes } : {}) };
 }
 
 export interface LiveToken {

@@ -49,6 +49,30 @@ test("remote results have the local tools' shape: query matches at the top level
   assert.deepEqual(result.userReply, { urlRequired: true, url: "https://app.planban.example/boards/deadleg#card=vest", markdown: "[Open the board](https://app.planban.example/boards/deadleg#card=vest)" });
 });
 
+test("the hosted tools show every freshness warning they can, and say merges aren't checked here", async () => {
+  const week = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const board: any = {
+    ...roadmap,
+    roadmapItems: [
+      ...roadmap.roadmapItems,
+      { id: "ship", title: "Ship it", status: "in-progress", summary: null, nextAction: "Merge PR 41.", tags: [], isGroup: false, parentId: null, priority: 2, updatedAt: week },
+    ],
+  };
+  const hosted: any = { ...service, getBoard: async () => board, unresolved: async () => ({ changes: [] }), working: async () => ({ working: {} }), notePresence: async () => undefined };
+  const ask = async (name: string, args: Record<string, unknown>) => {
+    const response = await handleMcp(new Request("https://app.planban.example/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) }), hosted, "https://app.planban.example");
+    return (await response.json()).result.structuredContent;
+  };
+  const got = await ask("planban_get_board", { boardId: "deadleg" });
+  assert.equal(got.attention.total, 1);
+  assert.deepEqual(got.attention.cards.map((card: any) => [card.id, card.signals.map((signal: any) => signal.kind)]), [["ship", ["quiet"]]]);
+  assert.equal(got.attention.awaitingOwner, 1);
+  assert.match(got.attention.notes.join(" "), /Merged-PR warnings aren't checked here/u);
+  const card = await ask("planban_get_card", { boardId: "deadleg", cardId: "ship" });
+  assert.deepEqual(card.staleness.map((signal: any) => signal.kind), ["quiet"]);
+  assert.match(card.stalenessNote, /Merged-PR warnings aren't checked here/u);
+});
+
 test("a remote refusal keeps its kind and the details to reconcile, as the local tools do", async () => {
   const conflict = { currentRevision: 5, yourRevision: 3, changes: [{ version: 9, revision: 5, at: "2026-10-15T18:00:00.000Z", by: "Ana", agent: false, summary: "Updated Choose the vest supplier", cards: ["vest"] }], card: roadmap.roadmapItems[0] };
   // The real service wrapper, whose mutation refuses as the board does.

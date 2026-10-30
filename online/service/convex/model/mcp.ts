@@ -8,7 +8,7 @@
 import { ConvexError } from "convex/values";
 import { sectionList } from "../../../../src/core/docSections";
 import { PLANBAN_STATUSES, type PlanbanDocPayload, type PlanbanHistoryPayload, type PlanbanRoadmap } from "../../../../src/core/types";
-import { largeDocNote } from "../../../../src/core/staleness";
+import { boardOnlyStaleness, cardPrNumbers, largeDocNote, stalenessAttention } from "../../../../src/core/staleness";
 import { cardAncestry } from "../../../../src/core/boardOperations";
 import { queryWorkItems, type WorkItemQuery } from "../../../../src/core/workItemQuery";
 import { internal } from "../_generated/api";
@@ -476,7 +476,9 @@ async function callTool(service: McpService, origin: string, name: string, args:
       const goals = goalsBlock({ ...emptyGoals(), goals: page.goals });
       const board = compactBoard(roadmap);
       const { roadmapItems, ...head } = board;
-      return goals ? { ...head, goals, roadmapItems } : board;
+      // The same freshness list as the local tools, from the board alone (no GitHub here, said in its notes).
+      const attention = stalenessAttention(boardOnlyStaleness(roadmap.roadmapItems, Date.now()), roadmap.roadmapItems);
+      return { ...head, ...(goals ? { goals } : {}), attention, roadmapItems };
     }
     case "planban_read_goals": {
       const { page, revision } = await service.goals(stringArg(args, "boardId"));
@@ -507,8 +509,11 @@ async function callTool(service: McpService, origin: string, name: string, args:
       await service.notePresence(boardId, cardId);
       const [{ changes }, { working }] = await Promise.all([service.unresolved(boardId, cardId), service.working(boardId, cardId)]);
       const others = working[cardId] ?? [];
+      const freshness = boardOnlyStaleness(roadmap.roadmapItems, Date.now());
       return {
         revision: roadmap.revision, card, ancestry: cardAncestry(roadmap, cardId),
+        // The note only for a card that names a PR, whose merge this view can't check.
+        staleness: freshness.cards[cardId] ?? [], ...(freshness.notes?.length && cardPrNumbers(card).length ? { stalenessNote: freshness.notes.join(" ") } : {}),
         ...(others.length ? { workingOn: others } : {}), ...(changes.length ? { unresolvedChanges: changes } : {}),
       };
     }
