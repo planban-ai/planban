@@ -78,10 +78,10 @@ async function readDocMtimes(planningRoot: string, items: PlanbanRoadmapItem[]):
     .filter((item) => item.status === "in-progress" || item.status === "up-next")
     .flatMap((item) => (["spec", "plan"] as const).map((kind) => ({ cardId: item.id, kind, path: kind === "spec" ? item.specDoc : item.planDoc })))
     .filter((doc): doc is { cardId: string; kind: "spec" | "plan"; path: string } => typeof doc.path === "string" && doc.path.length > 0);
-  const mtimes = await Promise.all(docs.map(async (doc) => {
+  const mtimes = await Promise.all(docs.map(async (doc): Promise<DocMtime | null> => {
     try {
       const info = await stat(resolveInsideRoot(planningRoot, doc.path));
-      return { cardId: doc.cardId, kind: doc.kind, mtimeMs: info.mtimeMs };
+      return { cardId: doc.cardId, kind: doc.kind, mtimeMs: info.mtimeMs, bytes: info.size };
     } catch {
       return null;
     }

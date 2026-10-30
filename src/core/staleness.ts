@@ -3,7 +3,7 @@
 import type { PlanbanHistoryEntry, PlanbanRoadmapItem } from "./types";
 import { planbanCommand } from "./command";
 
-export type StalenessKind = "holds-files" | "merged" | "doc-edited" | "quiet" | "awaiting-owner" | "group-behind";
+export type StalenessKind = "holds-files" | "merged" | "doc-edited" | "quiet" | "large-doc" | "awaiting-owner" | "group-behind";
 
 export interface StalenessSignal {
   kind: StalenessKind;
@@ -21,6 +21,8 @@ export interface DocMtime {
   cardId: string;
   kind: "spec" | "plan";
   mtimeMs: number;
+  /** Size on disk, when known, for the large-document warning. */
+  bytes?: number | undefined;
 }
 
 export interface StalenessInput {
@@ -30,6 +32,8 @@ export interface StalenessInput {
   merges: MergeRecord[];
   /** Files in each card folder other than its Spec and Plan, for cards that hold any. */
   cardFiles?: Record<string, string[]> | undefined;
+  /** Why some signals may be missing, such as GitHub being out of reach. Passed through to readers. */
+  notes?: string[] | undefined;
   now: number;
 }
 
@@ -38,10 +42,14 @@ export interface BoardStaleness {
   cards: Record<string, StalenessSignal[]>;
   /** Reported to agents only when In Progress Items exceed the threshold. */
   wip: { count: number; threshold: number } | null;
+  /** Why some signals may be missing, such as GitHub being out of reach. */
+  notes?: string[] | undefined;
 }
 
 export const QUIET_AFTER_DAYS = 5;
 export const WIP_THRESHOLD = 12;
+/** A Spec or Plan over this size has been appended to rather than rewritten. */
+export const LARGE_DOC_BYTES = 100 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1000;
 // A Group summary is expected to trail its children a little; flag it only after a day.
 const GROUP_BEHIND_SLACK_MS = DAY_MS;
@@ -49,10 +57,10 @@ const GROUP_BEHIND_SLACK_MS = DAY_MS;
 const DOC_WRITE_SLACK_MS = 2_000;
 const ACTIVE_STATUSES = new Set(["in-progress", "up-next"]);
 // Order used for the board chip and for sorting attention lists.
-export const STALENESS_KIND_ORDER: StalenessKind[] = ["holds-files", "merged", "doc-edited", "quiet", "group-behind", "awaiting-owner"];
+export const STALENESS_KIND_ORDER: StalenessKind[] = ["holds-files", "merged", "doc-edited", "quiet", "group-behind", "large-doc", "awaiting-owner"];
 // Kinds an agent can fix by editing the card; awaiting-owner waits on the human instead, and
 // holds-files blocks editing until the card's files are moved out.
-export const STALE_KINDS = new Set<StalenessKind>(["merged", "doc-edited", "quiet", "group-behind"]);
+export const STALE_KINDS = new Set<StalenessKind>(["merged", "doc-edited", "quiet", "group-behind", "large-doc"]);
 
 // The next step is the owner's when Next action starts with "Owner:", the house-style convention.
 const AWAITING_OWNER = [/^\s*Owner:/u];
@@ -78,6 +86,16 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 function shortDate(ms: number): string {
   const date = new Date(ms);
   return `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`;
+}
+
+function kilobytes(bytes: number) {
+  return `${Math.round(bytes / 1024)} KB`;
+}
+
+/** The warning for a Spec or Plan over LARGE_DOC_BYTES, or null. Also shown when a document is read or written. */
+export function largeDocNote(kind: "spec" | "plan", bytes: number): string | null {
+  if (bytes <= LARGE_DOC_BYTES) return null;
+  return `${kind === "spec" ? "Spec" : "Plan"} is ${kilobytes(bytes)}; rewrite it to the current state, don't append`;
 }
 
 /** PR numbers named in text: `#123`, `PR 123`, `PRs 1, 2 and 3`, `PRs 386–388`, `.../pull/123`. */
@@ -111,6 +129,16 @@ function prNumbersInMetadata(metadata: Record<string, unknown> | undefined): num
     if (typeof entry === "string") return /^\d+$/u.test(entry.trim()) ? [Number(entry)] : prNumbersInText(entry);
     return [];
   });
+}
+
+/** Every PR an active card names, in its summary, next action or metadata `prs` list. */
+export function cardPrNumbers(item: Pick<PlanbanRoadmapItem, "summary" | "nextAction" | "metadata">): number[] {
+  return [...new Set([...prNumbersInText(item.summary), ...prNumbersInText(item.nextAction), ...prNumbersInMetadata(item.metadata)])];
+}
+
+/** When a card last noted progress; a merge after this is flagged. */
+export function progressFloor(item: Pick<PlanbanRoadmapItem, "progressNotedAt" | "updatedAt">): number | null {
+  return time(item.progressNotedAt) ?? time(item.updatedAt);
 }
 
 /** Parses `git log --format=%cI%x09%s` lines into the earliest merge time per PR. */
@@ -180,10 +208,11 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
     const signals: StalenessSignal[] = [];
     if (files?.length) signals.push(holdsFilesSignal(item, files, input.now));
 
-    // A referenced PR merged after the card last changed (and after it existed).
-    const floor = Math.max(updatedAt ?? -Infinity, firstSeen.get(item.id) ?? -Infinity);
+    // A referenced PR merged after the card last noted progress (and after it existed). Only a change
+    // to its summary or next action, or completing it, notes progress; a touch or a metadata edit doesn't.
+    const floor = Math.max(progressFloor(item) ?? -Infinity, firstSeen.get(item.id) ?? -Infinity);
     if (floor > -Infinity) {
-      const prs = new Set([...prNumbersInText(item.summary), ...prNumbersInText(item.nextAction), ...prNumbersInMetadata(item.metadata)]);
+      const prs = cardPrNumbers(item);
       const merged = [...prs]
         .map((pr) => ({ pr, at: mergedAt.get(pr) ?? null }))
         .filter((entry): entry is { pr: number; at: number } => entry.at !== null && entry.at > floor && entry.at <= input.now)
@@ -213,6 +242,12 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
       signals.push({ kind: "quiet", detail: `No update for ${days}d`, since: new Date(lastActivity).toISOString() });
     }
 
+    for (const doc of input.docMtimes) {
+      if (doc.cardId !== item.id || doc.bytes === undefined) continue;
+      const note = largeDocNote(doc.kind, doc.bytes);
+      if (note) signals.push({ kind: "large-doc", detail: note, since: new Date(doc.mtimeMs).toISOString() });
+    }
+
     const childAt = latestChildUpdate.get(item.id);
     if (item.isGroup && childAt !== undefined && updatedAt !== null && childAt - updatedAt > GROUP_BEHIND_SLACK_MS) {
       signals.push({ kind: "group-behind", detail: `Child cards changed after this Group (${shortDate(childAt)})`, since: new Date(childAt).toISOString() });
@@ -228,20 +263,28 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
   }
 
   const inProgress = input.items.filter((item) => item.status === "in-progress" && !item.isGroup).length;
-  return { cards, wip: inProgress > WIP_THRESHOLD ? { count: inProgress, threshold: WIP_THRESHOLD } : null };
+  return {
+    cards,
+    wip: inProgress > WIP_THRESHOLD ? { count: inProgress, threshold: WIP_THRESHOLD } : null,
+    ...(input.notes?.length ? { notes: input.notes } : {}),
+  };
 }
 
 export interface StalenessAttention {
-  /** Active cards an agent could fix, most stale first, capped. */
+  /** Every active card an agent could fix, most stale first. */
   cards: Array<{ id: string; title: string; status: string; signals: StalenessSignal[] }>;
   total: number;
   awaitingOwner: number;
   /** Cards whose folders hold files, so Planban refuses changes to them until tidied. */
   holdingFiles: { ids: string[]; total: number };
   wip: BoardStaleness["wip"];
+  notes?: string[] | undefined;
 }
 
-export function stalenessAttention(staleness: BoardStaleness, items: PlanbanRoadmapItem[], limit = 10): StalenessAttention {
+/** How many card ids a one-line summary names before "+N more". */
+export const SUMMARY_IDS = 5;
+
+export function stalenessAttention(staleness: BoardStaleness, items: PlanbanRoadmapItem[]): StalenessAttention {
   const byId = new Map(items.map((item) => [item.id, item]));
   const rank = (signals: StalenessSignal[]) => STALENESS_KIND_ORDER.indexOf(signals[0]!.kind);
   const stale = Object.entries(staleness.cards)
@@ -249,7 +292,7 @@ export function stalenessAttention(staleness: BoardStaleness, items: PlanbanRoad
     .filter((entry) => entry.signals.length > 0 && byId.has(entry.id))
     .sort((left, right) => rank(left.signals) - rank(right.signals) || left.signals[0]!.since.localeCompare(right.signals[0]!.since));
   return {
-    cards: stale.slice(0, limit).map(({ id, signals }) => {
+    cards: stale.map(({ id, signals }) => {
       const item = byId.get(id)!;
       return { id, title: item.title, status: item.status, signals };
     }),
@@ -259,27 +302,32 @@ export function stalenessAttention(staleness: BoardStaleness, items: PlanbanRoad
       const ids = Object.entries(staleness.cards)
         .filter(([id, signals]) => byId.has(id) && signals.some((signal) => signal.kind === "holds-files"))
         .map(([id]) => id);
-      return { ids: ids.slice(0, limit), total: ids.length };
+      return { ids, total: ids.length };
     })(),
     wip: staleness.wip,
+    ...(staleness.notes?.length ? { notes: staleness.notes } : {}),
   };
 }
 
-/** One short line for agents, or null when nothing needs attention. */
-export function stalenessLine(attention: StalenessAttention): string | null {
+/**
+ * One short line for agents, or null when nothing needs attention. It names the first few cards;
+ * `allListedBy` says where to see every one, such as "planban_get_board".
+ */
+export function stalenessLine(attention: StalenessAttention, allListedBy?: string): string | null {
   const parts: string[] = [];
   const holding = attention.holdingFiles;
+  const more = (total: number) => total > SUMMARY_IDS ? `, +${total - SUMMARY_IDS} more${allListedBy ? `; ${allListedBy} lists them all` : ""}` : "";
   if (holding?.total) {
-    const ids = holding.ids.slice(0, 5).join(", ");
-    const more = holding.total > 5 ? `, +${holding.total - 5} more` : "";
-    parts.push(`${holding.total} card${holding.total === 1 ? " holds" : "s hold"} files in ${holding.total === 1 ? "its folder" : "their folders"} (${ids}${more}). Planban is an index, not file storage, so it refuses changes to ${holding.total === 1 ? "that card" : "those cards"} until the files are moved out with \`${moveFilesOutCommand("<card>")}\`.`);
+    const ids = holding.ids.slice(0, SUMMARY_IDS).join(", ");
+    parts.push(`${holding.total} card${holding.total === 1 ? " holds" : "s hold"} files in ${holding.total === 1 ? "its folder" : "their folders"} (${ids}${more(holding.total)}). Planban is an index, not file storage, so it refuses changes to ${holding.total === 1 ? "that card" : "those cards"} until the files are moved out with \`${moveFilesOutCommand("<card>")}\`.`);
   }
   if (attention.total > 0) {
-    const ids = attention.cards.slice(0, 5).map((card) => card.id).join(", ");
-    const more = attention.total > 5 ? `, +${attention.total - 5} more` : "";
-    parts.push(`${attention.total} active card${attention.total === 1 ? "" : "s"} look${attention.total === 1 ? "s" : ""} stale (${ids}${more}); fix any you touch.`);
+    const ids = attention.cards.slice(0, SUMMARY_IDS).map((card) => card.id).join(", ");
+    parts.push(`${attention.total} active card${attention.total === 1 ? "" : "s"} look${attention.total === 1 ? "s" : ""} stale (${ids}${more(attention.total)}); fix any you touch.`);
   }
   if (attention.wip) parts.push(`${attention.wip.count} Items are In Progress (over ${attention.wip.threshold}).`);
+  // A note only matters beside a warning or a quiet board an agent would otherwise trust.
+  for (const note of attention.notes ?? []) parts.push(note);
   return parts.length ? parts.join(" ") : null;
 }
 

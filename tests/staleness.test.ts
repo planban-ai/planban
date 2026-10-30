@@ -6,6 +6,8 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   computeStaleness,
+  LARGE_DOC_BYTES,
+  largeDocNote,
   parseMergeLog,
   prNumbersInText,
   stalenessAttention,
@@ -15,6 +17,7 @@ import {
 } from "../src/core/staleness";
 import { clearStalenessCaches, collectStaleness, readMergeLog } from "../src/core/stalenessSources";
 import { createCard, initializeProject, loadState } from "../src/core/storage";
+import { committedRoadmap, createEmptyRoadmap, planCreateCard, planMoveCard, planUpdateCard } from "../src/core/boardOperations";
 import type { PlanbanRoadmapItem } from "../src/core/types";
 import { planbanStalenessLine } from "../plugins/planban/scripts/claude-session-context.mjs";
 
@@ -100,6 +103,72 @@ test("merged: only PRs merged after the card first appears in history count", ()
   assert.equal(result.cards["late-card"], undefined);
 });
 
+test("merged: only a change to the summary or next action, or completing the card, settles a merge", () => {
+  let clock = NOW - 3 * DAY;
+  const at = () => new Date(clock).toISOString();
+  const step = (plan: (roadmap: ReturnType<typeof createEmptyRoadmap>) => { roadmap: ReturnType<typeof createEmptyRoadmap> }) => {
+    clock += 60 * 60 * 1000;
+    board = committedRoadmap(plan(board).roadmap, at());
+  };
+  let board = createEmptyRoadmap({ repoId: "r", title: "R", now: at() });
+  step((roadmap) => planCreateCard(roadmap, { title: "Ship", status: "in-progress", nextAction: "Merge PR 41." }, { now: at() }));
+  const merge = { pr: 41, mergedAt: iso(clock + 30 * 60 * 1000) };
+  const signals = () => compute({ items: board.roadmapItems, merges: [merge] }).cards.ship?.map((signal) => signal.kind) ?? [];
+  step((roadmap) => ({ roadmap }));
+  assert.deepEqual(signals(), ["merged"]);
+
+  // A metadata-only update and a no-op update are touches: the merge stays flagged.
+  step((roadmap) => planUpdateCard(roadmap, { cardId: "ship", metadata: { thread: "t1" } }, { now: at() }));
+  assert.deepEqual(signals(), ["merged"], "a metadata edit doesn't settle the merge");
+  const before = board.roadmapItems[0]!.updatedAt;
+  step((roadmap) => planUpdateCard(roadmap, { cardId: "ship", nextAction: "Merge PR 41." }, { now: at() }));
+  assert.equal(board.roadmapItems[0]!.updatedAt, before, "an update that changes nothing isn't activity");
+  assert.deepEqual(signals(), ["merged"]);
+
+  // Changing the next action settles it.
+  step((roadmap) => planUpdateCard(roadmap, { cardId: "ship", nextAction: "Deploy what PR 41 merged." }, { now: at() }));
+  assert.deepEqual(signals(), []);
+
+  // Completing settles a later merge, and moving back doesn't bring it back.
+  step((roadmap) => planUpdateCard(roadmap, { cardId: "ship", summary: "Follow-up in PR 42." }, { now: at() }));
+  const later = { pr: 42, mergedAt: iso(clock + 30 * 60 * 1000) };
+  step((roadmap) => ({ roadmap }));
+  assert.deepEqual(compute({ items: board.roadmapItems, merges: [later] }).cards.ship?.map((signal) => signal.kind), ["merged"]);
+  step((roadmap) => planMoveCard(roadmap, { cardId: "ship", status: "complete" }, { now: at() }));
+  step((roadmap) => planMoveCard(roadmap, { cardId: "ship", status: "in-progress" }, { now: at() }));
+  assert.equal(compute({ items: board.roadmapItems, merges: [later] }).cards.ship, undefined);
+});
+
+test("merged: a card written before progressNotedAt keeps its last update as the floor when touched", () => {
+  const old = item({ id: "legacy", nextAction: "Merge PR 7.", updatedAt: iso(NOW - 3 * DAY) });
+  const board = { ...createEmptyRoadmap({ repoId: "r", title: "R", now: iso(NOW - 3 * DAY) }), roadmapItems: [old] };
+  const touched = planUpdateCard(board, { cardId: "legacy", metadata: { a: 1 } }, { now: iso(NOW - DAY) }).roadmap.roadmapItems;
+  assert.equal(touched[0]!.progressNotedAt, iso(NOW - 3 * DAY));
+  assert.deepEqual(compute({ items: touched, merges: [{ pr: 7, mergedAt: iso(NOW - 2 * DAY) }] }).cards.legacy?.map((signal) => signal.kind), ["merged"]);
+});
+
+test("quiet: a real update clears it, a metadata-only one included", () => {
+  const board = { ...createEmptyRoadmap({ repoId: "r", title: "R", now: iso(NOW - 9 * DAY) }), roadmapItems: [item({ id: "q", updatedAt: iso(NOW - 9 * DAY) })] };
+  assert.deepEqual(compute({ items: board.roadmapItems }).cards.q?.map((signal) => signal.kind), ["quiet"]);
+  const updated = planUpdateCard(board, { cardId: "q", metadata: { checked: true } }, { now: iso(NOW - 1000) }).roadmap.roadmapItems;
+  assert.equal(compute({ items: updated }).cards.q, undefined);
+});
+
+test("large-doc: a Spec or Plan over 100 KB says rewrite, don't append", () => {
+  assert.equal(largeDocNote("plan", LARGE_DOC_BYTES), null);
+  assert.equal(largeDocNote("plan", 150 * 1024), "Plan is 150 KB; rewrite it to the current state, don't append");
+  const result = compute({
+    items: [item({ id: "big", updatedAt: iso(NOW - 1000) }), item({ id: "small", updatedAt: iso(NOW - 1000) })],
+    docMtimes: [
+      { cardId: "big", kind: "spec", mtimeMs: NOW - 2000, bytes: 120 * 1024 },
+      { cardId: "small", kind: "plan", mtimeMs: NOW - 2000, bytes: 20 * 1024 },
+    ],
+  });
+  assert.deepEqual(result.cards.big, [{ kind: "large-doc", detail: "Spec is 120 KB; rewrite it to the current state, don't append", since: iso(NOW - 2000) }]);
+  assert.equal(result.cards.small, undefined);
+  assert.equal(stalenessAttention(result, [item({ id: "big" })]).total, 1, "agents are asked to fix it");
+});
+
 test("doc-edited: a doc changed outside Planban after its last tool write and the card's update", () => {
   const lastWrite = NOW - 3 * DAY;
   const history = [{ createdAt: iso(lastWrite), affectedCards: ["a", "b", "c"], affectedDocs: [
@@ -174,7 +243,7 @@ test("group-behind: a Group updated more than a day before a child", () => {
   assert.equal(result.cards.group?.some((signal) => signal.kind === "quiet"), false, "Groups are never quiet");
 });
 
-test("wip is reported above twelve In Progress Items, and attention is capped and ordered", () => {
+test("wip is reported above twelve In Progress Items, and attention lists every card in order", () => {
   const items = Array.from({ length: 13 }, (_, index) => item({ id: `card-${index}`, updatedAt: iso(NOW - (index < 11 ? 7 : 1) * DAY) }));
   items.push(item({ id: "merged-card", status: "up-next", summary: "PR 9", updatedAt: iso(NOW - DAY) }));
   items.push(item({ id: "owner-card", status: "up-next", nextAction: "Owner: review", updatedAt: iso(NOW - DAY) }));
@@ -182,18 +251,19 @@ test("wip is reported above twelve In Progress Items, and attention is capped an
   assert.deepEqual(staleness.wip, { count: 13, threshold: 12 });
   const attention = stalenessAttention(staleness, items);
   assert.equal(attention.total, 12);
-  assert.equal(attention.cards.length, 10);
+  assert.equal(attention.cards.length, 12, "the full list, never capped");
   assert.equal(attention.cards[0]?.id, "merged-card");
   assert.equal(attention.awaitingOwner, 1);
   assert.equal(attention.cards.some((card) => card.id === "owner-card"), false, "awaiting-owner alone is not stale");
   assert.match(stalenessLine(attention) ?? "", /^12 active cards look stale \(merged-card, card-0, .*\+7 more\); fix any you touch\. 13 Items are In Progress \(over 12\)\.$/u);
+  assert.match(stalenessLine(attention, "planban_status") ?? "", /\+7 more; planban_status lists them all\); fix any you touch\./u);
   assert.equal(stalenessLine(stalenessAttention(compute({ items: [] }), [])), null);
   assert.equal(compute({ items: items.slice(0, 12) }).wip, null);
 });
 
 test("chip labels are short", () => {
   assert.equal(stalenessChipLabel({ kind: "awaiting-owner", detail: "", since: iso(NOW) }), "Needs you");
-  for (const kind of ["merged", "doc-edited", "quiet", "group-behind"] as const) {
+  for (const kind of ["merged", "doc-edited", "quiet", "group-behind", "large-doc"] as const) {
     assert.equal(stalenessChipLabel({ kind, detail: "", since: iso(NOW) }), null, kind);
   }
 });

@@ -63,7 +63,7 @@ export async function planbanStalenessLine({ projectDir: requestedDir }) {
     const { projectStaleness } = await import(pathToFileURL(join(runtimeRoot, "src/core/stalenessSources.ts")).href);
     const { stalenessAttention, stalenessLine } = await import(pathToFileURL(join(runtimeRoot, "src/core/staleness.ts")).href);
     const board = await projectStaleness(projectDir);
-    return board ? stalenessLine(stalenessAttention(board.staleness, board.items)) : null;
+    return board ? stalenessLine(stalenessAttention(board.staleness, board.items), "planban_status") : null;
   })().catch(() => null);
   let timer;
   const timeout = new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout(null), STALENESS_BUDGET_MS); });

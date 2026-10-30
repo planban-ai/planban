@@ -8,6 +8,7 @@
 import { ConvexError } from "convex/values";
 import { sectionList } from "../../../../src/core/docSections";
 import { PLANBAN_STATUSES, type PlanbanDocPayload, type PlanbanHistoryPayload, type PlanbanRoadmap } from "../../../../src/core/types";
+import { largeDocNote } from "../../../../src/core/staleness";
 import { cardAncestry } from "../../../../src/core/boardOperations";
 import { queryWorkItems, type WorkItemQuery } from "../../../../src/core/workItemQuery";
 import { internal } from "../_generated/api";
@@ -523,8 +524,9 @@ async function callTool(service: McpService, origin: string, name: string, args:
     case "planban_read_doc": {
       const doc = await service.readDoc(stringArg(args, "boardId"), stringArg(args, "cardId"), args.kind === "plan" ? "plan" : "spec");
       await service.notePresence(stringArg(args, "boardId"), stringArg(args, "cardId"));
-      // Each section's own version, for planban_write_doc_section.
-      return { ...doc, sections: sectionList(doc.markdown) };
+      // Each section's own version, for planban_write_doc_section; and, past 100 KB, rewrite rather than append.
+      const sizeNote = doc.exists ? largeDocNote(doc.kind, new TextEncoder().encode(doc.markdown).length) : null;
+      return { ...doc, sections: sectionList(doc.markdown), ...(sizeNote ? { note: `${sizeNote}.` } : {}) };
     }
     case "planban_history": {
       const history = await service.history(stringArg(args, "boardId"));

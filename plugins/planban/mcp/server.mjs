@@ -34,7 +34,7 @@ const { PLANBAN_STATUSES } = typesModule;
 const { queryWorkItems } = queryModule;
 const { ensureDemoBoard } = demoModule;
 const { PLANBAN_MCP_VERSION } = versionModule;
-const { stalenessAttention, stalenessLine } = stalenessModule;
+const { largeDocNote, stalenessAttention, stalenessLine } = stalenessModule;
 const { collectStaleness, projectStaleness } = stalenessSourcesModule;
 const { HOW_TO_REFER } = contentRulesModule;
 const { moveFilesOut } = moveFilesOutModule;
@@ -297,6 +297,13 @@ async function boardStaleness(state) {
 
 function withLine(text, line) {
   return line ? `${text}\n${line}` : text;
+}
+
+// A Spec or Plan over 100 KB is being appended to; say so whenever an agent reads or writes it.
+function docSizeLine(payload) {
+  if (typeof payload?.markdown !== "string" || (payload.kind !== "spec" && payload.kind !== "plan")) return null;
+  const note = largeDocNote(payload.kind, Buffer.byteLength(payload.markdown, "utf8"));
+  return note ? `${note}.` : null;
 }
 
 function signalsLine(signals) {
@@ -891,7 +898,7 @@ async function callToolImpl(name, args) {
     const attention = board ? stalenessAttention(board.staleness, board.items) : null;
     const goals = status.initialized ? await readGoalsBlock(status.cwd) : null;
     return await boardResult(
-      withLine(withLine(status.initialized ? `Planban is initialized for ${status.cwd}.` : `Planban is not initialized for ${status.cwd}.`, attention && stalenessLine(attention)), goals),
+      withLine(withLine(status.initialized ? `Planban is initialized for ${status.cwd}.` : `Planban is not initialized for ${status.cwd}.`, attention && stalenessLine(attention, "attention in this result")), goals),
       status.initialized ? status.repoId : null,
       // The Planban accounts signed in on this computer and which boards use each (emails only).
       { ...status, ...(attention ? { attention } : {}), ...(goals ? { goals } : {}), onlineAccounts: await accountsModule.listAccounts().catch(() => []) },
@@ -945,7 +952,7 @@ async function callToolImpl(name, args) {
     // A board using features this Planban can't show: say so plainly, and how to update.
     const behind = state.planbanBehind ? `${state.planbanBehind.notice} ${UPDATE_HOW}` : null;
     return await boardResult(
-      withLine(withLine(withLine(`Loaded Planban board ${state.manifest.repoId} at revision ${state.roadmap.revision}.`, behind), goals), stalenessLine(attention)),
+      withLine(withLine(withLine(`Loaded Planban board ${state.manifest.repoId} at revision ${state.roadmap.revision}.`, behind), goals), stalenessLine(attention, "attention in this result")),
       state.manifest.repoId,
       { ...summarizeBoard(state), attention, ...(goals ? { goals } : {}), ...(behind ? { planbanBehind: { ...state.planbanBehind, notice: behind } } : {}) },
     );
@@ -1072,7 +1079,7 @@ async function callToolImpl(name, args) {
     });
     void notePresence({ cwd, cardId: payload.cardId, agentName: clientAgentName ?? undefined }).catch(() => undefined);
     return textResult(
-      payload.exists ? `Read ${payload.kind} document for ${payload.cardId}.` : `No ${payload.kind} document exists for ${payload.cardId}.`,
+      payload.exists ? withLine(`Read ${payload.kind} document for ${payload.cardId}.`, docSizeLine(payload)) : `No ${payload.kind} document exists for ${payload.cardId}.`,
       payload,
     );
   }
@@ -1223,7 +1230,7 @@ async function callToolImpl(name, args) {
         affectedDocs: [{ cardId, kind, path: `items/${cardId}/${kind}.md` }],
       },
     });
-    return await boardResult(`Wrote ${payload.kind} document for ${payload.cardId}.`, repoIdFromCwd(cwd), { ...payload, doc: payload });
+    return await boardResult(withLine(`Wrote ${payload.kind} document for ${payload.cardId}.`, docSizeLine(payload)), repoIdFromCwd(cwd), { ...payload, doc: payload });
   }
 
   if (name === "planban_write_doc_section") {
@@ -1236,7 +1243,7 @@ async function callToolImpl(name, args) {
       expectedSectionVersion: expected, markdown: requireText(args.markdown, "markdown"), after: optionalString(args.after, "after"),
       actor: "agent", idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
     });
-    return await boardResult(`Wrote the "${args.heading}" section of the ${payload.kind} for ${payload.cardId}.`, repoIdFromCwd(cwd), { ...payload, doc: payload });
+    return await boardResult(withLine(`Wrote the "${args.heading}" section of the ${payload.kind} for ${payload.cardId}.`, docSizeLine(payload)), repoIdFromCwd(cwd), { ...payload, doc: payload });
   }
 
   if (name === "planban_move_files_out") {
