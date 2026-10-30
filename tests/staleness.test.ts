@@ -302,6 +302,46 @@ test("a 404 from a repository the account can't see is reported, not read as no 
   });
 });
 
+test("repositories take turns across calls, oldest due first, so the twenty-first isn't starved", async () => {
+  await withPlanbanHome(async () => {
+    const keys = Array.from({ length: 21 }, (_, index) => `org/repo${index + 1}#1`);
+    const github = fakeGitHub(new Map(keys.map((key) => [key, null])));
+    const first = await githubMerges(refs(...keys), { now: NOW, exec: github.exec });
+    assert.equal(github.asked.length, 20);
+    assert.ok(!github.asked.includes("org/repo21#1"));
+    assert.match(first.notes.join(" "), /^1 merge check was deferred/u);
+    github.asked.length = 0;
+    await githubMerges(refs(...keys), { now: NOW + 61_000, exec: github.exec });
+    assert.equal(github.asked[0], "org/repo21#1", "the repository waiting longest goes first");
+  });
+});
+
+test("hung repositories can't use up a call's time: each request gets a third of it", async () => {
+  await withPlanbanHome(async () => {
+    const hung = ["h1/r#1", "h2/r#1", "h3/r#1", "h4/r#1"];
+    const exec = async (_command: string, args: string[]) => {
+      const path = args.find((arg) => arg.startsWith("repos/"))!;
+      if (!path.startsWith("repos/ok/")) return new Promise<string>(() => undefined);
+      return JSON.stringify({ number: 1, merged_at: iso(NOW - DAY) });
+    };
+    const started = Date.now();
+    const result = await githubMerges(refs(...hung, "ok/r#1"), { now: NOW, exec, deadlineMs: 900 });
+    assert.ok(Date.now() - started < 1_500);
+    assert.deepEqual(prsOf(result), ["ok/r#1"], "the healthy repository is still checked");
+    assert.match(result.notes.join(" "), /^4 merge checks were deferred/u);
+  });
+});
+
+test("access checks count toward a call's request limit", async () => {
+  await withPlanbanHome(async () => {
+    const keys = Array.from({ length: 20 }, (_, index) => `org/repo${index + 1}#404`);
+    const github = fakeGitHub(new Map());
+    const result = await githubMerges(refs(...keys), { now: NOW, exec: github.exec });
+    assert.equal(github.asked.length, 20, "pull requests and repositories together");
+    assert.match(result.notes.join(" "), /merge checks were deferred/u);
+  });
+});
+
 test("GitHub's rate limit pauses that repository's lookups, and the pause is said", async () => {
   await withPlanbanHome(async () => {
     const github = fakeGitHub(new Map([["o/r#1", null], ["acme/site#2", iso(NOW - DAY)]]), { fail: new Map([["o/r#1", "gh: API rate limit exceeded for user ID 1. (HTTP 403)"]]) });
@@ -361,7 +401,7 @@ test("a process writing while another looks up: both answers are kept, and nothi
     const fast = ["o/r#11", "o/r#12", "o/r#13"];
     // The slow one reads the memory first and writes last, after the fast one has written.
     await Promise.all([
-      childLookup(home, { keys: slow, merged: slow, delayMs: 2_000, now: NOW }),
+      childLookup(home, { keys: slow, merged: slow, delayMs: 2_000, now: NOW, deadlineMs: 9_000 }),
       childLookup(home, { keys: fast, merged: fast, now: NOW }),
     ]);
     const github = fakeGitHub(new Map());

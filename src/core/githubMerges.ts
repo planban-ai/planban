@@ -146,7 +146,10 @@ const TIMED_OUT = Symbol("timed out");
 export async function githubMerges(refs: GitHubRef[], options: { now?: number; exec?: Run; deadlineMs?: number } = {}): Promise<GitHubMerges> {
   const now = options.now ?? Date.now();
   const exec = options.exec ?? ghRunner;
-  const deadline = Date.now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
+  const budgetMs = options.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  const deadline = Date.now() + budgetMs;
+  // One request gets at most a third of the call's time, so a hung repository can't use it all.
+  const requestMs = Math.max(1, Math.floor(budgetMs / 3));
   const wanted = [...new Map(refs.map((ref) => [keyOf(ref), ref])).values()];
   const memory = await readMemory();
   const answers: Memory = { version: 5, prs: {}, retryAfter: {} };
@@ -162,17 +165,24 @@ export async function githubMerges(refs: GitHubRef[], options: { now?: number; e
     const wait = known.failures ? Math.min(2 ** known.failures * MINUTE, MAX_RETRY_WAIT_MS) : ASK_AGAIN_MS;
     return now - time(known.askedAt) >= wait;
   });
-  // Each repository in turn, longest since asked first within each.
+  // Each repository in turn, the one whose oldest due check has waited longest first, and the
+  // longest since asked first within each: across calls, every repository gets its turn.
+  const askedAt = (ref: GitHubRef) => time(memory.prs[keyOf(ref)]?.askedAt);
   const byRepo = new Map<string, GitHubRef[]>();
   for (const ref of due) byRepo.set(ref.repo.toLowerCase(), [...(byRepo.get(ref.repo.toLowerCase()) ?? []), ref]);
-  for (const list of byRepo.values()) list.sort((a, b) => time(memory.prs[keyOf(a)]?.askedAt) - time(memory.prs[keyOf(b)]?.askedAt));
+  for (const list of byRepo.values()) list.sort((a, b) => askedAt(a) - askedAt(b));
+  const repos = [...byRepo.values()].sort((a, b) => askedAt(a[0]!) - askedAt(b[0]!));
   const queue: GitHubRef[] = [];
-  for (let round = 0; queue.length < due.length; round += 1) for (const list of byRepo.values()) if (list[round]) queue.push(list[round]!);
+  for (let round = 0; queue.length < due.length; round += 1) for (const list of repos) if (list[round]) queue.push(list[round]!);
 
-  // One request: stops at its own timeout or the call's deadline, whichever is first, even if gh hangs.
+  // One request, counted against the call's limit (access checks included): stops at its own
+  // timeout or the call's deadline, whichever is first, even if gh hangs. TIMED_OUT also means
+  // the limit left no room for it; either way, what it was for is deferred.
+  let requests = 0;
   const ask = async (args: string[]): Promise<string | typeof TIMED_OUT> => {
-    const left = deadline - Date.now();
-    if (left <= 0) return TIMED_OUT;
+    const left = Math.min(deadline - Date.now(), requestMs);
+    if (left <= 0 || requests >= REQUESTS_PER_CALL) return TIMED_OUT;
+    requests += 1;
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<typeof TIMED_OUT>((resolveTimeout) => { timer = setTimeout(() => { controller.abort(); resolveTimeout(TIMED_OUT); }, left); });
@@ -228,11 +238,13 @@ export async function githubMerges(refs: GitHubRef[], options: { now?: number; e
       answers.prs[key] = { askedAt: at, failures, failure };
     }
   };
-  const batch = queue.slice(0, REQUESTS_PER_CALL);
-  for (let start = 0; start < batch.length; start += PARALLEL_REQUESTS) {
-    await Promise.all(batch.slice(start, start + PARALLEL_REQUESTS).map(lookUp));
+  let next = 0;
+  while (next < queue.length && requests < REQUESTS_PER_CALL && Date.now() < deadline) {
+    const group = queue.slice(next, next + Math.min(PARALLEL_REQUESTS, REQUESTS_PER_CALL - requests));
+    next += group.length;
+    await Promise.all(group.map(lookUp));
   }
-  const deferred = unchecked.length + (queue.length - batch.length);
+  const deferred = unchecked.length + (queue.length - next);
   await saveMemory(answers).catch(() => undefined);
 
   const known = mergeMemory(memory, answers);
