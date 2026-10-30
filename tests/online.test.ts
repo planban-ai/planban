@@ -740,14 +740,14 @@ test("an Online Board shows freshness warnings everywhere a local one does, with
     await takeOnline(fake.url, cwd);
     await new Promise((resolve) => setTimeout(resolve, 20));
     const mergedAt = new Date(Date.now() - 5).toISOString();
-    await fakeGh(() => JSON.stringify([{ number: 41, merged_at: mergedAt, updated_at: mergedAt }, { number: 40, merged_at: null, updated_at: mergedAt }]));
+    await fakeGh(() => JSON.stringify({ number: 41, merged_at: mergedAt }));
 
     // planban_status and the session-start hook read the board from the service, not a local file.
     const board = await projectStaleness(cwd);
     assert.deepEqual(board?.staleness.cards.alpha?.map((signal) => signal.kind), ["merged"]);
     assert.deepEqual(board?.staleness.cards["sign-off"]?.map((signal) => signal.kind), ["awaiting-owner"]);
     assert.equal(board?.staleness.notes, undefined);
-    assert.deepEqual(ghCalls[0]!.slice(0, 4), ["api", "--method", "GET", "repos/example/demo/pulls"]);
+    assert.deepEqual(ghCalls.map((args) => args.slice(0, 4)), [["api", "--method", "GET", "repos/example/demo/pulls/41"]], "only the PR a card names is asked about");
     clearStalenessCaches();
     assert.equal(await planbanStalenessLine({ projectDir: cwd }), "1 active card looks stale (alpha); fix any you touch.");
 

@@ -9,7 +9,7 @@ import { cardsHoldingFiles } from "./cardFiles";
 import { clearGitHubMergeCache, githubMerges, githubRepoFor } from "./githubMerges";
 import { boardPath, onlineRequest } from "./online/client";
 import { defaultPlanningRoot, expandHome, historyIndexPath, resolveInsideRoot, roadmapPath } from "./paths";
-import { cardPrNumbers, computeStaleness, parseMergeLog, progressFloor, type BoardStaleness, type DocMtime, type MergeRecord } from "./staleness";
+import { cardPrNumbers, computeStaleness, parseMergeLog, type BoardStaleness, type DocMtime, type MergeRecord } from "./staleness";
 import type { PlanbanHistoryEntry, PlanbanHistoryPayload, PlanbanProjectManifest, PlanbanRoadmap, PlanbanRoadmapItem } from "./types";
 
 type Storage = PlanbanProjectManifest["storage"];
@@ -101,23 +101,22 @@ async function readOnlineHistoryRows(storage: OnlineStorage): Promise<HistoryRow
 }
 
 /**
- * Merges for an Online Board: this checkout's git log plus GitHub, read back to the oldest active
- * card that names a PR. No card naming a PR means no GitHub read at all.
+ * Merges for an Online Board: this checkout's git log plus GitHub, asked about each PR an active
+ * card names that the log doesn't already show merged. No card naming a PR means no GitHub read.
  */
 async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: number): Promise<{ merges: MergeRecord[]; notes: string[] }> {
-  const floors = items
-    .filter((item) => (item.status === "in-progress" || item.status === "up-next") && cardPrNumbers(item).length > 0)
-    .map((item) => progressFloor(item))
-    .filter((at): at is number => at !== null);
-  const local = cachedMergeLog(cwd, now);
-  if (!floors.length) return { merges: await local, notes: [] };
+  const named = [...new Set(items
+    .filter((item) => item.status === "in-progress" || item.status === "up-next")
+    .flatMap((item) => cardPrNumbers(item)))];
+  const local = await cachedMergeLog(cwd, now);
+  if (!named.length) return { merges: local, notes: [] };
   const repo = await githubRepoFor(cwd);
   if (!repo) {
-    return { merges: await local, notes: ["Merged-PR warnings use only this computer's git history: this project has no GitHub origin remote."] };
+    return { merges: local, notes: ["Merged-PR warnings use only this computer's git history: this project has no GitHub origin remote."] };
   }
-  const [known, github] = await Promise.all([local, githubMerges(repo, Math.min(...floors), { now })]);
-  // GitHub is the record; the local log fills in only what GitHub didn't answer.
-  const byPr = new Map(known.map((merge) => [merge.pr, merge]));
+  const seenHere = new Set(local.map((merge) => merge.pr));
+  const github = await githubMerges(repo, named.filter((pr) => !seenHere.has(pr)), { now });
+  const byPr = new Map(local.map((merge) => [merge.pr, merge]));
   for (const merge of github.merges) byPr.set(merge.pr, merge);
   return { merges: [...byPr.values()], notes: github.note ? [github.note] : [] };
 }

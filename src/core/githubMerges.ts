@@ -1,7 +1,12 @@
 // Merged pull requests from GitHub, for Online Boards worked on from several computers: a merge
 // made anywhere counts, not just ones this checkout has fetched. Read with the GitHub CLI (`gh`)
 // and whatever account it is signed in to; Planban stores no GitHub token. Best effort: when gh is
-// missing, signed out or GitHub can't be reached, the last merges seen here are used with a note.
+// missing, signed out or GitHub can't be reached, the merges already seen here are used with a note.
+//
+// Planban asks about the pull requests cards name, one by number, rather than paging through
+// GitHub's lists: positions in a list shift whenever a pull request changes, but a number doesn't,
+// and a merge never un-happens. A pull request seen merged is kept for good; one still open, or a
+// number that isn't a pull request, is asked about again on later checks.
 import { execFile } from "node:child_process";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -11,30 +16,24 @@ import type { MergeRecord } from "./staleness";
 const GIT_TIMEOUT_MS = 2_000;
 const GH_TIMEOUT_MS = 2_000;
 const REFRESH_AFTER_MS = 60_000;
-const PER_PAGE = 100;
-const MAX_PAGES = 5;
-// A merge can land a moment before GitHub's list shows it; each read overlaps the last by this much.
-const CURSOR_OVERLAP_MS = 10 * 60 * 1000;
+/** Pull requests asked about in one check; more are asked about on the next, oldest-asked first. */
+export const LOOKUPS_PER_CHECK = 20;
+const PARALLEL_LOOKUPS = 4;
 
 export interface GitHubMerges {
   merges: MergeRecord[];
-  /** Set when the merges could not be brought up to date, saying why in plain words. */
+  /** Set when the merges could not be brought fully up to date, saying why in plain words. */
   note?: string | undefined;
 }
 
 interface MergeCache {
-  version: 2;
+  version: 3;
   repo: string;
-  /** Every merge updated between scannedFrom and cursor has been seen. */
-  scannedFrom: string;
-  cursor: string;
-  /**
-   * Where reading older history resumes, while scannedFrom is still newer than the oldest card
-   * needs: the page of GitHub's list, newest first, that held scannedFrom.
-   */
-  resumePage: number;
-  checkedAt: string;
+  /** Pull requests seen merged, by number. Permanent: a merge never un-happens. */
   merges: MergeRecord[];
+  /** When each other named number was last asked about (still open, or not a pull request). */
+  askedAt: Record<string, string>;
+  checkedAt: string;
 }
 
 export type Run = (command: string, args: string[], options: { cwd?: string; timeout: number }) => Promise<string>;
@@ -66,7 +65,7 @@ function cachePath(repo: string) {
 async function readCache(repo: string): Promise<MergeCache | null> {
   try {
     const cache = JSON.parse(await readFile(cachePath(repo), "utf8")) as MergeCache;
-    return cache.version === 2 && cache.repo === repo && Array.isArray(cache.merges) ? cache : null;
+    return cache.version === 3 && cache.repo === repo && Array.isArray(cache.merges) && typeof cache.askedAt === "object" ? cache : null;
   } catch {
     return null;
   }
@@ -80,54 +79,6 @@ async function writeCache(cache: MergeCache) {
   await rename(temp, path);
 }
 
-interface PullRow { number: number; merged_at: string | null; updated_at: string }
-
-interface PageScan {
-  merges: MergeRecord[];
-  /** Whether the scan got back to the time it was asked for, or to the end of the list. */
-  reached: boolean;
-  /** The oldest update time read. */
-  oldest: number;
-  /** The page holding `oldest`, where a later scan resumes. */
-  lastPage: number;
-}
-
-function readPage(repo: string, page: number, exec: Run): Promise<PullRow[]> {
-  return exec("gh", ["api", "--method", "GET", `repos/${repo}/pulls`, "-f", "state=closed", "-f", "sort=updated", "-f", "direction=desc",
-    "-f", `per_page=${PER_PAGE}`, "-f", `page=${page}`, "--jq", "[.[] | {number, merged_at, updated_at}]"], { timeout: GH_TIMEOUT_MS })
-    .then((text) => JSON.parse(text) as PullRow[]);
-}
-
-/**
- * Reads GitHub's closed pull requests, newest update first, from `startPage` until updates pass
- * `stopAt`, reading at most MAX_PAGES pages. A PR's last update is never before its merge, so once
- * updates pass a time, so have merges.
- *
- * Resuming older history (`continueFrom` set) starts one page back and checks that page still
- * holds something updated at or after that time: pull requests updated since move to the top and
- * shift the rest up, so this proves no row slipped past between the two reads.
- */
-async function scanPages(repo: string, exec: Run, startPage: number, stopAt: number, continueFrom?: number): Promise<PageScan> {
-  const merges: MergeRecord[] = [];
-  let page = continueFrom === undefined ? startPage : Math.max(1, startPage - 1);
-  let oldest = Infinity;
-  let checking = continueFrom !== undefined;
-  for (let read = 0; read < MAX_PAGES; read += 1) {
-    const rows = await readPage(repo, page, exec);
-    if (checking && page > 1 && !rows.some((row) => Date.parse(row.updated_at) >= continueFrom!)) {
-      page -= 1;
-      continue;
-    }
-    checking = false;
-    for (const row of rows) if (row.merged_at) merges.push({ pr: row.number, mergedAt: row.merged_at });
-    const last = rows.at(-1);
-    if (last) oldest = Math.min(oldest, Date.parse(last.updated_at));
-    if (rows.length < PER_PAGE || oldest < stopAt) return { merges, reached: true, oldest, lastPage: page };
-    page += 1;
-  }
-  return { merges, reached: false, oldest, lastPage: page - 1 };
-}
-
 function why(error: unknown): string {
   const code = (error as NodeJS.ErrnoException)?.code;
   const stderr = String((error as { stderr?: unknown })?.stderr ?? "");
@@ -137,7 +88,22 @@ function why(error: unknown): string {
   return "GitHub couldn't be reached";
 }
 
-const memory = new Map<string, { at: number; result: Promise<GitHubMerges> }>();
+/** GitHub's answer for a number that isn't a pull request in this repository. */
+const notFound = (error: unknown) => /HTTP 404|Not Found/u.test(String((error as { stderr?: unknown })?.stderr ?? ""));
+
+/** One pull request's merge time, or null when it isn't merged or isn't a pull request. */
+async function lookUp(repo: string, pr: number, exec: Run): Promise<string | null> {
+  try {
+    const text = await exec("gh", ["api", "--method", "GET", `repos/${repo}/pulls/${pr}`, "--jq", "{number, merged_at}"], { timeout: GH_TIMEOUT_MS });
+    const row = JSON.parse(text) as { number?: unknown; merged_at?: unknown };
+    return typeof row.merged_at === "string" && Number.isFinite(Date.parse(row.merged_at)) ? row.merged_at : null;
+  } catch (error) {
+    if (notFound(error)) return null;
+    throw error;
+  }
+}
+
+const memory = new Map<string, { at: number; key: string; result: Promise<GitHubMerges> }>();
 
 export function clearGitHubMergeCache() {
   memory.clear();
@@ -154,62 +120,52 @@ export function useGitHubRunner(exec?: Run) {
 }
 
 /**
- * Merged PRs for `repo` from `since` on, merged with what earlier reads saw. Each check reads what
- * changed since the last one, then, while older history is still unread, continues it from where
- * the last check stopped: a busy repository is covered over a few checks, never skipped. Refreshes
- * at most once a minute per process; the position and merges persist between processes, so a
- * short-lived hook can still answer when GitHub can't.
+ * Which of the pull requests `prs` (the numbers active cards name) have merged, with when. Asks
+ * GitHub only about numbers not already seen merged, at most LOOKUPS_PER_CHECK a check, those
+ * never asked about first and then the longest since asked. Refreshes at most once a minute per
+ * process; what was learned persists between processes, so a short-lived hook can still answer
+ * when GitHub can't.
  */
-export function githubMerges(repo: string, since: number, options: { now?: number; exec?: Run } = {}): Promise<GitHubMerges> {
+export function githubMerges(repo: string, prs: number[], options: { now?: number; exec?: Run } = {}): Promise<GitHubMerges> {
   const now = options.now ?? Date.now();
+  const named = [...new Set(prs.filter((pr) => Number.isInteger(pr) && pr > 0))];
+  const key = named.sort((a, b) => a - b).join(",");
   const cached = memory.get(repo);
-  if (cached && now - cached.at < REFRESH_AFTER_MS) return cached.result;
+  if (cached && cached.key === key && now - cached.at < REFRESH_AFTER_MS) return cached.result;
   const result = (async (): Promise<GitHubMerges> => {
     const saved = await readCache(repo);
     const exec = options.exec ?? ghRunner;
+    const merged = new Map((saved?.merges ?? []).map((merge) => [merge.pr, merge]));
+    const askedAt: Record<string, string> = { ...(saved?.askedAt ?? {}) };
+    const known = () => named.flatMap((pr) => merged.get(pr) ?? []);
+    const open = named.filter((pr) => !merged.has(pr));
+    const order = (pr: number) => askedAt[pr] ? Date.parse(askedAt[pr]!) : -Infinity;
+    const batch = [...open].sort((a, b) => order(a) - order(b)).slice(0, LOOKUPS_PER_CHECK);
     try {
-      const byPr = new Map((saved?.merges ?? []).map((merge) => [merge.pr, merge]));
-      const keep = (scan: PageScan) => { for (const merge of scan.merges) byPr.set(merge.pr, merge); };
-      // A first check reads from the top; later ones resume older history where the last stopped.
-      let scannedFrom: number | null = null;
-      let resumePage = 1;
-      if (saved) {
-        // What changed since the last check.
-        const recent = await scanPages(repo, exec, 1, Date.parse(saved.cursor) - CURSOR_OVERLAP_MS);
-        keep(recent);
-        if (recent.reached) {
-          scannedFrom = Date.parse(saved.scannedFrom);
-          resumePage = saved.resumePage;
-        } else {
-          // More changed than one read holds: what was read before is no longer joined up to now.
-          scannedFrom = recent.oldest;
-          resumePage = recent.lastPage;
-        }
+      for (let start = 0; start < batch.length; start += PARALLEL_LOOKUPS) {
+        const group = batch.slice(start, start + PARALLEL_LOOKUPS);
+        const answers = await Promise.all(group.map((pr) => lookUp(repo, pr, exec)));
+        group.forEach((pr, index) => {
+          const mergedAt = answers[index];
+          if (mergedAt) {
+            merged.set(pr, { pr, mergedAt });
+            delete askedAt[pr];
+          } else askedAt[pr] = new Date(now).toISOString();
+        });
       }
-      if (scannedFrom === null || scannedFrom > since) {
-        const older = scannedFrom === null
-          ? await scanPages(repo, exec, 1, since)
-          : await scanPages(repo, exec, resumePage, since, scannedFrom);
-        keep(older);
-        scannedFrom = older.reached ? Math.min(since, older.oldest) : older.oldest;
-        resumePage = older.lastPage;
-      }
-      const merges = [...byPr.values()];
-      const at = new Date(now).toISOString();
-      await writeCache({ version: 2, repo, scannedFrom: new Date(scannedFrom).toISOString(), cursor: at, resumePage, checkedAt: at, merges }).catch(() => undefined);
-      if (scannedFrom <= since) return { merges };
-      return {
-        merges,
-        note: `Merged-PR warnings checked GitHub only back to ${new Date(scannedFrom).toISOString().slice(0, 10)} so far, as more pull requests changed than one check reads; later checks continue further back. Older merges may be missing.`,
-      };
     } catch (error) {
       const seen = saved ? ` since ${saved.checkedAt.slice(0, 10)}` : "";
-      return {
-        merges: saved?.merges ?? [],
-        note: `Merged-PR warnings may be missing merges${seen}: ${why(error)}. Only merges this computer already knows about are shown.`,
-      };
+      return { merges: known(), note: `Merged-PR warnings may be missing merges${seen}: ${why(error)}. Only merges this computer already knows about are shown.` };
     }
+    const at = new Date(now).toISOString();
+    await writeCache({ version: 3, repo, merges: [...merged.values()], askedAt, checkedAt: at }).catch(() => undefined);
+    const neverAsked = open.filter((pr) => !merged.has(pr) && !askedAt[pr]).length;
+    if (!neverAsked) return { merges: known() };
+    return {
+      merges: known(),
+      note: `Merged-PR warnings asked GitHub about ${named.length - neverAsked} of the ${named.length} pull requests cards name so far; the rest are asked about on the next checks.`,
+    };
   })();
-  memory.set(repo, { at: now, result });
+  memory.set(repo, { at: now, key, result });
   return result;
 }
