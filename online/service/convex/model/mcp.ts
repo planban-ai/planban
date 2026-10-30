@@ -512,8 +512,9 @@ async function callTool(service: McpService, origin: string, name: string, args:
       const freshness = boardOnlyStaleness(roadmap.roadmapItems, Date.now());
       return {
         revision: roadmap.revision, card, ancestry: cardAncestry(roadmap, cardId),
-        // The note only for a card that names a PR, whose merge this view can't check.
-        staleness: freshness.cards[cardId] ?? [], ...(freshness.notes?.length && cardPrNumbers(card).length ? { stalenessNote: freshness.notes.join(" ") } : {}),
+        // The note only for an active card that names a PR, whose merge this view can't check.
+        staleness: freshness.cards[cardId] ?? [],
+        ...(freshness.notes?.length && (card.status === "in-progress" || card.status === "up-next") && cardPrNumbers(card).length ? { stalenessNote: freshness.notes.join(" ") } : {}),
         ...(others.length ? { workingOn: others } : {}), ...(changes.length ? { unresolvedChanges: changes } : {}),
       };
     }

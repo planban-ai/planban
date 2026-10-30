@@ -56,6 +56,7 @@ test("the hosted tools show every freshness warning they can, and say merges are
     roadmapItems: [
       ...roadmap.roadmapItems,
       { id: "ship", title: "Ship it", status: "in-progress", summary: null, nextAction: "Merge PR 41.", tags: [], isGroup: false, parentId: null, priority: 2, updatedAt: week },
+      { id: "shipped", title: "Shipped", status: "complete", summary: "Landed in PR 40.", nextAction: null, tags: [], isGroup: false, parentId: null, priority: 1, updatedAt: week },
     ],
   };
   const hosted: any = { ...service, getBoard: async () => board, unresolved: async () => ({ changes: [] }), working: async () => ({ working: {} }), notePresence: async () => undefined };
@@ -71,6 +72,8 @@ test("the hosted tools show every freshness warning they can, and say merges are
   const card = await ask("planban_get_card", { boardId: "deadleg", cardId: "ship" });
   assert.deepEqual(card.staleness.map((signal: any) => signal.kind), ["quiet"]);
   assert.match(card.stalenessNote, /Merged-PR warnings aren't checked here/u);
+  const done = await ask("planban_get_card", { boardId: "deadleg", cardId: "shipped" });
+  assert.equal(done.stalenessNote, undefined, "a completed card gets no merged-PR note, even though it names a PR");
 });
 
 test("a remote refusal keeps its kind and the details to reconcile, as the local tools do", async () => {
