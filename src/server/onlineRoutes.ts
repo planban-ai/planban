@@ -71,6 +71,8 @@ function describeOutcome(kind: MoveJob["kind"], state: Awaited<ReturnType<typeof
     if (location === "online") return { unchanged: false, location, message: "The board is online. The last step, refreshing this Mac's backup copy, did not finish; it happens again automatically.", retry: null };
     if (!unfinished) return { unchanged: true, location, message: "Nothing has changed. The board is still on this Mac, you and your agents can keep editing, and the partial online copy has been removed.", retry: "Take online" };
     if (unfinished.phase === "committed") return { unchanged: false, location, message: "The board reached your Planban account, but this Mac has not switched to it yet. Try again to finish; nothing is lost either way.", retry: "Finish taking it online" };
+    // Shut here before the commit: whether the commit landed is unknown, so nobody can edit it on this Mac.
+    if (unfinished.phase === "sealing" || unfinished.phase === "sealed") return { unchanged: false, location, message: "The board is paused on this Mac, so nobody can change it here. Planban could not confirm whether it reached your Planban account. Try again to finish the move, or stop it to put the board back on this Mac as it was.", retry: "Continue" };
     return { unchanged: false, location, message: "The board is still on this Mac and nothing on it has changed, but the partial online copy could not be removed yet. Try again to continue the move, or stop it to remove the partial copy.", retry: "Continue" };
   }
   if (location === "local") return { unchanged: false, location, message: "The board is on this Mac. The online copy was not told the move finished yet; that happens the next time this Mac reaches it.", retry: null };

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { PlanbanConflictError } from "./boardOperations";
+import { PlanbanBoardMovedError, PlanbanConflictError } from "./boardOperations";
 
 export const LOCK_DIR = ".planban-write.lock";
 const IDEMPOTENCY_FILE = ".idempotency.json";
@@ -409,9 +409,16 @@ export async function runIdempotentBoardMutation<T>(input: {
   idempotencyKey?: string | undefined;
   scope: string;
   fingerprint: string;
+  /**
+   * Checked once the board is held, before the key is looked up or claimed:
+   * false when the board moved while this waited, so the key belongs with the
+   * board's new home (PlanbanBoardMovedError; nothing is recorded here).
+   */
+  stillHere?: () => Promise<boolean>;
   run: () => Promise<T>;
 }): Promise<{ replayed: boolean; value: T }> {
   return withBoardWriteLock(input.planningRoot, async () => {
+    if (input.stillHere && !(await input.stillHere())) throw new PlanbanBoardMovedError();
     const key = input.idempotencyKey?.trim();
     if (!key) return { replayed: false, value: await input.run() };
 

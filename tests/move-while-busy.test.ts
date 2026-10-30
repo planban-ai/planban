@@ -9,7 +9,9 @@ import test from "node:test";
 import * as storage from "../src/core/storage";
 import { onlineLogin } from "../src/core/online/login";
 import { resetCopyChecks } from "../src/core/online/copyCheck";
-import { takeOnline } from "../src/core/online/transfers";
+import { stopTakeOnline, takeOnline } from "../src/core/online/transfers";
+import { startServer } from "../src/server/server";
+import { createServer } from "node:http";
 import { serviceBridge } from "./service-bridge";
 
 let root: string;
@@ -145,4 +147,67 @@ test("Planban 1.x can neither read, write nor re-create the local copy after the
   assert.equal(await readFile(join(planningRoot(), "roadmap.json"), "utf8"), storage.RETIRED_ROADMAP);
   // The copy from before the move is still kept for recovery.
   assert.match(await readFile(join(planningRoot(), "ONLINE-BOARD.txt"), "utf8"), /Authority moved to/);
+});
+
+test("a local write that reaches the board's lock after the project already points online never runs locally", async () => {
+  const cwd = await localBoard("Alpha");
+  await takeOnline(bridge.url, cwd);
+  // The state a writer is in when the move finishes between its routing check and the lock:
+  // every read of the project now says online, yet it is on the local path.
+  let ran = false;
+  await assert.rejects(storage.withRoadmapWriteLock(cwd, async () => { ran = true; }), (error: unknown) => error instanceof storage.PlanbanBoardMovedError);
+  assert.equal(ran, false, "nothing ran against the local cache of the online board");
+});
+
+test("a move whose commit fails puts the board back on this machine, and local writes work again", async () => {
+  const cwd = await localBoard("Alpha");
+  bridge.control.intercept = async (path) => (path.endsWith("/commit") ? { status: 500, body: { error: { code: "internal", message: "commit failed" } } } : undefined);
+  await assert.rejects(takeOnline(bridge.url, cwd), /still on this machine, unchanged/);
+  bridge.control.intercept = undefined;
+  assert.equal((await storage.readManifest(cwd))?.storage?.kind ?? "local", "local");
+  const state = await storage.loadState(cwd);
+  await storage.updateCard({ cwd, cardId: "alpha", summary: "After the failed move", baseRevision: state.roadmap.revision });
+  assert.equal((await storage.loadState(cwd)).roadmap.roadmapItems[0]!.summary, "After the failed move");
+});
+
+test("while it is unknown whether the commit landed, every local writer stays shut out until the move is finished or stopped", async () => {
+  const cwd = await localBoard("Alpha");
+  const fail = { status: 500, body: { error: { code: "internal", message: "unreachable" } } };
+  bridge.control.intercept = async (path) => (path.endsWith("/commit") || path.endsWith("/abort") ? fail : undefined);
+  await assert.rejects(takeOnline(bridge.url, cwd));
+  // Planban 2.0 and 1.x alike are refused, loudly.
+  await assert.rejects(storage.createCard({ cwd, title: "Lost?" }), /moving online/);
+  await assert.rejects(legacy.load(planningRoot()), /Restart: Planban 2\.0/);
+  bridge.control.intercept = undefined;
+  assert.equal((await stopTakeOnline(cwd)).stopped, true);
+  const back = await storage.loadState(cwd);
+  assert.deepEqual(back.roadmap.roadmapItems.map((item) => item.title), ["Alpha"]);
+  await storage.createCard({ cwd, title: "After stopping" });
+});
+
+test("a board-page change queued behind the move is applied once, even when the page retries it with the same key", async () => {
+  const cwd = await localBoard("Alpha");
+  const reservation = createServer();
+  await new Promise<void>((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = (reservation.address() as any).port;
+  await new Promise<void>((resolve) => reservation.close(() => resolve()));
+  const server = await startServer({ cwd, port, useVite: false });
+  try {
+    const read = (await storage.loadState(cwd)).roadmap.revision;
+    const create = () => fetch(`${server.url}/api/cards`, {
+      method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "page-create-1" }, body: JSON.stringify({ title: "Beta", baseRevision: read }),
+    });
+    const { atCommit, release } = holdAtCommit();
+    const moving = takeOnline(bridge.url, cwd);
+    await atCommit;
+    const first = create();
+    await sleep(300);
+    release();
+    await moving;
+    assert.equal((await first).status, 200, await (await first).clone().text());
+    const retried = await create();
+    assert.equal(retried.status, 200);
+    const titles = (await storage.loadState(cwd)).roadmap.roadmapItems.map((item) => item.title);
+    assert.deepEqual(titles.filter((title) => title === "Beta"), ["Beta"], `applied once: ${titles.join(", ")}`);
+  } finally { await server.close(); }
 });

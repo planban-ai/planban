@@ -64,6 +64,7 @@ import { assertCompletionConfirmed,
   createEmptyRoadmap as createEmptyRoadmapAt,
   normalizeColumnPriorities,
   normalizeRoadmap,
+  PlanbanBoardMovedError,
   PlanbanConflictError,
   PlanbanNotFoundError,
   PlanbanValidationError,
@@ -84,6 +85,7 @@ export {
   cardAncestry,
   defaultColumns,
   normalizeRoadmap,
+  PlanbanBoardMovedError,
   PlanbanConflictError,
   PlanbanNotFoundError,
   PlanbanValidationError,
@@ -244,18 +246,6 @@ export async function refuseForOnline(cwd: string, operation: string) {
 
 export { RETIRED_ROADMAP } from "./paths";
 
-/**
- * A write waited for the board while it moved (Take Online or Take Local),
- * so it was not made where it was headed. Nothing was written. Writes that
- * can go to the board's new home are sent there again (againIfMoved).
- */
-export class PlanbanBoardMovedError extends PlanbanConflictError {
-  constructor() {
-    super("This board moved online while this change was waiting for it, so nothing was written to the copy on this computer. Make the change again: it will go to the online board.");
-    this.name = "PlanbanBoardMovedError";
-  }
-}
-
 /** Sends a write that met PlanbanBoardMovedError again, to wherever the board lives now. */
 export const againIfMoved = <T>(again: () => Promise<T>) => (error: unknown): Promise<T> =>
   error instanceof PlanbanBoardMovedError ? again() : Promise.reject(error);
@@ -266,17 +256,32 @@ export async function withRoadmapWriteLock<T>(cwdInput: string, callback: () => 
   if (!manifest || !manifest.enabled) {
     throw new Error(`Planban is not initialized in ${cwd}`);
   }
+  // Every caller is a local write. A project that points online now moved
+  // after the caller chose the local path: nothing may run against the
+  // online board's cache folder.
+  if (manifest.storage?.kind === "online") throw new PlanbanBoardMovedError();
   const planningRoot = resolvePlanningRoot(manifest);
-  if (manifest.storage?.kind !== "online") await guardLocalCopy(planningRoot, cwd, manifest.repoId);
+  await guardLocalCopy(planningRoot, cwd, manifest.repoId);
   // A card write takes the board first, before writing anything, so it can
   // give up cleanly if another process is stuck holding the board.
   return withBoardWriteLock(planningRoot, async () => {
     // The board may have moved while this write waited for it: the project
     // now points elsewhere, so nothing is written here.
-    const now = await readManifest(cwd);
-    if (!now?.enabled || resolvePlanningRoot(now) !== planningRoot) throw new PlanbanBoardMovedError();
+    if (!(await stillLocalAt(cwd, planningRoot))) throw new PlanbanBoardMovedError();
     return callback();
   }, { giveUp: true });
+}
+
+/** Where this project's board is kept on this computer (an online board's cache folder), or null. */
+export async function boardPlanningRoot(cwdInput: string): Promise<string | null> {
+  const manifest = await readManifest(resolveProjectCwd(cwdInput));
+  return manifest?.enabled ? resolvePlanningRoot(manifest) : null;
+}
+
+/** True while this project's board is a local board kept at planningRoot. */
+export async function stillLocalAt(cwd: string, planningRoot: string): Promise<boolean> {
+  const now = await readManifest(cwd);
+  return !!now?.enabled && now.storage?.kind !== "online" && resolvePlanningRoot(now) === planningRoot;
 }
 
 /**
@@ -331,6 +336,11 @@ export async function loadState(cwdInput: string): Promise<PlanbanResolvedState>
 /** Why a local board has no live roadmap; for one that moved online, where it went and how to follow it. */
 async function missingRoadmapMessage(cwd: string, planningRoot: string) {
   const missing = `Planban roadmap is missing at ${roadmapPath(planningRoot)}`;
+  // A Take Online that has not finished: the board here is shut until it is finished or stopped.
+  const moving = await readFile(join(planningRoot, "online-transfer.json"), "utf8").then((text) => JSON.parse(text) as { direction?: string; url?: string }, () => null);
+  if (moving?.direction === "online" && await isRetiredRoadmap(roadmapPath(planningRoot))) {
+    return `This board is partway through moving online${moving.url ? ` to ${moving.url}` : ""}, so it can't be changed on this computer: a change here would not reach the online board. Nothing was written. To finish the move, run: ${planbanCommand()} online take-online ${moving.url ?? "<url>"} --cwd "${cwd}". To cancel it instead: ${planbanCommand()} online stop-take-online --cwd "${cwd}".`;
+  }
   const note = await readFile(join(planningRoot, "ONLINE-BOARD.txt"), "utf8").catch(() => null);
   if (note === null && !(await isRetiredRoadmap(roadmapPath(planningRoot)))) return missing;
   const moved = /Authority moved to (\S+), board ([^\s.]+)\./.exec(note ?? "");

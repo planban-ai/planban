@@ -33,7 +33,9 @@ import {
   touchBoard,
 } from "../core/registry";
 import {
+  boardPlanningRoot,
   getStatus,
+  PlanbanBoardMovedError,
   initializeProject,
   loadState,
   readManifest,
@@ -66,6 +68,7 @@ import {
   reconstructHierarchy,
 } from "../core/storage";
 import { boardPath, OnlineAuthenticationError, onlineRequest } from "../core/online/client";
+import { withRequestIdempotencyKey } from "../core/online/adapter";
 import { planbanCommand } from "../core/command";
 import type { LiveWatch } from "../core/online/live";
 import { registerOnlineRoutes } from "./onlineRoutes";
@@ -590,20 +593,32 @@ export async function startServer(options: ServeOptions) {
     cwdForMutation: string,
     run: () => Promise<T>,
   ): Promise<{ replayed: boolean; value: T }> {
-    const status = await getStatus(cwdForMutation);
-    if (!status.initialized || !status.planningRoot) {
-      return { replayed: false, value: await run() };
+    const key = idempotencyKey(req);
+    for (;;) {
+      const status = await getStatus(cwdForMutation);
+      if (!status.initialized || !status.planningRoot) {
+        return { replayed: false, value: await withRequestIdempotencyKey(key, run) };
+      }
+      const planningRoot = status.planningRoot;
+      try {
+        return await runIdempotentBoardMutation({
+          planningRoot,
+          idempotencyKey: key,
+          scope: `${req.method} ${req.route?.path ?? req.path}`,
+          fingerprint: idempotencyFingerprint({
+            params: req.params,
+            body: req.body ?? null,
+          }),
+          // A board that moved while this request waited records the key where it lives now.
+          stillHere: async () => (await boardPlanningRoot(cwdForMutation)) === planningRoot,
+          // The online operation carries the same key, so the service also knows a retry.
+          run: () => withRequestIdempotencyKey(key, run),
+        });
+      } catch (error) {
+        if (error instanceof PlanbanBoardMovedError) continue;
+        throw error;
+      }
     }
-    return runIdempotentBoardMutation({
-      planningRoot: status.planningRoot,
-      idempotencyKey: idempotencyKey(req),
-      scope: `${req.method} ${req.route?.path ?? req.path}`,
-      fingerprint: idempotencyFingerprint({
-        params: req.params,
-        body: req.body ?? null,
-      }),
-      run,
-    });
   }
 
   app.get("/api/live", (req, res) => {

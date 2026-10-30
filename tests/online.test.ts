@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import { tmpdir } from "node:os";
@@ -828,22 +829,35 @@ test("take-online killed mid-upload leaves the board local, and running it again
   assert.equal(await storage.pathExists(join(before.planningRoot, "online-transfer.json")), false);
 });
 
-test("take-online killed after the upload committed finishes on retry and reports later local edits", async () => {
+test("take-online killed right after the commit leaves this machine's board shut to every writer; the retry finishes and nothing is lost", async () => {
   const before = await storage.loadState(cwd);
   await killedAt("take-online:after-commit", ["online", "take-online", fake.url, "--cwd", cwd]);
   assert.equal(fake.authority, "online");
   assert.equal((await storage.readManifest(cwd))?.storage?.kind ?? "local", "local");
-  // An edit made on this machine after the upload, before the retry.
-  await storage.createCard({ cwd, title: "Made after the upload" });
+  // The board is online but this project has not switched yet: a local edit now would be lost, so it is refused.
+  await assert.rejects(storage.createCard({ cwd, title: "Made after the upload" }), /moving online/);
+  // Planban 1.x, which reads roadmap.json itself, cannot use it either.
+  assert.throws(() => JSON.parse(readFileSync(before.roadmapPath, "utf8")), /Restart: Planban 2\.0/);
   const result = await takeOnline(fake.url, cwd);
   assert.equal([...fake.transfers.values()].filter((transfer) => transfer.state === "committed").length, 1);
-  assert.deepEqual(result.unsyncedLocalChanges?.map((change) => change.summary), ["Created Made after the upload"]);
-  assert.equal(fake.bundle.roadmap.roadmapItems.some((item) => item.title === "Made after the upload"), false);
-  // The local edit is kept as recovery evidence.
-  assert.ok(JSON.parse(await readFile(result.localSnapshot, "utf8")).roadmapItems.some((item: { title: string }) => item.title === "Made after the upload"));
+  assert.equal(result.unsyncedLocalChanges, undefined);
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
   assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
   // The live board is set aside; what is left there stops older Planban versions using it.
   assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+});
+
+test("a roadmap that appears while a committed move is unfinished is set aside and reported, never taken for the board", async () => {
+  const before = await storage.loadState(cwd);
+  await killedAt("take-online:after-commit", ["online", "take-online", fake.url, "--cwd", cwd]);
+  // Something put a board back where the marker was (Planban 1.x init after the file was removed, say).
+  const stray = JSON.stringify({ version: 2, writerVersion: 6, revision: 0, roadmapItems: [] });
+  await writeFile(before.roadmapPath, stray);
+  const result: any = await takeOnline(fake.url, cwd);
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap, "the snapshot is the board as it was");
+  assert.equal(await readFile(result.strayRoadmap, "utf8"), stray, "the stray roadmap is kept, aside, and named");
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+  assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
 });
 
 test("take-local killed mid-download keeps the online board intact, and running it again finishes", async () => {
@@ -862,24 +876,36 @@ test("take-local killed mid-download keeps the online board intact, and running 
   assert.equal(await storage.pathExists(join(onlineCacheRoot({ kind: "online", url: fake.url, boardId: "demo" }), "online-transfer.json")), false);
 });
 
-test("take-online killed between setting the local roadmap aside and switching the project finishes on retry", async () => {
+test("a shut board whose marker was deleted gets it back on resume, and the move finishes from the snapshot", async () => {
   const before = await storage.loadState(cwd);
-  await killedAt("take-online:after-rename", ["online", "take-online", fake.url, "--cwd", cwd]);
-  assert.equal(await storage.pathExists(before.roadmapPath), false);
+  await killedAt("take-online:after-seal", ["online", "take-online", fake.url, "--cwd", cwd]);
+  await rm(before.roadmapPath);
+  const result = await takeOnline(fake.url, cwd);
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
+  assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+  assert.deepEqual(fake.bundle.roadmap.roadmapItems.map((item) => item.id), before.roadmap.roadmapItems.map((item) => item.id));
+});
+
+test("take-online killed after copying the snapshot, before shutting the local board, finishes on retry with one snapshot", async () => {
+  const before = await storage.loadState(cwd);
+  await killedAt("take-online:after-snapshot", ["online", "take-online", fake.url, "--cwd", cwd]);
+  assert.deepEqual(JSON.parse(await readFile(before.roadmapPath, "utf8")), before.roadmap, "never a moment without a roadmap file");
   assert.equal((await storage.readManifest(cwd))?.storage?.kind ?? "local", "local");
   const result = await takeOnline(fake.url, cwd);
   assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
   assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
+  assert.equal((await readdir(before.planningRoot)).filter((name) => name.startsWith("roadmap.local-before-online-")).length, 1);
   assert.equal([...fake.transfers.values()].filter((transfer) => transfer.state === "committed").length, 1);
 });
 
-test("take-online killed after leaving the marker finishes on retry and keeps the snapshot", async () => {
+test("take-online killed after shutting the local board, before the commit, keeps it shut and finishes on retry", async () => {
   const before = await storage.loadState(cwd);
-  await killedAt("take-online:after-retire", ["online", "take-online", fake.url, "--cwd", cwd]);
+  await killedAt("take-online:after-seal", ["online", "take-online", fake.url, "--cwd", cwd]);
   assert.equal(await readFile(before.roadmapPath, "utf8"), storage.RETIRED_ROADMAP);
+  await assert.rejects(storage.createCard({ cwd, title: "Lost?" }), /moving online/);
   const result = await takeOnline(fake.url, cwd);
   // The retry never takes the marker for the board: the snapshot still holds the board as it was.
-  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")).roadmapItems.map((item: { id: string }) => item.id), before.roadmap.roadmapItems.map((item) => item.id));
+  assert.deepEqual(JSON.parse(await readFile(result.localSnapshot, "utf8")), before.roadmap);
   assert.equal((await readdir(before.planningRoot)).filter((name) => name.startsWith("roadmap.local-before-online-")).length, 1);
   assert.equal((await storage.loadState(cwd)).manifest.storage?.kind, "online");
 });
@@ -1103,7 +1129,7 @@ test("Take Online leaves a note in the project folder; a machine with the note k
 
 test("a take-online killed before writing its note writes it when run again; a damaged note says how to fix it", async () => {
   const { second } = await secondMachineCopy();
-  await killedAt("take-online:after-rename", ["online", "take-online", fake.url, "--cwd", cwd]);
+  await killedAt("take-online:after-seal", ["online", "take-online", fake.url, "--cwd", cwd]);
   const notePath = join(cwd, ".planban", "online-board.json");
   assert.equal(await storage.pathExists(notePath), false);
   await killedAt("take-online:after-note", ["online", "take-online", fake.url, "--cwd", cwd]);
@@ -1408,16 +1434,16 @@ test("a take-local resumed before its freeze asks again about people who joined 
 test("an earlier upload is replaced only once the service confirms it is gone", async () => {
   const before = await storage.loadState(cwd);
   const journalPath = join(before.planningRoot, "online-transfer.json");
-  await killedAt("take-online:after-commit", ["online", "take-online", fake.url, "--cwd", cwd]);
+  await killedAt("take-online:after-part", ["online", "take-online", fake.url, "--cwd", cwd]);
   const recorded = JSON.parse(await readFile(journalPath, "utf8"));
   await storage.updateCard({ cwd, cardId: "alpha", summary: "edited after the upload", baseRevision: (await storage.loadState(cwd)).roadmap.revision });
   fake.failAbort(true);
   await assert.rejects(takeOnline(fake.url, cwd));
-  assert.equal(JSON.parse(await readFile(journalPath, "utf8")).transferId, recorded.transferId, "the record of the committed upload is kept");
+  assert.equal(JSON.parse(await readFile(journalPath, "utf8")).transferId, recorded.transferId, "the record of the earlier upload is kept");
   fake.failAbort(false);
-  const result: any = await takeOnline(fake.url, cwd);
+  await takeOnline(fake.url, cwd);
   assert.equal((await storage.readManifest(cwd))?.storage?.kind, "online");
-  assert.equal(result.unsyncedLocalChanges.length, 1);
+  assert.equal(fake.bundle.roadmap.roadmapItems.find((item) => item.id === "alpha")?.summary, "edited after the upload", "the current board went online");
 });
 
 test("an upload started by another account is never cancelled or forgotten by this one", async () => {

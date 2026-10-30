@@ -27,6 +27,18 @@ export class PlanbanConflictError extends Error {
   }
 }
 
+/**
+ * A write waited for the board while it moved (Take Online or Take Local),
+ * so it was not made where it was headed. Nothing was written. Writes that
+ * can go to the board's new home are sent there again (againIfMoved).
+ */
+export class PlanbanBoardMovedError extends PlanbanConflictError {
+  constructor() {
+    super("This board moved online while this change was waiting for it, so nothing was written to the copy on this computer. Make the change again: it will go to the online board.");
+    this.name = "PlanbanBoardMovedError";
+  }
+}
+
 export class PlanbanValidationError extends Error {
   constructor(message: string) {
     super(message);

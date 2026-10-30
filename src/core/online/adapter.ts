@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { agentContextPath, defaultPlanbanRoot, manifestPath } from "../paths";
@@ -57,6 +58,25 @@ export async function loadOnlineState(cwd: string, manifest: PlanbanProjectManif
   return withBehindNotice(onlineState(cwd, manifest, roadmap), storage);
 }
 
+/**
+ * The retry key a request to the board page came with. Online operations made
+ * on its behalf use it, so a retried request is recognised by the service too,
+ * wherever its first attempt was recorded (a move online may come in between).
+ */
+const requestKeys = new AsyncLocalStorage<{ key: string; used: number }>();
+
+export function withRequestIdempotencyKey<T>(key: string | undefined, run: () => Promise<T>): Promise<T> {
+  return key ? requestKeys.run({ key, used: 0 }, run) : run();
+}
+
+/** The request's key for its first online operation, and one derived from it for each after. */
+function requestKey(): string | undefined {
+  const request = requestKeys.getStore();
+  if (!request) return undefined;
+  request.used += 1;
+  return request.used === 1 ? request.key : `${request.key}#${request.used}`;
+}
+
 export async function onlineOperation<T>(cwd: string, manifest: PlanbanProjectManifest, op: string, input: { cwd: string; idempotencyKey?: string | undefined }) {
   if (manifest.storage?.kind !== "online") throw new Error("Expected an Online Board.");
   const { cwd: _cwd, idempotencyKey, ...rest } = input as { cwd: string; idempotencyKey?: string | undefined; actor?: unknown };
@@ -66,7 +86,7 @@ export async function onlineOperation<T>(cwd: string, manifest: PlanbanProjectMa
   const body = { ...rest, actor: rest.actor ?? "user" };
   // One key per logical edit: a retry after a lost response cannot apply it twice.
   const response = await onlineRequest<{ roadmap: PlanbanRoadmap; result: T; replayed?: boolean; originalRevision?: number }>(manifest.storage.url, boardPath(manifest.storage.boardId, `/ops/${op}`), body,
-    { idempotencyKey: idempotencyKey ?? randomUUID() });
+    { idempotencyKey: idempotencyKey ?? requestKey() ?? randomUUID() });
   // Every machine that changes an Online Board keeps a local backup of it.
   void refreshBackup(manifest.storage.url, manifest.storage.boardId);
   const state = withBehindNotice(onlineState(cwd, manifest, response.roadmap), manifest.storage);
