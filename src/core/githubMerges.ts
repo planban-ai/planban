@@ -4,30 +4,28 @@
 //
 // Planban asks about each pull request a card names, by repository and number, rather than paging
 // through GitHub's lists, whose positions shift whenever a pull request changes. A merge never
-// un-happens, so one seen merged is kept for good; others are asked about again later. What is
-// learned, when each pull request was last asked about, and a lookup budget shared by every
-// process on this computer live in one file, changed only under a file lock. Best effort: anything
-// that stops a lookup leaves the merges already known and a note saying why, never an error.
+// un-happens, so one seen merged is remembered; others are asked about again later. The memory is a
+// file used only to save requests: it is read, the lookups are made, and the latest copy is read
+// again and merged with the answers before an atomic rename. No lock: a lost update costs one
+// extra lookup. Every call has a deadline and a request limit, and anything it couldn't check is
+// said in a note, never an error.
 import { execFile } from "node:child_process";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { defaultPlanbanRoot } from "./paths";
-import { withBoardWriteLock } from "./persistence";
 
 const GIT_TIMEOUT_MS = 2_000;
-const GH_TIMEOUT_MS = 2_000;
 const MINUTE = 60_000;
-/** Lookups every process on this computer may make together, per minute. */
-export const LOOKUPS_PER_MINUTE = 20;
-const PARALLEL_LOOKUPS = 4;
+/** Requests one call may make. */
+export const REQUESTS_PER_CALL = 20;
+/** How long one call may take, all requests together, unless the caller says otherwise. */
+export const DEFAULT_DEADLINE_MS = 5_000;
+const PARALLEL_REQUESTS = 4;
 /** An open pull request is asked about again after this long. */
 const ASK_AGAIN_MS = MINUTE;
 /** After failed lookups, wait 2, 4, 8 … minutes before the next try, up to an hour. */
 const MAX_RETRY_WAIT_MS = 60 * MINUTE;
 const RATE_LIMIT_PAUSE_MS = 15 * MINUTE;
-/** How long a "can't see this repository" answer stands, and a "can see it" one. */
-const HIDDEN_CHECK_MS = 60 * MINUTE;
-const VISIBLE_CHECK_MS = 24 * 60 * MINUTE;
 
 export interface GitHubRef {
   /** "owner/name". */
@@ -45,23 +43,24 @@ export interface GitHubMerges {
   notes: string[];
 }
 
-interface LookupState {
-  version: 4;
-  /** Merge times by "owner/name#123", lower-cased. Permanent. */
-  merged: Record<string, string>;
-  /** Pull requests asked about and not merged (or not found): when, and failures in a row. */
-  asked: Record<string, { at: string; failures: number }>;
-  /** Whether the gh account here can see each repository, and when that was checked. */
-  access: Record<string, { visible: boolean; at: string }>;
-  /** Lookups made in the current minute, by every process. */
-  budget: { from: string; used: number };
-  /** Set after GitHub's rate limit answered: no lookups until then. */
-  pausedUntil?: string | undefined;
-  /** Why the last failed lookup failed, said while any pull request waits to be tried again. */
-  lastFailure?: string | undefined;
+interface Remembered {
+  /** When this pull request was last asked about. The newest answer wins when copies are merged. */
+  askedAt: string;
+  mergedAt?: string | undefined;
+  /** Failed lookups in a row, and why the last one failed. */
+  failures: number;
+  failure?: string | undefined;
 }
 
-export type Run = (command: string, args: string[], options: { cwd?: string; timeout: number }) => Promise<string>;
+interface Memory {
+  version: 5;
+  /** By "owner/name#123", lower-cased. */
+  prs: Record<string, Remembered>;
+  /** Per repository, lower-cased: no requests before this time, after GitHub's rate limit answered. */
+  retryAfter: Record<string, string>;
+}
+
+export type Run = (command: string, args: string[], options: { cwd?: string; timeout: number; signal?: AbortSignal }) => Promise<string>;
 
 export const runCommand: Run = (command, args, options) => new Promise((resolveRun, rejectRun) => {
   execFile(command, args, { ...options, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GH_PROMPT_DISABLED: "1", NO_COLOR: "1" } },
@@ -92,27 +91,38 @@ export function useGitHubRunner(exec?: Run) {
   ghRunner = exec ?? runCommand;
 }
 
-const stateRoot = () => join(defaultPlanbanRoot(), "online", "github");
-const statePath = () => join(stateRoot(), "lookups.json");
+const memoryPath = () => join(defaultPlanbanRoot(), "online", "github", "merges.json");
 const keyOf = (ref: GitHubRef) => `${ref.repo.toLowerCase()}#${ref.number}`;
-const emptyState = (now: number): LookupState => ({ version: 4, merged: {}, asked: {}, access: {}, budget: { from: new Date(now).toISOString(), used: 0 } });
+const time = (iso: string | undefined) => iso ? Date.parse(iso) : -Infinity;
 
-/** Reads, changes and saves the state as one step that no other process can interleave with. */
-function withState<T>(now: number, change: (state: LookupState) => T): Promise<T> {
-  return withBoardWriteLock(stateRoot(), async () => {
-    let state = emptyState(now);
-    try {
-      const saved = JSON.parse(await readFile(statePath(), "utf8")) as LookupState;
-      if (saved.version === 4) state = saved;
-    } catch {
-      // Nothing saved yet, or unreadable: start again.
-    }
-    const result = change(state);
-    const temp = `${statePath()}.${process.pid}.tmp`;
-    await writeFile(temp, JSON.stringify(state));
-    await rename(temp, statePath());
-    return result;
-  });
+async function readMemory(): Promise<Memory> {
+  try {
+    const saved = JSON.parse(await readFile(memoryPath(), "utf8")) as Memory;
+    if (saved.version === 5 && saved.prs && saved.retryAfter) return saved;
+  } catch {
+    // Nothing saved yet, or unreadable: start again.
+  }
+  return { version: 5, prs: {}, retryAfter: {} };
+}
+
+/** Merges two copies: a merge is kept for good; otherwise the newest answer about each pull request wins. */
+function mergeMemory(a: Memory, b: Memory): Memory {
+  const prs = { ...a.prs };
+  for (const [key, entry] of Object.entries(b.prs)) {
+    const other = prs[key];
+    if (!other || (!other.mergedAt && (entry.mergedAt || time(entry.askedAt) > time(other.askedAt)))) prs[key] = entry;
+  }
+  const retryAfter = { ...a.retryAfter };
+  for (const [repo, at] of Object.entries(b.retryAfter)) if (time(at) > time(retryAfter[repo])) retryAfter[repo] = at;
+  return { version: 5, prs, retryAfter };
+}
+
+async function saveMemory(answers: Memory) {
+  const latest = mergeMemory(await readMemory(), answers);
+  await mkdir(join(memoryPath(), ".."), { recursive: true });
+  const temp = `${memoryPath()}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temp, JSON.stringify(latest));
+  await rename(temp, memoryPath());
 }
 
 const stderrOf = (error: unknown) => String((error as { stderr?: unknown })?.stderr ?? "");
@@ -122,135 +132,117 @@ const isRateLimited = (error: unknown) => /rate limit|HTTP 429/iu.test(stderrOf(
 function why(error: unknown): string {
   if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "the GitHub CLI (gh) isn't installed here";
   if (/auth login|not logged|authentication/iu.test(stderrOf(error))) return "the GitHub CLI (gh) isn't signed in here";
-  if ((error as { killed?: boolean })?.killed) return "GitHub took too long to answer";
+  if ((error as { killed?: boolean })?.killed || (error as { name?: string })?.name === "AbortError") return "GitHub took too long to answer";
   return "GitHub couldn't be reached";
 }
 
-type Outcome = { kind: "merged"; at: string } | { kind: "open" } | { kind: "not-found" } | { kind: "failed"; error: unknown };
-
-async function lookUp(ref: GitHubRef, exec: Run): Promise<Outcome> {
-  try {
-    const row = JSON.parse(await exec("gh", ["api", "--method", "GET", `repos/${ref.repo}/pulls/${ref.number}`, "--jq", "{number, merged_at}"], { timeout: GH_TIMEOUT_MS })) as { merged_at?: unknown };
-    return typeof row.merged_at === "string" && Number.isFinite(Date.parse(row.merged_at)) ? { kind: "merged", at: row.merged_at } : { kind: "open" };
-  } catch (error) {
-    return isNotFound(error) ? { kind: "not-found" } : { kind: "failed", error };
-  }
-}
-
-/** Whether the gh account here can see `repo`: GitHub answers 404 for a private one it can't. */
-async function canSee(repo: string, exec: Run): Promise<boolean | { error: unknown }> {
-  try {
-    await exec("gh", ["api", "--method", "GET", `repos/${repo}`, "--jq", ".full_name"], { timeout: GH_TIMEOUT_MS });
-    return true;
-  } catch (error) {
-    return isNotFound(error) ? false : { error };
-  }
-}
-
-const retryWait = (failures: number) => Math.min(2 ** failures * MINUTE, MAX_RETRY_WAIT_MS);
-const time = (iso: string | undefined) => iso ? Date.parse(iso) : -Infinity;
+const TIMED_OUT = Symbol("timed out");
 
 /**
- * Which of the pull requests `refs` names have merged, with when. Asks GitHub about those not
- * already seen merged, within the shared budget: never-asked ones first, then the longest since
- * asked. Merges already known are always returned, whatever else happens.
+ * Which of the pull requests `refs` names have merged, with when. Asks GitHub about those due a
+ * check, at most REQUESTS_PER_CALL requests, taking each repository in turn so none starves
+ * another, and stops at the deadline. Merges already known are always returned.
  */
-export async function githubMerges(refs: GitHubRef[], options: { now?: number; exec?: Run } = {}): Promise<GitHubMerges> {
+export async function githubMerges(refs: GitHubRef[], options: { now?: number; exec?: Run; deadlineMs?: number } = {}): Promise<GitHubMerges> {
   const now = options.now ?? Date.now();
   const exec = options.exec ?? ghRunner;
+  const deadline = Date.now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
   const wanted = [...new Map(refs.map((ref) => [keyOf(ref), ref])).values()];
+  const memory = await readMemory();
+  const answers: Memory = { version: 5, prs: {}, retryAfter: {} };
   const notes: string[] = [];
-  const answer = (state: LookupState): GitHubMerges => {
-    const merges = wanted.flatMap((ref) => state.merged[keyOf(ref)] ? [{ ...ref, mergedAt: state.merged[keyOf(ref)]! }] : []);
-    const visible = (ref: GitHubRef) => state.access[ref.repo.toLowerCase()]?.visible !== false;
-    const unasked = wanted.filter((ref) => visible(ref) && !state.merged[keyOf(ref)] && !state.asked[keyOf(ref)]).length;
-    if (unasked) notes.push(`Merged-PR warnings asked GitHub about ${wanted.length - unasked} of the ${wanted.length} pull requests cards name so far; the rest are asked about on the next checks.`);
-    for (const repo of new Set(wanted.map((ref) => ref.repo).filter((repo) => state.access[repo.toLowerCase()]?.visible === false))) {
-      notes.push(`Merged-PR warnings can't see ${repo}: the GitHub CLI (gh) account here has no access to it.`);
+  const at = new Date(now).toISOString();
+
+  // Due: not known merged, not paused by a rate limit, and not asked about too recently.
+  const paused = (repo: string) => time(memory.retryAfter[repo.toLowerCase()]) > now;
+  const due = wanted.filter((ref) => {
+    const known = memory.prs[keyOf(ref)];
+    if (known?.mergedAt || paused(ref.repo)) return false;
+    if (!known) return true;
+    const wait = known.failures ? Math.min(2 ** known.failures * MINUTE, MAX_RETRY_WAIT_MS) : ASK_AGAIN_MS;
+    return now - time(known.askedAt) >= wait;
+  });
+  // Each repository in turn, longest since asked first within each.
+  const byRepo = new Map<string, GitHubRef[]>();
+  for (const ref of due) byRepo.set(ref.repo.toLowerCase(), [...(byRepo.get(ref.repo.toLowerCase()) ?? []), ref]);
+  for (const list of byRepo.values()) list.sort((a, b) => time(memory.prs[keyOf(a)]?.askedAt) - time(memory.prs[keyOf(b)]?.askedAt));
+  const queue: GitHubRef[] = [];
+  for (let round = 0; queue.length < due.length; round += 1) for (const list of byRepo.values()) if (list[round]) queue.push(list[round]!);
+
+  // One request: stops at its own timeout or the call's deadline, whichever is first, even if gh hangs.
+  const ask = async (args: string[]): Promise<string | typeof TIMED_OUT> => {
+    const left = deadline - Date.now();
+    if (left <= 0) return TIMED_OUT;
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<typeof TIMED_OUT>((resolveTimeout) => { timer = setTimeout(() => { controller.abort(); resolveTimeout(TIMED_OUT); }, left); });
+    try {
+      return await Promise.race([exec("gh", ["api", "--method", "GET", ...args], { timeout: left, signal: controller.signal }), timeout]);
+    } finally {
+      clearTimeout(timer);
     }
-    if (wanted.some((ref) => !state.merged[keyOf(ref)] && (state.asked[keyOf(ref)]?.failures ?? 0) > 0)) {
-      notes.push(`Merged-PR warnings may be missing merges: ${state.lastFailure ?? "GitHub couldn't be reached"}. Only merges this computer already knows about are shown.`);
-    }
-    if (time(state.pausedUntil) > now) notes.push(`GitHub's rate limit was reached, so merged-PR checks pause until ${state.pausedUntil!.slice(11, 16)} UTC.`);
-    return { merges, notes: [...new Set(notes)] };
   };
-  try {
-    // 1. Claim what to ask about, under the lock, so processes running at once share the budget
-    //    and don't ask about the same pull request twice.
-    const previous = new Map<string, LookupState["asked"][string] | undefined>();
-    const knownVisible = new Set<string>();
-    const batch = await withState(now, (state) => {
-      if (now - time(state.budget.from) >= MINUTE) state.budget = { from: new Date(now).toISOString(), used: 0 };
-      if (time(state.pausedUntil) > now) return [];
-      const due = wanted.filter((ref) => {
-        const key = keyOf(ref);
-        if (state.merged[key]) return false;
-        const access = state.access[ref.repo.toLowerCase()];
-        if (access && !access.visible && now - time(access.at) < HIDDEN_CHECK_MS) return false;
-        const asked = state.asked[key];
-        return !asked || now - time(asked.at) >= (asked.failures ? retryWait(asked.failures) : ASK_AGAIN_MS);
-      }).sort((a, b) => time(state.asked[keyOf(a)]?.at) - time(state.asked[keyOf(b)]?.at));
-      const claimed = due.slice(0, Math.max(0, LOOKUPS_PER_MINUTE - state.budget.used));
-      for (const [repo, access] of Object.entries(state.access)) if (access.visible && now - time(access.at) < VISIBLE_CHECK_MS) knownVisible.add(repo);
-      state.budget.used += claimed.length;
-      for (const ref of claimed) {
-        previous.set(keyOf(ref), state.asked[keyOf(ref)]);
-        state.asked[keyOf(ref)] = { at: new Date(now).toISOString(), failures: state.asked[keyOf(ref)]?.failures ?? 0 };
-      }
-      return claimed;
-    });
-
-    // 2. Ask, outside the lock. Each answer stands on its own: one failure doesn't lose the others.
-    const outcomes = new Map<string, Outcome>();
-    let rateLimited = false;
-    for (let start = 0; start < batch.length && !rateLimited; start += PARALLEL_LOOKUPS) {
-      const group = batch.slice(start, start + PARALLEL_LOOKUPS);
-      const settled = await Promise.all(group.map((ref) => lookUp(ref, exec)));
-      group.forEach((ref, index) => outcomes.set(keyOf(ref), settled[index]!));
-      rateLimited = settled.some((outcome) => outcome.kind === "failed" && isRateLimited(outcome.error));
-    }
-    // A 404 means "no such pull request" only when the repository itself can be seen.
-    const access = new Map<string, boolean>();
-    const notFoundRepos = new Set(batch.filter((ref) => outcomes.get(keyOf(ref))?.kind === "not-found").map((ref) => ref.repo.toLowerCase()).filter((repo) => !knownVisible.has(repo)));
-    for (const repo of notFoundRepos) {
-      const seen = await canSee(repo, exec);
-      if (typeof seen === "boolean") access.set(repo, seen);
-      for (const ref of batch) {
-        if (ref.repo.toLowerCase() !== repo || outcomes.get(keyOf(ref))?.kind !== "not-found" || seen === true) continue;
-        // Can't see the repository (or couldn't tell): not an answer about the pull request.
-        if (seen === false) outcomes.delete(keyOf(ref));
-        else outcomes.set(keyOf(ref), { kind: "failed", error: seen.error });
-      }
-    }
-    const failure = [...outcomes.values()].find((outcome): outcome is Extract<Outcome, { kind: "failed" }> => outcome.kind === "failed" && !isRateLimited(outcome.error));
-
-    // 3. Record the answers into the latest saved state, under the lock.
-    return await withState(now, (state) => {
-      const at = new Date(now).toISOString();
-      for (const [repo, visible] of access) state.access[repo] = { visible, at };
-      for (const ref of batch) {
-        const key = keyOf(ref);
-        const outcome = outcomes.get(key);
-        if (!outcome) {
-          // Not asked (stopped by the rate limit) or in a repository that can't be seen: as it was.
-          const before = previous.get(key);
-          if (before) state.asked[key] = before;
-          else delete state.asked[key];
-          continue;
+  // A 404 means "no such pull request" only if the repository can be seen, checked in this call.
+  const visible = new Map<string, Promise<boolean | typeof TIMED_OUT>>();
+  const canSee = (repo: string) => {
+    const key = repo.toLowerCase();
+    if (!visible.has(key)) {
+      visible.set(key, (async () => {
+        try {
+          return (await ask([`repos/${repo}`, "--jq", ".full_name"])) === TIMED_OUT ? TIMED_OUT : true;
+        } catch (error) {
+          if (isNotFound(error)) return false;
+          throw error;
         }
-        if (outcome.kind === "merged") {
-          state.merged[key] = outcome.at;
-          delete state.asked[key];
-        } else {
-          state.asked[key] = { at, failures: outcome.kind === "failed" ? (state.asked[key]?.failures ?? 0) + 1 : 0 };
-        }
+      })());
+    }
+    return visible.get(key)!;
+  };
+
+  const unchecked: GitHubRef[] = [];
+  const hidden = new Set<string>();
+  let failure: string | null = null;
+  const lookUp = async (ref: GitHubRef) => {
+    const key = keyOf(ref);
+    if (paused(ref.repo) || time(answers.retryAfter[ref.repo.toLowerCase()]) > now) return void unchecked.push(ref);
+    try {
+      const answer = await ask([`repos/${ref.repo}/pulls/${ref.number}`, "--jq", "{number, merged_at}"]);
+      if (answer === TIMED_OUT) return void unchecked.push(ref);
+      const row = JSON.parse(answer) as { merged_at?: unknown };
+      const mergedAt = typeof row.merged_at === "string" && Number.isFinite(Date.parse(row.merged_at)) ? row.merged_at : undefined;
+      answers.prs[key] = { askedAt: at, mergedAt, failures: 0 };
+    } catch (error) {
+      if (isRateLimited(error)) {
+        answers.retryAfter[ref.repo.toLowerCase()] = new Date(now + RATE_LIMIT_PAUSE_MS).toISOString();
+        return void unchecked.push(ref);
       }
-      if (rateLimited) state.pausedUntil = new Date(now + RATE_LIMIT_PAUSE_MS).toISOString();
-      if (failure) state.lastFailure = why(failure.error);
-      return answer(state);
-    });
-  } catch (error) {
-    // The saved state itself couldn't be used: say so; the local git log still counts.
-    return { merges: [], notes: [`Merged-PR warnings couldn't use what this computer learned from GitHub: ${(error as Error).message}.`] };
+      if (isNotFound(error)) {
+        const seen = await canSee(ref.repo).catch((reason: unknown) => ({ reason }));
+        if (seen === true) return void (answers.prs[key] = { askedAt: at, failures: 0 });
+        if (seen === false) return void hidden.add(ref.repo);
+        if (seen === TIMED_OUT) return void unchecked.push(ref);
+        error = seen.reason;
+      }
+      failure = why(error);
+      const failures = (memory.prs[key]?.failures ?? 0) + 1;
+      answers.prs[key] = { askedAt: at, failures, failure };
+    }
+  };
+  const batch = queue.slice(0, REQUESTS_PER_CALL);
+  for (let start = 0; start < batch.length; start += PARALLEL_REQUESTS) {
+    await Promise.all(batch.slice(start, start + PARALLEL_REQUESTS).map(lookUp));
   }
+  const deferred = unchecked.length + (queue.length - batch.length);
+  await saveMemory(answers).catch(() => undefined);
+
+  const known = mergeMemory(memory, answers);
+  const merges = wanted.flatMap((ref) => known.prs[keyOf(ref)]?.mergedAt ? [{ ...ref, mergedAt: known.prs[keyOf(ref)]!.mergedAt! }] : []);
+  const failed = wanted.find((ref) => !known.prs[keyOf(ref)]?.mergedAt && known.prs[keyOf(ref)]?.failures);
+  if (failed) notes.push(`Merged-PR warnings may be missing merges: ${failure ?? known.prs[keyOf(failed)]!.failure ?? "GitHub couldn't be reached"}. Only merges this computer already knows about are shown.`);
+  for (const repo of hidden) notes.push(`Merged-PR warnings can't see ${repo}: the GitHub CLI (gh) account here has no access to it.`);
+  for (const repo of new Set(wanted.map((ref) => ref.repo).filter((repo) => time(known.retryAfter[repo.toLowerCase()]) > now))) {
+    notes.push(`GitHub's rate limit was reached for ${repo}, so its merge checks pause until ${known.retryAfter[repo.toLowerCase()]!.slice(11, 16)} UTC.`);
+  }
+  if (deferred) notes.push(`${deferred} merge check${deferred === 1 ? " was" : "s were"} deferred to a later check (each check asks GitHub at most ${REQUESTS_PER_CALL} times, within a time limit), so some merges may not show yet.`);
+  return { merges, notes };
 }

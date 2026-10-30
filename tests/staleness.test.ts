@@ -294,77 +294,115 @@ test("a 404 from a repository the account can't see is reported, not read as no 
     const result = await githubMerges(refs("secret/app#12", "o/r#5"), { now: NOW, exec: github.exec });
     assert.deepEqual(prsOf(result), ["o/r#5"]);
     assert.deepEqual(result.notes, ["Merged-PR warnings can't see secret/app: the GitHub CLI (gh) account here has no access to it."]);
+    // Never trusted from memory: the next check asks again, and says so again.
     github.asked.length = 0;
     const again = await githubMerges(refs("secret/app#12"), { now: NOW + 2 * 60_000, exec: github.exec });
-    assert.deepEqual(github.asked, [], "the repository isn't asked about again for an hour");
+    assert.deepEqual(github.asked, ["secret/app#12", "secret/app"]);
     assert.match(again.notes.join(" "), /can't see secret\/app/u);
   });
 });
 
-test("GitHub's rate limit pauses lookups, and the pause is said", async () => {
+test("GitHub's rate limit pauses that repository's lookups, and the pause is said", async () => {
   await withPlanbanHome(async () => {
-    const github = fakeGitHub(new Map([["o/r#1", null]]), { fail: new Map([["o/r#1", "gh: API rate limit exceeded for user ID 1. (HTTP 403)"]]) });
+    const github = fakeGitHub(new Map([["o/r#1", null], ["acme/site#2", iso(NOW - DAY)]]), { fail: new Map([["o/r#1", "gh: API rate limit exceeded for user ID 1. (HTTP 403)"]]) });
     const first = await githubMerges(refs("o/r#1"), { now: NOW, exec: github.exec });
-    assert.match(first.notes.join(" "), /rate limit was reached, so merged-PR checks pause until 00:15 UTC/u);
+    assert.match(first.notes.join(" "), /rate limit was reached for o\/r, so its merge checks pause until 00:15 UTC/u);
     github.asked.length = 0;
-    const paused = await githubMerges(refs("o/r#1", "o/r#2"), { now: NOW + 5 * 60_000, exec: github.exec });
-    assert.deepEqual(github.asked, []);
+    const paused = await githubMerges(refs("o/r#1", "o/r#2", "acme/site#2"), { now: NOW + 5 * 60_000, exec: github.exec });
+    assert.deepEqual(github.asked, ["acme/site#2"], "only the paused repository waits");
+    assert.deepEqual(prsOf(paused), ["acme/site#2"]);
     assert.match(paused.notes.join(" "), /pause until 00:15 UTC/u);
   });
 });
 
-/** Runs githubMerges in a separate Node process against a stand-in GitHub that logs each request. */
-function childLookup(home: string, keys: string[], merged: string[], log: string, now: number) {
+/**
+ * Runs githubMerges in a separate Node process, against a stand-in GitHub that logs each request:
+ * `merged` pull requests answer with a merge time, `missing` ones and `hidden` repositories with
+ * 404s, the rest as open. `delayMs` slows each answer; `hang` never answers, ignoring the abort.
+ */
+function childLookup(home: string, world: { keys: string[]; merged?: string[]; missing?: string[]; hidden?: string[]; delayMs?: number; hang?: boolean; now: number; deadlineMs?: number }) {
   const script = join(home, "child-lookup.mts");
   writeFileSync(script, `
 import { appendFileSync } from "node:fs";
 import { githubMerges } from ${JSON.stringify(pathToFileURL(join(process.cwd(), "src/core/githubMerges.ts")).href)};
-const [keys, merged, log, now] = JSON.parse(process.argv[2]);
+const world = JSON.parse(process.argv[2]);
+const notFound = () => Object.assign(new Error("gh exited 1"), { stderr: "gh: Not Found (HTTP 404)" });
 const exec = async (_command, args) => {
   const path = args.find((arg) => arg.startsWith("repos/"));
-  appendFileSync(log, path + "\\n");
-  const [, repo, number] = /^repos\\/(.+?)\\/pulls\\/(\\d+)$/.exec(path);
-  return JSON.stringify({ number: Number(number), merged_at: merged.includes(repo + "#" + number) ? "2026-09-01T00:00:00.000Z" : null });
+  appendFileSync(world.log, path + "\\n");
+  if (world.hang) return new Promise(() => undefined);
+  if (world.delayMs) await new Promise((resolve) => setTimeout(resolve, world.delayMs));
+  const [, repo, number] = /^repos\\/([^/]+\\/[^/]+)(?:\\/pulls\\/(\\d+))?$/.exec(path);
+  if ((world.hidden ?? []).includes(repo)) throw notFound();
+  if (!number) return JSON.stringify(repo);
+  const key = repo + "#" + number;
+  if ((world.missing ?? []).includes(key)) throw notFound();
+  return JSON.stringify({ number: Number(number), merged_at: (world.merged ?? []).includes(key) ? "2026-09-01T00:00:00.000Z" : null });
 };
-const refs = keys.map((key) => ({ repo: key.split("#")[0], number: Number(key.split("#")[1]) }));
-const result = await githubMerges(refs, { now, exec });
-process.stdout.write(JSON.stringify(result));
+const refs = world.keys.map((key) => ({ repo: key.split("#")[0], number: Number(key.split("#")[1]) }));
+const started = Date.now();
+const result = await githubMerges(refs, { now: world.now, exec, ...(world.deadlineMs ? { deadlineMs: world.deadlineMs } : {}) });
+process.stdout.write(JSON.stringify({ ...result, elapsedMs: Date.now() - started }));
+process.exit(0);
 `);
-  return new Promise<{ merges: unknown[]; notes: string[] }>((resolveChild, rejectChild) => {
-    execFile(process.execPath, ["--import", "tsx/esm", script, JSON.stringify([keys, merged, log, now])], { env: { ...process.env, PLANBAN_HOME: home } }, (error, stdout, stderr) => {
+  const log = join(home, "requests.log");
+  return new Promise<{ merges: Array<{ repo: string; number: number }>; notes: string[]; elapsedMs: number }>((resolveChild, rejectChild) => {
+    execFile(process.execPath, ["--import", "tsx/esm", script, JSON.stringify({ ...world, log })], { env: { ...process.env, PLANBAN_HOME: home }, timeout: 30_000 }, (error, stdout, stderr) => {
       if (error) rejectChild(new Error(`${error.message}\n${stderr}`));
       else resolveChild(JSON.parse(stdout));
     });
   });
 }
+const requestLog = (home: string) => { try { return readFileSync(join(home, "requests.log"), "utf8").trim().split("\n").filter(Boolean); } catch { return []; } };
 
-test("separate processes looking up at once lose none of each other's answers", async () => {
+test("a process writing while another looks up: both answers are kept, and nothing waits on anything", async () => {
   await withPlanbanHome(async (home) => {
-    const log = join(home, "requests.log");
-    const sets = [0, 1, 2].map((child) => Array.from({ length: 5 }, (_, index) => `o/r#${child * 10 + index + 1}`));
-    await Promise.all(sets.map((keys) => childLookup(home, keys, keys, log, NOW)));
-    const all = sets.flat();
+    const slow = ["o/r#1", "o/r#2", "o/r#3"];
+    const fast = ["o/r#11", "o/r#12", "o/r#13"];
+    // The slow one reads the memory first and writes last, after the fast one has written.
+    await Promise.all([
+      childLookup(home, { keys: slow, merged: slow, delayMs: 2_000, now: NOW }),
+      childLookup(home, { keys: fast, merged: fast, now: NOW }),
+    ]);
     const github = fakeGitHub(new Map());
-    const after = await githubMerges(refs(...all), { now: NOW + 30_000, exec: github.exec });
-    assert.equal(prsOf(after).length, 15, "every process's merges were saved");
+    const after = await githubMerges(refs(...slow, ...fast), { now: NOW + 30_000, exec: github.exec });
+    assert.deepEqual(prsOf(after).length, 6, "the later write merged with the earlier one");
     assert.deepEqual(github.asked, []);
   });
 });
 
-test("separate processes share one lookup budget, so fresh processes can't multiply requests", async () => {
+test("a slow or hung GitHub can't hold a check past its deadline", async () => {
   await withPlanbanHome(async (home) => {
-    const log = join(home, "requests.log");
-    const keys = Array.from({ length: 30 }, (_, index) => `o/r#${index + 1}`);
-    await Promise.all([0, 1, 2].map(() => childLookup(home, keys, [], log, NOW)));
-    await childLookup(home, keys, [], log, NOW + 10_000);
-    const requests = readFileSync(log, "utf8").trim().split("\n");
-    assert.equal(requests.length, 20, "twenty lookups a minute across every process");
-    assert.equal(new Set(requests).size, 20, "and none asked twice");
-    const next = await childLookup(home, keys, [], log, NOW + 61_000);
-    const all = readFileSync(log, "utf8").trim().split("\n");
-    assert.equal(all.length, 40, "twenty more in the next minute");
-    assert.equal(new Set(all).size, 30, "never-asked ones first, so every named pull request has now been asked about");
-    assert.deepEqual(next.notes, []);
+    const hung = await childLookup(home, { keys: ["o/r#1", "o/r#2", "acme/site#3"], hang: true, now: NOW, deadlineMs: 500 });
+    assert.ok(hung.elapsedMs < 1_500, `returned after ${hung.elapsedMs} ms`);
+    assert.match(hung.notes.join(" "), /^3 merge checks were deferred to a later check/u);
+    const slow = await childLookup(home, { keys: ["o/r#4"], merged: ["o/r#4"], delayMs: 3_000, now: NOW, deadlineMs: 800 });
+    assert.ok(slow.elapsedMs < 1_800, `returned after ${slow.elapsedMs} ms`);
+    assert.match(slow.notes.join(" "), /1 merge check was deferred/u);
+  });
+});
+
+test("two repositories wanting more checks than one call makes both get their turn", async () => {
+  await withPlanbanHome(async (home) => {
+    const busy = Array.from({ length: 30 }, (_, index) => `big/repo#${index + 1}`);
+    const small = Array.from({ length: 5 }, (_, index) => `small/repo#${index + 1}`);
+    const first = await childLookup(home, { keys: [...busy, ...small], now: NOW });
+    const asked = requestLog(home);
+    assert.equal(asked.length, 20);
+    assert.equal(asked.filter((path) => path.startsWith("repos/small/")).length, 5, "the smaller repository isn't starved");
+    assert.match(first.notes.join(" "), /^15 merge checks were deferred/u);
+    // The next call, a minute on, asks the never-asked first; then everything has been asked about.
+    await childLookup(home, { keys: [...busy, ...small], now: NOW + 61_000 });
+    assert.equal(new Set(requestLog(home)).size, 35);
+  });
+});
+
+test("after access to a repository is lost, a 404 brings a note, not a quiet \"no such pull request\"", async () => {
+  await withPlanbanHome(async (home) => {
+    const first = await childLookup(home, { keys: ["team/app#9"], missing: ["team/app#9"], now: NOW });
+    assert.deepEqual(first.notes, [], "while the repository can be seen, a 404 is just a number that isn't a pull request");
+    const revoked = await childLookup(home, { keys: ["team/app#9"], hidden: ["team/app"], now: NOW + 2 * 60_000 });
+    assert.deepEqual(revoked.notes, ["Merged-PR warnings can't see team/app: the GitHub CLI (gh) account here has no access to it."]);
   });
 });
 

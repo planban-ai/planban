@@ -104,7 +104,7 @@ async function readOnlineHistoryRows(storage: OnlineStorage): Promise<HistoryRow
  * card names that the log doesn't already show merged. A bare `#123` is in this project's origin
  * repository; `owner/name#123` and full addresses are in theirs. No PR named, no GitHub read.
  */
-async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: number): Promise<{ merges: MergeRecord[]; notes: string[] }> {
+async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: number, deadlineMs?: number): Promise<{ merges: MergeRecord[]; notes: string[] }> {
   const named = items.filter((item) => isActiveStatus(item.status)).flatMap((item) => cardPrRefs(item));
   const local = await cachedMergeLog(cwd, now);
   if (!named.length) return { merges: local, notes: [] };
@@ -118,7 +118,7 @@ async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: numbe
     ? ["Merged-PR warnings for pull requests named as #123 use only this computer's git history: this project has no GitHub origin remote."]
     : [];
   if (!lookups.length) return { merges: local, notes };
-  const github = await githubMerges(lookups, { now });
+  const github = await githubMerges(lookups, { now, ...(deadlineMs === undefined ? {} : { deadlineMs }) });
   // A merge matches a card's owner/name#123; one in the origin repository also matches a bare #123.
   const isOrigin = (repo: string) => !!origin && repo.toLowerCase() === origin.toLowerCase();
   const merges: MergeRecord[] = [
@@ -155,6 +155,8 @@ export async function collectStaleness(input: {
   /** The board's storage, from its manifest; an Online Board reads its own history and GitHub. */
   storage?: Storage | undefined;
   now?: number | undefined;
+  /** How long GitHub may take, all its lookups together. */
+  githubDeadlineMs?: number | undefined;
 }): Promise<BoardStaleness> {
   const now = input.now ?? Date.now();
   const storage = input.storage;
@@ -162,7 +164,7 @@ export async function collectStaleness(input: {
     try {
       // Online documents change only through Planban, so none is "edited outside Planban", and the
       // board holds no files. Document sizes are checked when a document is read or written.
-      const [history, { merges, notes }] = await Promise.all([readOnlineHistoryRows(storage), onlineMerges(input.cwd, input.items, now)]);
+      const [history, { merges, notes }] = await Promise.all([readOnlineHistoryRows(storage), onlineMerges(input.cwd, input.items, now, input.githubDeadlineMs)]);
       return computeStaleness({ items: input.items, history, docMtimes: [], merges, notes, now });
     } catch {
       return { cards: {}, wip: null };
@@ -185,7 +187,7 @@ export async function collectStaleness(input: {
  * Read-only staleness for a project directory, for callers that must not load or migrate the board
  * (the session-start hook). Returns null when the project has no readable Planban board.
  */
-export async function projectStaleness(projectDir: string): Promise<{ items: PlanbanRoadmapItem[]; staleness: BoardStaleness } | null> {
+export async function projectStaleness(projectDir: string, options: { githubDeadlineMs?: number } = {}): Promise<{ items: PlanbanRoadmapItem[]; staleness: BoardStaleness } | null> {
   try {
     const manifest = JSON.parse(await readFile(join(projectDir, ".planban/project.json"), "utf8")) as {
       repoId?: unknown;
@@ -201,7 +203,7 @@ export async function projectStaleness(projectDir: string): Promise<{ items: Pla
       if (!read) return { items: [], staleness: { cards: {}, wip: null, notes: ["Planban couldn't reach the Online Board to check which cards look stale."] } };
       const { roadmap } = read;
       const items = roadmap.roadmapItems;
-      return { items, staleness: await collectStaleness({ cwd: projectDir, planningRoot: projectDir, items, storage }) };
+      return { items, staleness: await collectStaleness({ cwd: projectDir, planningRoot: projectDir, items, storage, githubDeadlineMs: options.githubDeadlineMs }) };
     }
     const planningRoot = typeof manifest.storage?.root === "string" && manifest.storage.root
       ? resolve(expandHome(manifest.storage.root))

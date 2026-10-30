@@ -85,7 +85,8 @@ async function computeLine(projectDir) {
   await loadRuntimeTypescript(runtimeRoot);
   const { projectStaleness } = await import(pathToFileURL(join(runtimeRoot, "src/core/stalenessSources.ts")).href);
   const { stalenessAttention, stalenessLine } = await import(pathToFileURL(join(runtimeRoot, "src/core/staleness.ts")).href);
-  const board = await projectStaleness(projectDir);
+  // GitHub gets two seconds of the hook's three, so a slow answer still leaves a line with a note.
+  const board = await projectStaleness(projectDir, { githubDeadlineMs: 2_000 });
   return board ? stalenessLine(stalenessAttention(board.staleness, board.items), "planban_status") : null;
 }
 
