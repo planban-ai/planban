@@ -211,3 +211,25 @@ test("a board-page change queued behind the move is applied once, even when the 
     assert.deepEqual(titles.filter((title) => title === "Beta"), ["Beta"], `applied once: ${titles.join(", ")}`);
   } finally { await server.close(); }
 });
+
+test("a board-page change applied just before the move is not applied again when the page retries it afterwards", async () => {
+  const cwd = await localBoard("Alpha");
+  const reservation = createServer();
+  await new Promise<void>((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  const port = (reservation.address() as any).port;
+  await new Promise<void>((resolve) => reservation.close(() => resolve()));
+  const server = await startServer({ cwd, port, useVite: false });
+  try {
+    const read = (await storage.loadState(cwd)).roadmap.revision;
+    const create = () => fetch(`${server.url}/api/cards`, {
+      method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": "page-create-2" }, body: JSON.stringify({ title: "Beta", baseRevision: read }),
+    });
+    assert.equal((await create()).status, 200);
+    await takeOnline(bridge.url, cwd);
+    // The reply was lost, say: the page sends the same request again, now that the board is online.
+    const retried = await create();
+    assert.equal(retried.status, 200, await retried.clone().text());
+    const titles = (await storage.loadState(cwd)).roadmap.roadmapItems.map((item) => item.title);
+    assert.deepEqual(titles.filter((title) => title === "Beta"), ["Beta"], `applied once: ${titles.join(", ")}`);
+  } finally { await server.close(); }
+});

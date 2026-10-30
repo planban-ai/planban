@@ -5,13 +5,13 @@ import { z } from "zod";
 import { normalizeRoadmap, PlanbanConflictError, PlanbanNotFoundError, PlanbanValidationError } from "../boardOperations";
 import { listHistory } from "../history";
 import { agentContextPath, defaultPlanbanRoot, hasLiveRoadmap, isRetiredRoadmap, RETIRED_ROADMAP, defaultPlanningRoot, detachedBoardCwd, historyCarriedDocsPath, historyDocPath, historyIndexPath, historyRoadmapPath, isPathInsideRoot, manifestPath, resolveInsideRoot, slugify } from "../paths";
-import { atomicWriteFile, isAtomicWriteTemp, LOCK_DIR, QUEUE_DIR, withBoardWriteLock } from "../persistence";
+import { atomicWriteFile, carryIdempotencyRecords, isAtomicWriteTemp, LOCK_DIR, QUEUE_DIR, withBoardWriteLock } from "../persistence";
 import { registerBoardFromState } from "../registry";
 import { roadmapSchema } from "../schema";
 import { docPathForItem, loadState, pathExists, readLocalGoals, readManifest, refreshAgentsBlock, resolveProjectCwd, resolvePlanningRoot, saveRoadmap } from "../storage";
 import { normalizeGoals } from "../goals";
 import type { PlanbanProjectManifest, PlanbanResolvedState } from "../types";
-import { loadOnlineState, onlineState } from "./adapter";
+import { loadOnlineState, onlineCacheRoot, onlineState } from "./adapter";
 import { boardAccount, recordBoardAccount, recordBoardAccountAs, withIdentity } from "./accounts";
 import { boardCredentials, boardPath, onlineRequest, requireCredentials } from "./client";
 import { markIndependent, readOnlineNote, readStaleMarker, removeOnlineNote, writeOnlineNote, type StaleCopy } from "./copyCheck";
@@ -750,6 +750,8 @@ async function finishTakeOnline(cwd: string, manifest: PlanbanProjectManifest, p
   await recordBoardAccountAs(url, boardId, pinned).catch(() => undefined);
   const roadmap = (await onlineRequest<{ roadmap: PlanbanResolvedState["roadmap"] }>(url, boardPath(boardId), undefined, { credentials: pinned })).roadmap;
   const onlineManifest: PlanbanProjectManifest = { ...manifest, storage: { kind: "online", url, boardId } };
+  // Before the project switches, so a retry of a request applied here finds its answer where the board is kept next.
+  await carryIdempotencyRecords(planningRoot, onlineCacheRoot({ kind: "online", url, boardId }));
   // The note is written before the project switches, while the record of the
   // move still exists, so a retry after any crash writes it again.
   const onlineNote = await leaveOnlineNote(cwd, { url, boardId, title: roadmap.project.title, onlineSince: new Date().toISOString() });

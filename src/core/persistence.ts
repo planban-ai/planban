@@ -404,6 +404,23 @@ function pruneIdempotencyRecords(records: IdempotencyRecord[]) {
     .sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
 }
 
+/**
+ * Copies the board's completed retry records to where the board will be kept
+ * next (Take Online), so a request applied just before the move and sent
+ * again afterwards returns its saved answer instead of applying twice.
+ * Records already there are kept. Safe to repeat.
+ */
+export async function carryIdempotencyRecords(fromRoot: string, toRoot: string) {
+  const completed = (await readIdempotencyStore(fromRoot)).records.filter((record) => "response" in record);
+  if (!completed.length) return;
+  await withBoardWriteLock(toRoot, async () => {
+    const store = await readIdempotencyStore(toRoot);
+    const known = new Set(store.records.map((record) => `${record.scope}\n${record.key}`));
+    const carried = completed.filter((record) => !known.has(`${record.scope}\n${record.key}`));
+    if (carried.length) await writeIdempotencyStore(toRoot, { version: 1, records: pruneIdempotencyRecords([...store.records, ...carried]) });
+  });
+}
+
 export async function runIdempotentBoardMutation<T>(input: {
   planningRoot: string;
   idempotencyKey?: string | undefined;
