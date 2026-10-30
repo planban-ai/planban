@@ -6,10 +6,10 @@ import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { cardsHoldingFiles } from "./cardFiles";
-import { clearGitHubMergeCache, githubMerges, githubRepoFor } from "./githubMerges";
+import { githubMerges, githubRepoFor } from "./githubMerges";
 import { boardPath, onlineRequest } from "./online/client";
 import { defaultPlanningRoot, expandHome, historyIndexPath, resolveInsideRoot, roadmapPath } from "./paths";
-import { cardPrNumbers, computeStaleness, parseMergeLog, type BoardStaleness, type DocMtime, type MergeRecord } from "./staleness";
+import { cardPrRefs, computeStaleness, isActiveStatus, parseMergeLog, type BoardStaleness, type DocMtime, type MergeRecord } from "./staleness";
 import type { PlanbanHistoryEntry, PlanbanHistoryPayload, PlanbanProjectManifest, PlanbanRoadmap, PlanbanRoadmapItem } from "./types";
 
 type Storage = PlanbanProjectManifest["storage"];
@@ -29,7 +29,6 @@ export function clearStalenessCaches() {
   mergeLogCache.clear();
   historyCache.clear();
   onlineHistoryCache.clear();
-  clearGitHubMergeCache();
 }
 
 /**
@@ -102,23 +101,35 @@ async function readOnlineHistoryRows(storage: OnlineStorage): Promise<HistoryRow
 
 /**
  * Merges for an Online Board: this checkout's git log plus GitHub, asked about each PR an active
- * card names that the log doesn't already show merged. No card naming a PR means no GitHub read.
+ * card names that the log doesn't already show merged. A bare `#123` is in this project's origin
+ * repository; `owner/name#123` and full addresses are in theirs. No PR named, no GitHub read.
  */
 async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: number): Promise<{ merges: MergeRecord[]; notes: string[] }> {
-  const named = [...new Set(items
-    .filter((item) => item.status === "in-progress" || item.status === "up-next")
-    .flatMap((item) => cardPrNumbers(item)))];
+  const named = items.filter((item) => isActiveStatus(item.status)).flatMap((item) => cardPrRefs(item));
   const local = await cachedMergeLog(cwd, now);
   if (!named.length) return { merges: local, notes: [] };
-  const repo = await githubRepoFor(cwd);
-  if (!repo) {
-    return { merges: local, notes: ["Merged-PR warnings use only this computer's git history: this project has no GitHub origin remote."] };
-  }
+  const origin = await githubRepoFor(cwd);
   const seenHere = new Set(local.map((merge) => merge.pr));
-  const github = await githubMerges(repo, named.filter((pr) => !seenHere.has(pr)), { now });
-  const byPr = new Map(local.map((merge) => [merge.pr, merge]));
-  for (const merge of github.merges) byPr.set(merge.pr, merge);
-  return { merges: [...byPr.values()], notes: github.note ? [github.note] : [] };
+  const lookups = named.flatMap((ref) => {
+    if (ref.repo) return [{ repo: ref.repo, number: ref.number }];
+    return origin && !seenHere.has(ref.number) ? [{ repo: origin, number: ref.number }] : [];
+  });
+  const notes = !origin && named.some((ref) => ref.repo === null)
+    ? ["Merged-PR warnings for pull requests named as #123 use only this computer's git history: this project has no GitHub origin remote."]
+    : [];
+  if (!lookups.length) return { merges: local, notes };
+  const github = await githubMerges(lookups, { now });
+  // A merge matches a card's owner/name#123; one in the origin repository also matches a bare #123.
+  const isOrigin = (repo: string) => !!origin && repo.toLowerCase() === origin.toLowerCase();
+  const merges: MergeRecord[] = [
+    ...local,
+    ...(origin ? local.map((merge) => ({ ...merge, repo: origin })) : []),
+    ...github.merges.flatMap((merge) => {
+      const record = { pr: merge.number, mergedAt: merge.mergedAt, repo: merge.repo };
+      return isOrigin(merge.repo) ? [record, { pr: merge.number, mergedAt: merge.mergedAt }] : [record];
+    }),
+  ];
+  return { merges, notes: [...notes, ...github.notes] };
 }
 
 async function readDocMtimes(planningRoot: string, items: PlanbanRoadmapItem[]): Promise<DocMtime[]> {

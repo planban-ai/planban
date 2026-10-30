@@ -8,7 +8,7 @@
 import { ConvexError } from "convex/values";
 import { sectionList } from "../../../../src/core/docSections";
 import { PLANBAN_STATUSES, type PlanbanDocPayload, type PlanbanHistoryPayload, type PlanbanRoadmap } from "../../../../src/core/types";
-import { boardOnlyStaleness, cardPrNumbers, largeDocNote, stalenessAttention } from "../../../../src/core/staleness";
+import { boardOnlyStaleness, cardPrRefs, isActiveStatus, largeDocNote, stalenessAttention } from "../../../../src/core/staleness";
 import { cardAncestry } from "../../../../src/core/boardOperations";
 import { queryWorkItems, type WorkItemQuery } from "../../../../src/core/workItemQuery";
 import { internal } from "../_generated/api";
@@ -514,7 +514,7 @@ async function callTool(service: McpService, origin: string, name: string, args:
         revision: roadmap.revision, card, ancestry: cardAncestry(roadmap, cardId),
         // The note only for an active card that names a PR, whose merge this view can't check.
         staleness: freshness.cards[cardId] ?? [],
-        ...(freshness.notes?.length && (card.status === "in-progress" || card.status === "up-next") && cardPrNumbers(card).length ? { stalenessNote: freshness.notes.join(" ") } : {}),
+        ...(freshness.notes?.length && isActiveStatus(card.status) && cardPrRefs(card).length ? { stalenessNote: freshness.notes.join(" ") } : {}),
         ...(others.length ? { workingOn: others } : {}), ...(changes.length ? { unresolvedChanges: changes } : {}),
       };
     }

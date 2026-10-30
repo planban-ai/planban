@@ -15,7 +15,22 @@ export interface StalenessSignal {
 export interface MergeRecord {
   pr: number;
   mergedAt: string;
+  /** "owner/name" for another repository; absent for this project's own. */
+  repo?: string | undefined;
 }
+
+/** A pull request a card names: in this project's own repository (repo null), or another one. */
+export interface PrRef {
+  repo: string | null;
+  number: number;
+}
+
+/** One key per pull request, matching a card's reference to a merge. */
+export function prKey(repo: string | null | undefined, number: number): string {
+  return `${repo ? repo.toLowerCase() : ""}#${number}`;
+}
+
+const prName = (repo: string | null | undefined, number: number) => `${repo ?? ""}#${number}`;
 
 export interface DocMtime {
   cardId: string;
@@ -56,6 +71,7 @@ const GROUP_BEHIND_SLACK_MS = DAY_MS;
 // Tool doc writes land a moment before their history entry.
 const DOC_WRITE_SLACK_MS = 2_000;
 const ACTIVE_STATUSES = new Set(["in-progress", "up-next"]);
+export const isActiveStatus = (status: string) => ACTIVE_STATUSES.has(status);
 // Order used for the board chip and for sorting attention lists.
 export const STALENESS_KIND_ORDER: StalenessKind[] = ["holds-files", "merged", "doc-edited", "quiet", "group-behind", "large-doc", "awaiting-owner"];
 // Kinds an agent can fix by editing the card; awaiting-owner waits on the human instead, and
@@ -98,42 +114,62 @@ export function largeDocNote(kind: "spec" | "plan", bytes: number): string | nul
   return `${kind === "spec" ? "Spec" : "Plan"} is ${kilobytes(bytes)}; rewrite it to the current state, don't append`;
 }
 
-/** PR numbers named in text: `#123`, `PR 123`, `PRs 1, 2 and 3`, `PRs 386–388`, `.../pull/123`. */
-export function prNumbersInText(text: string | null | undefined): number[] {
+// Another repository, named in full: `owner/name#123` or a github.com pull request address.
+const QUALIFIED_ADDRESS = /https?:\/\/(?:www\.)?github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d{1,6})\b/giu;
+const QUALIFIED_SHORT = /(?<![\w./-])([\w.-]+\/[\w.-]+)#(\d{1,6})\b/gu;
+
+/**
+ * Pull requests named in text. `owner/name#123` and github.com addresses name that repository;
+ * `#123`, `PR 123`, `PRs 1, 2 and 3`, `PRs 386–388` and other `/pull/123` addresses name this
+ * project's own.
+ */
+export function prRefsInText(text: string | null | undefined): PrRef[] {
   if (!text) return [];
-  const found = new Set<number>();
-  for (const match of text.matchAll(/(?<![\w&])#(\d{1,6})\b/gu)) found.add(Number(match[1]));
-  for (const match of text.matchAll(/\/pull\/(\d{1,6})\b/gu)) found.add(Number(match[1]));
+  const found = new Map<string, PrRef>();
+  const add = (repo: string | null, number: number) => found.set(prKey(repo, number), { repo, number });
+  let rest = text;
+  for (const pattern of [QUALIFIED_ADDRESS, QUALIFIED_SHORT]) {
+    for (const match of rest.matchAll(pattern)) add(match[1]!, Number(match[2]));
+    rest = rest.replace(pattern, " ");
+  }
+  for (const match of rest.matchAll(/(?<![\w&])#(\d{1,6})\b/gu)) add(null, Number(match[1]));
+  for (const match of rest.matchAll(/\/pull\/(\d{1,6})\b/gu)) add(null, Number(match[1]));
   const list = /\bPRs?\s*#?(\d{1,6})((?:\s*(?:,|\/|&|\+|and|or|–|-|to)\s*#?\d{1,6})*)/giu;
-  for (const match of text.matchAll(list)) {
+  for (const match of rest.matchAll(list)) {
     let previous = Number(match[1]);
-    found.add(previous);
+    add(null, previous);
     for (const next of (match[2] ?? "").matchAll(/(–|-|to)?\s*#?(\d{1,6})/gu)) {
       const value = Number(next[2]);
       // Expand short ranges such as "PRs 386–388".
       if (next[1] && value > previous && value - previous <= 50) {
-        for (let between = previous + 1; between < value; between += 1) found.add(between);
+        for (let between = previous + 1; between < value; between += 1) add(null, between);
       }
-      found.add(value);
+      add(null, value);
       previous = value;
     }
   }
-  return [...found];
+  return [...found.values()];
 }
 
-function prNumbersInMetadata(metadata: Record<string, unknown> | undefined): number[] {
+/** The PR numbers named in text, whichever repository. */
+export function prNumbersInText(text: string | null | undefined): number[] {
+  return [...new Set(prRefsInText(text).map((ref) => ref.number))];
+}
+
+function prRefsInMetadata(metadata: Record<string, unknown> | undefined): PrRef[] {
   const prs = metadata?.prs;
   if (!Array.isArray(prs)) return [];
-  return prs.flatMap((entry) => {
-    if (typeof entry === "number" && Number.isInteger(entry)) return [entry];
-    if (typeof entry === "string") return /^\d+$/u.test(entry.trim()) ? [Number(entry)] : prNumbersInText(entry);
+  return prs.flatMap((entry): PrRef[] => {
+    if (typeof entry === "number" && Number.isInteger(entry)) return [{ repo: null, number: entry }];
+    if (typeof entry === "string") return /^\d+$/u.test(entry.trim()) ? [{ repo: null, number: Number(entry) }] : prRefsInText(entry);
     return [];
   });
 }
 
-/** Every PR an active card names, in its summary, next action or metadata `prs` list. */
-export function cardPrNumbers(item: Pick<PlanbanRoadmapItem, "summary" | "nextAction" | "metadata">): number[] {
-  return [...new Set([...prNumbersInText(item.summary), ...prNumbersInText(item.nextAction), ...prNumbersInMetadata(item.metadata)])];
+/** Every PR a card names, in its summary, next action or metadata `prs` list. */
+export function cardPrRefs(item: Pick<PlanbanRoadmapItem, "summary" | "nextAction" | "metadata">): PrRef[] {
+  const refs = [...prRefsInText(item.summary), ...prRefsInText(item.nextAction), ...prRefsInMetadata(item.metadata)];
+  return [...new Map(refs.map((ref) => [prKey(ref.repo, ref.number), ref])).values()];
 }
 
 /** When a card last noted progress; a merge after this is flagged. */
@@ -174,7 +210,7 @@ function holdsFilesSignal(item: PlanbanRoadmapItem, files: string[], now: number
 }
 
 export function computeStaleness(input: StalenessInput): BoardStaleness {
-  const mergedAt = new Map(input.merges.map((merge) => [merge.pr, time(merge.mergedAt)]));
+  const mergedAt = new Map(input.merges.map((merge) => [prKey(merge.repo, merge.pr), time(merge.mergedAt)]));
   const firstSeen = new Map<string, number>();
   const lastSeen = new Map<string, number>();
   const lastDocWrite = new Map<string, number>();
@@ -212,13 +248,12 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
     // to its summary or next action, or completing it, notes progress; a touch or a metadata edit doesn't.
     const floor = Math.max(progressFloor(item) ?? -Infinity, firstSeen.get(item.id) ?? -Infinity);
     if (floor > -Infinity) {
-      const prs = cardPrNumbers(item);
-      const merged = [...prs]
-        .map((pr) => ({ pr, at: mergedAt.get(pr) ?? null }))
-        .filter((entry): entry is { pr: number; at: number } => entry.at !== null && entry.at > floor && entry.at <= input.now)
+      const merged = cardPrRefs(item)
+        .map((ref) => ({ ref, at: mergedAt.get(prKey(ref.repo, ref.number)) ?? null }))
+        .filter((entry): entry is { ref: PrRef; at: number } => entry.at !== null && entry.at > floor && entry.at <= input.now)
         .sort((left, right) => right.at - left.at);
       if (merged.length) {
-        const names = merged.slice(0, 3).map((entry) => `#${entry.pr}`).join(", ");
+        const names = merged.slice(0, 3).map((entry) => prName(entry.ref.repo, entry.ref.number)).join(", ");
         const latest = merged[0]!.at;
         signals.push({ kind: "merged", detail: `${names} merged ${shortDate(latest)}`, since: new Date(latest).toISOString() });
       }
@@ -279,7 +314,7 @@ export const MERGES_NOT_CHECKED_NOTE = "Merged-PR warnings aren't checked here, 
  * with a note when an active card names a PR.
  */
 export function boardOnlyStaleness(items: PlanbanRoadmapItem[], now: number, history: StalenessInput["history"] = []): BoardStaleness {
-  const namesPr = items.some((item) => ACTIVE_STATUSES.has(item.status) && cardPrNumbers(item).length > 0);
+  const namesPr = items.some((item) => ACTIVE_STATUSES.has(item.status) && cardPrRefs(item).length > 0);
   return computeStaleness({ items, history, docMtimes: [], merges: [], now, notes: namesPr ? [MERGES_NOT_CHECKED_NOTE] : [] });
 }
 
