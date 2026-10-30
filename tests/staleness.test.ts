@@ -18,6 +18,7 @@ import {
 import { clearStalenessCaches, collectStaleness, readMergeLog } from "../src/core/stalenessSources";
 import { createCard, initializeProject, loadState } from "../src/core/storage";
 import { committedRoadmap, createEmptyRoadmap, planCreateCard, planMoveCard, planUpdateCard } from "../src/core/boardOperations";
+import { githubMerges, githubRepoFromRemote } from "../src/core/githubMerges";
 import type { PlanbanRoadmapItem } from "../src/core/types";
 import { planbanStalenessLine } from "../plugins/planban/scripts/claude-session-context.mjs";
 
@@ -167,6 +168,47 @@ test("large-doc: a Spec or Plan over 100 KB says rewrite, don't append", () => {
   assert.deepEqual(result.cards.big, [{ kind: "large-doc", detail: "Spec is 120 KB; rewrite it to the current state, don't append", since: iso(NOW - 2000) }]);
   assert.equal(result.cards.small, undefined);
   assert.equal(stalenessAttention(result, [item({ id: "big" })]).total, 1, "agents are asked to fix it");
+});
+
+test("GitHub remotes are read in every form git writes them", () => {
+  for (const remote of ["https://github.com/planban-ai/planban.git", "https://github.com/planban-ai/planban", "git@github.com:planban-ai/planban.git", "ssh://git@github.com/planban-ai/planban.git", "https://token@github.com/planban-ai/planban.git\n"]) {
+    assert.equal(githubRepoFromRemote(remote), "planban-ai/planban", remote);
+  }
+  assert.equal(githubRepoFromRemote("https://gitlab.com/o/r.git"), null);
+});
+
+test("GitHub merges are read from a cursor, kept between reads, and degrade with a note", async () => {
+  const root = mkdtempSync(join(tmpdir(), "planban-github-"));
+  const previousHome = process.env.PLANBAN_HOME;
+  process.env.PLANBAN_HOME = root;
+  try {
+    const calls: string[][] = [];
+    const page = (rows: Array<{ number: number; merged_at: string | null; updated_at: string }>) => JSON.stringify(rows);
+    let answer: (args: string[]) => string = () => page([
+      { number: 5, merged_at: iso(NOW - DAY), updated_at: iso(NOW - DAY) },
+      { number: 6, merged_at: null, updated_at: iso(NOW - 2 * DAY) },
+    ]);
+    const exec = async (_command: string, args: string[]) => { calls.push(args); return answer(args); };
+    const first = await githubMerges("o/r", NOW - 10 * DAY, { now: NOW, exec });
+    assert.deepEqual(first, { merges: [{ pr: 5, mergedAt: iso(NOW - DAY) }] });
+    assert.ok(calls[0]!.includes("repos/o/r/pulls") && calls[0]!.includes("state=closed") && calls[0]!.includes("sort=updated"));
+
+    // A later read in another process fetches only what's new and keeps what was seen.
+    answer = () => page([{ number: 8, merged_at: iso(NOW + DAY), updated_at: iso(NOW + DAY) }]);
+    const later = await githubMerges("o/r", NOW - 10 * DAY, { now: NOW + 2 * DAY, exec });
+    assert.deepEqual(later.merges.map((merge) => merge.pr).sort(), [5, 8]);
+
+    // GitHub out of reach: the merges seen so far, and a note saying why.
+    answer = () => { throw Object.assign(new Error("gh failed"), { stderr: "To get started with GitHub CLI, please run:  gh auth login" }); };
+    const offline = await githubMerges("o/r", NOW - 10 * DAY, { now: NOW + 4 * DAY, exec });
+    assert.deepEqual(offline.merges.map((merge) => merge.pr).sort(), [5, 8]);
+    assert.match(offline.note ?? "", /isn't signed in here/u);
+  } finally {
+    if (previousHome === undefined) delete process.env.PLANBAN_HOME;
+    else process.env.PLANBAN_HOME = previousHome;
+    clearStalenessCaches();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("doc-edited: a doc changed outside Planban after its last tool write and the card's update", () => {

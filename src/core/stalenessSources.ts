@@ -1,13 +1,19 @@
 // Gathers the inputs for stale signals: the local git merge log, the history index, doc mtimes
-// and files held in card folders.
+// and files held in card folders. An Online Board uses its own history from the service and
+// merges from GitHub, so a merge made on any computer counts.
 // Every source is best effort: a failure yields no signals of that kind, never an error.
 import { execFile } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { cardsHoldingFiles } from "./cardFiles";
+import { clearGitHubMergeCache, githubMerges, githubRepoFor } from "./githubMerges";
+import { boardPath, onlineRequest } from "./online/client";
 import { defaultPlanningRoot, expandHome, historyIndexPath, resolveInsideRoot, roadmapPath } from "./paths";
-import { computeStaleness, parseMergeLog, type BoardStaleness, type DocMtime, type MergeRecord } from "./staleness";
-import type { PlanbanHistoryEntry, PlanbanRoadmapItem } from "./types";
+import { cardPrNumbers, computeStaleness, parseMergeLog, progressFloor, type BoardStaleness, type DocMtime, type MergeRecord } from "./staleness";
+import type { PlanbanHistoryEntry, PlanbanHistoryPayload, PlanbanProjectManifest, PlanbanRoadmap, PlanbanRoadmapItem } from "./types";
+
+type Storage = PlanbanProjectManifest["storage"];
+type OnlineStorage = Extract<NonNullable<Storage>, { kind: "online" }>;
 
 const GIT_TIMEOUT_MS = 2_000;
 const MERGE_LOG_TTL_MS = 30_000;
@@ -17,10 +23,13 @@ type HistoryRows = Array<Pick<PlanbanHistoryEntry, "createdAt" | "affectedCards"
 
 const mergeLogCache = new Map<string, { at: number; merges: Promise<MergeRecord[]> }>();
 const historyCache = new Map<string, { key: string; rows: HistoryRows }>();
+const onlineHistoryCache = new Map<string, { version: number; rows: Map<number, HistoryRows[number]> }>();
 
 export function clearStalenessCaches() {
   mergeLogCache.clear();
   historyCache.clear();
+  onlineHistoryCache.clear();
+  clearGitHubMergeCache();
 }
 
 /**
@@ -73,6 +82,46 @@ async function readHistoryRows(planningRoot: string): Promise<HistoryRows> {
   }
 }
 
+/** An Online Board's history from the service: only entries newer than the last read are fetched. */
+async function readOnlineHistoryRows(storage: OnlineStorage): Promise<HistoryRows> {
+  const key = `${storage.url}|${storage.boardId}`;
+  const cached = onlineHistoryCache.get(key) ?? { version: 0, rows: new Map() };
+  try {
+    const payload = await onlineRequest<PlanbanHistoryPayload>(storage.url, boardPath(storage.boardId, `/history?after=${cached.version}`));
+    const rows = new Map(cached.rows);
+    for (const entry of payload.entries ?? []) {
+      rows.set(entry.version, { createdAt: String(entry.createdAt ?? ""), affectedCards: entry.affectedCards ?? [], affectedDocs: entry.affectedDocs ?? [] });
+    }
+    const version = Math.max(cached.version, ...(payload.entries ?? []).map((entry) => entry.version));
+    onlineHistoryCache.set(key, { version, rows });
+    return [...rows.values()];
+  } catch {
+    return [...cached.rows.values()];
+  }
+}
+
+/**
+ * Merges for an Online Board: this checkout's git log plus GitHub, read back to the oldest active
+ * card that names a PR. No card naming a PR means no GitHub read at all.
+ */
+async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: number): Promise<{ merges: MergeRecord[]; notes: string[] }> {
+  const floors = items
+    .filter((item) => (item.status === "in-progress" || item.status === "up-next") && cardPrNumbers(item).length > 0)
+    .map((item) => progressFloor(item))
+    .filter((at): at is number => at !== null);
+  const local = cachedMergeLog(cwd, now);
+  if (!floors.length) return { merges: await local, notes: [] };
+  const repo = await githubRepoFor(cwd);
+  if (!repo) {
+    return { merges: await local, notes: ["Merged-PR warnings use only this computer's git history: this project has no GitHub origin remote."] };
+  }
+  const [known, github] = await Promise.all([local, githubMerges(repo, Math.min(...floors), { now })]);
+  // GitHub is the record; the local log fills in only what GitHub didn't answer.
+  const byPr = new Map(known.map((merge) => [merge.pr, merge]));
+  for (const merge of github.merges) byPr.set(merge.pr, merge);
+  return { merges: [...byPr.values()], notes: github.note ? [github.note] : [] };
+}
+
 async function readDocMtimes(planningRoot: string, items: PlanbanRoadmapItem[]): Promise<DocMtime[]> {
   const docs = items
     .filter((item) => item.status === "in-progress" || item.status === "up-next")
@@ -93,9 +142,22 @@ export async function collectStaleness(input: {
   cwd: string;
   planningRoot: string;
   items: PlanbanRoadmapItem[];
+  /** The board's storage, from its manifest; an Online Board reads its own history and GitHub. */
+  storage?: Storage | undefined;
   now?: number | undefined;
 }): Promise<BoardStaleness> {
   const now = input.now ?? Date.now();
+  const storage = input.storage;
+  if (storage?.kind === "online") {
+    try {
+      // Online documents change only through Planban, so none is "edited outside Planban", and the
+      // board holds no files. Document sizes are checked when a document is read or written.
+      const [history, { merges, notes }] = await Promise.all([readOnlineHistoryRows(storage), onlineMerges(input.cwd, input.items, now)]);
+      return computeStaleness({ items: input.items, history, docMtimes: [], merges, notes, now });
+    } catch {
+      return { cards: {}, wip: null };
+    }
+  }
   try {
     const [merges, history, docMtimes, cardFiles] = await Promise.all([
       cachedMergeLog(input.cwd, now),
@@ -121,6 +183,13 @@ export async function projectStaleness(projectDir: string): Promise<{ items: Pla
       storage?: { root?: unknown };
     };
     if (typeof manifest.repoId !== "string" || manifest.enabled === false) return null;
+    const storage = (manifest.storage as Storage | undefined);
+    if (storage?.kind === "online" && typeof storage.url === "string" && typeof storage.boardId === "string") {
+      // The board as the service has it, read without the backup and account-linking a full load does.
+      const { roadmap } = await onlineRequest<{ roadmap: PlanbanRoadmap }>(storage.url, boardPath(storage.boardId));
+      const items = roadmap.roadmapItems;
+      return { items, staleness: await collectStaleness({ cwd: projectDir, planningRoot: projectDir, items, storage }) };
+    }
     const planningRoot = typeof manifest.storage?.root === "string" && manifest.storage.root
       ? resolve(expandHome(manifest.storage.root))
       : defaultPlanningRoot(manifest.repoId);

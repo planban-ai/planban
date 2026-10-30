@@ -292,7 +292,7 @@ async function boardResult(text, repoId, structuredContent) {
 
 // Stale signals are advisory: they never block or fail a read.
 async function boardStaleness(state) {
-  return await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems });
+  return await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems, storage: state.manifest.storage });
 }
 
 function withLine(text, line) {

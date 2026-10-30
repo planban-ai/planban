@@ -100,6 +100,24 @@ test("edits carry the revision the person saw; a stale one is a conflict that na
   });
 });
 
+test("the web page marks cards that wait on a person, and a metadata edit through the service is a patch", async () => {
+  await withServiceEnv(async () => {
+    const { boardId, adapter } = await ownerWithBoard();
+    const created = await page(adapter, boardPath(boardId, "/cards"), { method: "POST", body: { title: "Sign off", status: "in-progress", nextAction: "Owner: approve the copy.", baseRevision: 1 } });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const cardId = created.body.createdCard.id as string;
+    assert.deepEqual(created.body.staleness.cards[cardId].map((signal: Json) => signal.kind), ["awaiting-owner"], "an edit's answer carries the notes too");
+    const state = await page(adapter, boardPath(boardId, "/state"));
+    assert.deepEqual(state.body.staleness.cards[cardId].map((signal: Json) => signal.kind), ["awaiting-owner"]);
+
+    const first = await page(adapter, cardPath(boardId, cardId), { method: "PATCH", body: { metadata: { thread: "t1", pr: 4 }, baseRevision: 2 } });
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    const second = await page(adapter, cardPath(boardId, cardId), { method: "PATCH", body: { metadata: { pr: null, owner: "olive" }, baseRevision: 3 } });
+    assert.equal(second.status, 200, JSON.stringify(second.body));
+    assert.deepEqual(second.body.roadmap.roadmapItems.find((item: Json) => item.id === cardId).metadata, { thread: "t1", owner: "olive" });
+  });
+});
+
 test("Spec and Plan: new, existing and deleted documents, each write stating the stamp the page read", async () => {
   await withServiceEnv(async () => {
     const { boardId, adapter, log } = await ownerWithBoard();

@@ -27,6 +27,8 @@ import { planbanCommand } from "../src/core/command";
 import { listHistory } from "../src/core/history";
 import { checkIndexCard, checkIndexDocument, checkIndexValue } from "../src/core/contentRules";
 import type { PlanbanDocPayload, PlanbanRoadmap } from "../src/core/types";
+import { clearStalenessCaches, collectStaleness, projectStaleness } from "../src/core/stalenessSources";
+import { planbanStalenessLine } from "../plugins/planban/scripts/claude-session-context.mjs";
 const CMD = planbanCommand().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const execFileAsync = promisify(execFile);
@@ -713,6 +715,63 @@ test("Board HTTP API reads and edits online state and signals changes from anoth
     assert.equal(draft.status, 422);
     assert.match((await draft.json()).error, /not yet available for Online Boards/);
   } finally { await server.close(); }
+});
+
+test("an Online Board shows freshness warnings everywhere a local one does, with merges from GitHub", async () => {
+  // This project's origin is on GitHub; a stand-in gh answers for it.
+  await execFileAsync("git", ["init", "-q"], { cwd });
+  await execFileAsync("git", ["remote", "add", "origin", "git@github.com:example/demo.git"], { cwd });
+  const bin = join(root, "bin");
+  await mkdir(bin, { recursive: true });
+  const ghLog = join(root, "gh-calls.log");
+  const pathBefore = process.env.PATH;
+  const fakeGh = async (script: string) => {
+    await writeFile(join(bin, "gh"), `#!/bin/sh\necho "$@" >> "${ghLog}"\n${script}\n`, { mode: 0o755 });
+    clearStalenessCaches();
+    await rm(join(process.env.PLANBAN_HOME!, "online", "github"), { recursive: true, force: true });
+  };
+  process.env.PATH = `${bin}:${pathBefore}`;
+  try {
+    await storage.setCardStatus(cwd, "alpha", "in-progress");
+    await storage.updateCard({ cwd, cardId: "alpha", nextAction: "Merge PR 41, then deploy." });
+    await storage.createCard({ cwd, title: "Sign off", status: "in-progress", nextAction: "Owner: approve the copy." });
+    await takeOnline(fake.url, cwd);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const mergedAt = new Date(Date.now() - 5).toISOString();
+    await fakeGh(`echo '[{"number":41,"merged_at":"${mergedAt}","updated_at":"${mergedAt}"},{"number":40,"merged_at":null,"updated_at":"${mergedAt}"}]'`);
+
+    // planban_status and the session-start hook read the board from the service, not a local file.
+    const board = await projectStaleness(cwd);
+    assert.deepEqual(board?.staleness.cards.alpha?.map((signal) => signal.kind), ["merged"]);
+    assert.deepEqual(board?.staleness.cards["sign-off"]?.map((signal) => signal.kind), ["awaiting-owner"]);
+    assert.equal(board?.staleness.notes, undefined);
+    assert.match(await readFile(ghLog, "utf8"), /api --method GET repos\/example\/demo\/pulls/u);
+    clearStalenessCaches();
+    assert.equal(await planbanStalenessLine({ projectDir: cwd }), "1 active card looks stale (alpha); fix any you touch.");
+
+    // planban_get_board and the board page use the same sources for a loaded Online Board.
+    const state = await storage.loadState(cwd);
+    const loaded = await collectStaleness({ cwd: state.cwd, planningRoot: state.planningRoot, items: state.roadmap.roadmapItems, storage: state.manifest.storage });
+    assert.deepEqual(loaded.cards.alpha?.map((signal) => signal.kind), ["merged"]);
+    assert.ok(fake.requests.some((req) => req.path === "/api/v1/boards/demo/history"), "quiet and first-seen times come from the board's own history");
+
+    // A metadata-only touch doesn't settle the merge; changing the next action does.
+    await storage.updateCard({ cwd, cardId: "alpha", metadata: { checked: true }, baseRevision: state.roadmap.revision });
+    clearStalenessCaches();
+    assert.deepEqual((await projectStaleness(cwd))?.staleness.cards.alpha?.map((signal) => signal.kind), ["merged"]);
+
+    // GitHub out of reach: no error, the merges already seen here, and a note saying why.
+    await fakeGh(`echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4`);
+    const degraded = await projectStaleness(cwd);
+    assert.equal(degraded?.staleness.cards.alpha, undefined);
+    assert.deepEqual(degraded?.staleness.cards["sign-off"]?.map((signal) => signal.kind), ["awaiting-owner"]);
+    assert.match(degraded?.staleness.notes?.[0] ?? "", /isn't signed in here/u);
+    clearStalenessCaches();
+    assert.match(await planbanStalenessLine({ projectDir: cwd }) ?? "", /^Merged-PR warnings may be missing merges: the GitHub CLI \(gh\) isn't signed in here\./u);
+  } finally {
+    process.env.PATH = pathBefore;
+    clearStalenessCaches();
+  }
 });
 
 test("an Online Board without a sign-in tells the page which service to sign in to, signed out or expired", async () => {

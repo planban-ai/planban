@@ -19,6 +19,7 @@
 // becomes the page's 422; a missing or ended browser session (401) carries
 // signInNeeded, so the page shows its signed-out screen.
 import type { PlanbanRoadmap } from "../core/types";
+import { computeStaleness, type StalenessSignal } from "../core/staleness";
 
 /** One request to the online service, at a path under its own address. */
 export type ServiceSend = (path: string, init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<Response>;
@@ -47,6 +48,15 @@ export interface HostedBoardState {
   roadmap: PlanbanRoadmap;
   hosted: { boardId: string; role: BoardRole | null; authority: string | null };
   onlineReplay?: { replayed: true; originalRevision?: number };
+  staleness?: { cards: Record<string, StalenessSignal[]> };
+}
+
+/**
+ * The board's notes that need a person, from the board alone: the web page has no git or GitHub,
+ * and its notes show only what waits on someone ("Needs you").
+ */
+function pageStaleness(roadmap: PlanbanRoadmap) {
+  return { cards: computeStaleness({ items: roadmap.roadmapItems, history: [], docMtimes: [], merges: [], now: Date.now() }).cards };
 }
 
 export interface LiveToken {
@@ -208,7 +218,7 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
     const outcome = await op(boardId, name, input, request);
     if (!outcome.ok) return outcome.reply;
     const { roadmap, result, replayed, originalRevision } = outcome.value;
-    const state: HostedBoardState & Record<string, unknown> = { ...boardState(boardId, roadmap), ...(withResult && result ? result : {}) };
+    const state: HostedBoardState & Record<string, unknown> = { ...boardState(boardId, roadmap), staleness: pageStaleness(roadmap), ...(withResult && result ? result : {}) };
     if (replayed) state.onlineReplay = { replayed: true, ...(originalRevision === undefined ? {} : { originalRevision }) };
     return reply(state);
   }
@@ -223,7 +233,7 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
     const board = await get<{ roadmap: PlanbanRoadmap; authority?: string; role?: BoardRole }>(serviceBoard(boardId), request);
     if (!board.ok) return board.reply;
     roles.set(boardId, { role: board.value.role ?? roles.get(boardId)?.role ?? null, authority: board.value.authority ?? null });
-    return reply(boardState(boardId, board.value.roadmap));
+    return reply({ ...boardState(boardId, board.value.roadmap), staleness: pageStaleness(board.value.roadmap) });
   }
 
   const routes: Route[] = [
