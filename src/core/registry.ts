@@ -9,6 +9,7 @@ import {
   detachedBoardCwd,
   eventsPath,
   expandHome,
+  hasLiveRoadmap,
   manifestPath,
   registryPath,
   resolveInsideRoot,
@@ -399,7 +400,7 @@ export async function registerBoardFromCwd(cwdInput: string): Promise<PlanbanBoa
   }
   const planningRoot = resolvePlanningRoot(manifest);
   const liveRoadmapPath = roadmapPath(planningRoot);
-  if (!(await pathExists(liveRoadmapPath))) return null;
+  if (!(await hasLiveRoadmap(planningRoot))) return null;
   const raw = JSON.parse(await readFile(liveRoadmapPath, "utf8")) as { project?: { title?: unknown } };
   const timestamp = nowIso();
   const registry = await readRegistryFile();

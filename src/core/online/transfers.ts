@@ -1,17 +1,17 @@
-import { cp, mkdir, readFile, rename, rm } from "node:fs/promises";
+import { cp, link, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { normalizeRoadmap, PlanbanConflictError, PlanbanNotFoundError, PlanbanValidationError } from "../boardOperations";
 import { listHistory } from "../history";
-import { agentContextPath, defaultPlanbanRoot, defaultPlanningRoot, detachedBoardCwd, historyCarriedDocsPath, historyDocPath, historyIndexPath, historyRoadmapPath, isPathInsideRoot, manifestPath, resolveInsideRoot, slugify } from "../paths";
-import { atomicWriteFile, isAtomicWriteTemp, LOCK_DIR, QUEUE_DIR, withBoardWriteLock } from "../persistence";
+import { agentContextPath, defaultPlanbanRoot, hasLiveRoadmap, isRetiredRoadmap, RETIRED_ROADMAP, defaultPlanningRoot, detachedBoardCwd, historyCarriedDocsPath, historyDocPath, historyIndexPath, historyRoadmapPath, isPathInsideRoot, manifestPath, resolveInsideRoot, slugify } from "../paths";
+import { atomicWriteFile, carryIdempotencyRecords, checkIdempotencyCarry, isAtomicWriteTemp, LOCK_DIR, QUEUE_DIR, withBoardWriteLock } from "../persistence";
 import { registerBoardFromState } from "../registry";
 import { roadmapSchema } from "../schema";
-import { loadState, pathExists, readDoc, readLocalGoals, readManifest, refreshAgentsBlock, resolveProjectCwd, resolvePlanningRoot, saveRoadmap } from "../storage";
+import { docPathForItem, loadState, pathExists, readLocalGoals, readManifest, refreshAgentsBlock, resolveProjectCwd, resolvePlanningRoot, saveRoadmap } from "../storage";
 import { normalizeGoals } from "../goals";
 import type { PlanbanProjectManifest, PlanbanResolvedState } from "../types";
-import { loadOnlineState, onlineState } from "./adapter";
+import { loadOnlineState, onlineCacheRoot, onlineState } from "./adapter";
 import { boardAccount, recordBoardAccount, recordBoardAccountAs, withIdentity } from "./accounts";
 import { boardCredentials, boardPath, onlineRequest, requireCredentials } from "./client";
 import { markIndependent, readOnlineNote, readStaleMarker, removeOnlineNote, writeOnlineNote, type StaleCopy } from "./copyCheck";
@@ -79,10 +79,14 @@ const journalSchema = z.object({
   root: z.string().optional(),
   /** Take Local: the generation the board was frozen at. */
   generation: z.number().optional(),
-  /** Take Online, once committed: where the local roadmap is moved, and local changes the upload missed. */
+  /**
+   * Take Online: where the local roadmap is copied before the board here is
+   * shut (sealing, then sealed), ahead of the commit; and local changes an
+   * upload committed by an older Planban missed.
+   */
   snapshot: z.string().optional(),
   unsyncedLocalChanges: z.array(z.object({ version: z.number(), createdAt: z.string(), summary: z.string() })).optional(),
-  phase: z.enum(["uploading", "committed", "fencing", "fenced", "staged", "published"]),
+  phase: z.enum(["uploading", "sealing", "sealed", "restoring", "committed", "fencing", "fenced", "staged", "published"]),
   startedAt: z.string(),
   /** Take Online: the account that started the upload. Only it can see, finish or cancel that upload. */
   userId: z.string().optional(),
@@ -139,14 +143,24 @@ async function readCarriedDocs(planningRoot: string, version: number) {
   return carriedDocsSchema.parse(JSON.parse(raw)).docs;
 }
 
-export async function buildLocalBundle(cwd: string): Promise<BoardBundle> {
-  const state = await loadState(cwd);
+/** The board as it was when Take Online shut it here: its roadmap from the snapshot, everything else in place. */
+async function shutBoardState(cwd: string, snapshot: string): Promise<PlanbanResolvedState> {
+  const manifest = await readManifest(cwd);
+  if (!manifest?.enabled) throw new PlanbanValidationError(`Planban is not initialized in ${cwd}`);
+  return { cwd, manifest, manifestPath: manifestPath(cwd), agentContextPath: agentContextPath(cwd), planningRoot: resolvePlanningRoot(manifest),
+    roadmapPath: snapshot, roadmap: normalizeRoadmap(JSON.parse(await readFile(snapshot, "utf8"))) };
+}
+
+/** A local board as one bundle; a board shut by an unfinished Take Online is read from its snapshot. */
+export async function buildLocalBundle(cwd: string, shutAt?: string): Promise<BoardBundle> {
+  const state = shutAt ? await shutBoardState(cwd, shutAt) : await loadState(cwd);
   if (state.manifest.storage?.kind === "online") throw new PlanbanValidationError("This board is already online. Use online export.");
   const docs: BoardBundle["docs"] = [];
   for (const card of state.roadmap.roadmapItems) {
     for (const kind of ["spec", "plan"] as const) {
-      const doc = await readDoc({ cwd, cardId: card.id, kind });
-      if (doc.exists) docs.push({ cardId: card.id, kind, markdown: doc.markdown });
+      const path = docPathForItem(state, card, kind);
+      const markdown = path ? await readFile(path, "utf8").catch((error) => (error as NodeJS.ErrnoException).code === "ENOENT" ? null : Promise.reject(error)) : null;
+      if (markdown !== null) docs.push({ cardId: card.id, kind, markdown });
     }
   }
   const history = await listHistory(state);
@@ -375,7 +389,9 @@ export class PlanbanConfirmationNeeded extends PlanbanValidationError {
  * and the board only becomes live online at commit. Running it again resumes,
  * including after the upload committed but before this project switched.
  * While it runs, the board can still be read and its changes wait for the
- * board's write lock. If it fails before the online board is committed, the
+ * board's write lock; once it switches, a change that was waiting goes to
+ * the online board instead (againIfMoved), and Planban 1.x is shut out of
+ * the copy left here (RETIRED_ROADMAP). If it fails before the online board is committed, the
  * half-copied online version is removed and the board stays on this machine
  * unchanged (owner decision 15).
  */
@@ -396,11 +412,16 @@ export async function takeOnline(urlInput: string, cwdInput: string, options: Mo
     if (journal && (journal.direction !== "online" || journal.url !== url || journal.boardId !== boardId)) {
       throw new PlanbanValidationError(`An unfinished transfer of this board to ${journal.url} is recorded at ${transferJournalPath(planningRoot)}. Finish it first.`);
     }
+    // Resuming: where an earlier attempt got to is read from its record, not from which files exist.
+    let stray: string | undefined;
+    if (journal) ({ journal, stray } = await settleShutBoard(planningRoot, journal));
     if (journal?.phase !== "committed") {
       // Only a clean board goes online (owner decisions 18 and 20): nothing
       // moves until it is tidy, including when resuming an interrupted move.
-      const report = await indexReport(await buildLocalBundle(cwd), planningRoot);
+      const report = await indexReport(await buildLocalBundle(cwd, journal?.phase === "sealed" ? journal.snapshot : undefined), planningRoot);
       if (!report.clean) throw new PlanbanNotReadyForOnline(report);
+      // Retry records cross with the board; two that name different requests would change a retry's meaning.
+      await checkIdempotencyCarry(planningRoot, onlineCacheRoot({ kind: "online", url, boardId }));
     }
     // Resuming continues as the account that started the upload, and only as it.
     if (journal?.userId && journal.userId !== pinned.person) {
@@ -418,7 +439,8 @@ export async function takeOnline(urlInput: string, cwdInput: string, options: Mo
     options.onProgress?.({ step: "switch", message: "Switching this project to the online board" });
     const result = await finishTakeOnline(cwd, manifest, planningRoot, journal!, pinned);
     options.onProgress?.({ step: "done", message: "The board is online" });
-    return result;
+    stray ??= result.strayRoadmap;
+    return { ...result, ...(stray ? { strayRoadmap: stray } : {}) };
   });
 }
 
@@ -470,17 +492,144 @@ const otherAccountMessage = (journal: TransferJournal) =>
 async function abandonUpload(url: string, planningRoot: string, error: unknown): Promise<Error> {
   const journal = await readJournal(planningRoot);
   const reason = error instanceof Error ? error.message : String(error);
-  if (!journal || journal.direction !== "online" || journal.phase !== "uploading") return error instanceof Error ? error : new Error(reason);
+  if (!journal || journal.direction !== "online" || !BEFORE_COMMIT.has(journal.phase)) return error instanceof Error ? error : new Error(reason);
   const outcome = await cancelUpload(url, journal);
   const stopped = error instanceof DOMException && error.name === "AbortError";
   if (outcome === "removed") {
+    await reopenLocalBoard(planningRoot, journal);
     await rm(transferJournalPath(planningRoot), { force: true });
     if (stopped) return new PlanbanTakeOnlineStopped();
     return new PlanbanValidationError(`Taking the board online failed: ${reason}. The board is still on this machine, unchanged, and the partly copied online version was removed. Try again when ready.`);
   }
   if (outcome === "committed") return new PlanbanValidationError(`The board reached the online service before this error (${reason}). Run take-online again to finish switching this project to it.`);
   if (outcome === "other-account") return new PlanbanValidationError(otherAccountMessage(journal));
+  if (journal.phase !== "uploading") {
+    return new PlanbanValidationError(`Taking the board online failed: ${reason}. Planban could not confirm whether the online service received the board, so the board on this machine stays paused: nothing can change it until the move is finished or cancelled. Run take-online again to finish it, or ${planbanCommand()} online stop-take-online to cancel it.`);
+  }
   return new PlanbanValidationError(`Taking the board online failed: ${reason}. The board is still on this machine, unchanged. The partly copied online version could not be removed yet; run take-online again to resume, or ${planbanCommand()} online stop-take-online to cancel it.`);
+}
+
+/** Take Online phases before the service committed: the move can still be cancelled. */
+const BEFORE_COMMIT = new Set<TransferJournal["phase"]>(["uploading", "sealing", "sealed"]);
+
+/**
+ * Copies the live roadmap to `destination`, complete and on disk before that
+ * name exists, so a crash never leaves a partial copy under it. An existing
+ * file there is never replaced.
+ */
+async function copyRoadmapTo(planningRoot: string, destination: string) {
+  const bytes = await readFile(join(planningRoot, "roadmap.json"));
+  const partial = `${destination}.${randomUUID()}.partial`;
+  const handle = await open(partial, "wx");
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await link(partial, destination);
+  } finally {
+    await rm(partial, { force: true });
+  }
+  await syncFolder(planningRoot);
+}
+
+async function syncFolder(path: string) {
+  const handle = await open(path, "r").catch(() => null);
+  await handle?.sync().catch(() => undefined);
+  await handle?.close();
+}
+
+const sameBytes = async (a: string, b: string) => {
+  const [left, right] = await Promise.all([readFile(a).catch(() => null), readFile(b).catch(() => null)]);
+  return !!left && !!right && left.equals(right);
+};
+
+/**
+ * Shuts the board on this machine before the service commits, so that from
+ * then on no writer here (Planban 1.x included) can change a board that may
+ * already be online. The roadmap is copied to a snapshot first, then replaced
+ * by the marker in one step, so roadmap.json is never absent.
+ */
+async function shutLocalBoard(planningRoot: string, journal: TransferJournal): Promise<TransferJournal> {
+  if (journal.phase === "sealed") return journal;
+  const live = join(planningRoot, "roadmap.json");
+  // A snapshot from an attempt cut short is used again only if it is exactly the board as it is now.
+  const reuse = journal.snapshot && await sameBytes(journal.snapshot, live);
+  const snapshot = reuse ? journal.snapshot! : join(planningRoot, `roadmap.local-before-online-${Date.now()}.json`);
+  journal = { ...journal, phase: "sealing", snapshot };
+  await writeJournal(planningRoot, journal);
+  if (!reuse) await copyRoadmapTo(planningRoot, snapshot);
+  crashPoint("take-online:after-snapshot");
+  // Agents still running Planban 1.x read and write roadmap.json directly, and
+  // its `init` would put a fresh, empty board where none is. This marker makes
+  // each of them fail, saying to restart for Planban 2.0, and Planban 2.0
+  // says the board is moving online (or, later, moved).
+  await atomicWriteFile(live, RETIRED_ROADMAP);
+  journal = { ...journal, phase: "sealed" };
+  await writeJournal(planningRoot, journal);
+  crashPoint("take-online:after-seal");
+  return journal;
+}
+
+/**
+ * A roadmap.json that is not the marker, found after the board here was shut,
+ * was put there by something else (Planban 1.x `init` after the file was
+ * removed, say). It is never taken for the board: it is kept aside, named in
+ * the result, and the marker goes back.
+ */
+async function setStrayAside(planningRoot: string): Promise<string | undefined> {
+  if (!(await hasLiveRoadmap(planningRoot))) return undefined;
+  const stray = join(planningRoot, `roadmap.stray-after-shut-${Date.now()}.json`);
+  await copyRoadmapTo(planningRoot, stray);
+  await atomicWriteFile(join(planningRoot, "roadmap.json"), RETIRED_ROADMAP);
+  return stray;
+}
+
+/** On resuming a Take Online: where the board here stands, from the record of the move. */
+async function settleShutBoard(planningRoot: string, journal: TransferJournal): Promise<{ journal: TransferJournal | null; stray?: string }> {
+  if (journal.direction !== "online") return { journal };
+  if (journal.phase === "restoring") {
+    // A cancelled move cut short while putting the board back: finish that, then this is a new move.
+    await reopenLocalBoard(planningRoot, journal);
+    await rm(transferJournalPath(planningRoot), { force: true });
+    return { journal: null };
+  }
+  if (journal.phase === "sealing") {
+    // Cut short while shutting: the marker is written only once the snapshot is complete.
+    journal = { ...journal, phase: await isRetiredRoadmap(join(planningRoot, "roadmap.json")) ? "sealed" : "uploading" };
+    await writeJournal(planningRoot, journal);
+  }
+  if (journal.phase !== "sealed") return { journal };
+  const stray = await setStrayAside(planningRoot);
+  // Removed meanwhile: put the marker back, so nothing can start a board there.
+  if (!(await isRetiredRoadmap(join(planningRoot, "roadmap.json")))) await atomicWriteFile(join(planningRoot, "roadmap.json"), RETIRED_ROADMAP);
+  return stray ? { journal, stray } : { journal };
+}
+
+/**
+ * Puts the board back on this machine once the service confirmed the move is
+ * cancelled. "restoring" is recorded first: from then on the roadmap here is
+ * the board again, so a resume finishes putting it back and never takes edits
+ * made since for strays, or restores the older snapshot over them.
+ */
+async function reopenLocalBoard(planningRoot: string, journal: TransferJournal) {
+  const live = join(planningRoot, "roadmap.json");
+  const { snapshot } = journal;
+  if (journal.phase === "uploading") {
+    // Never shut: only a copy from an attempt cut short may be left.
+    if (snapshot && await sameBytes(snapshot, live)) await rm(snapshot, { force: true });
+    return;
+  }
+  if (journal.phase === "sealed") await setStrayAside(planningRoot);
+  if (journal.phase !== "restoring") await writeJournal(planningRoot, { ...journal, phase: "restoring" });
+  crashPoint("take-online:before-restore");
+  if (snapshot && await isRetiredRoadmap(live) && await pathExists(snapshot)) await atomicWriteFile(live, await readFile(snapshot));
+  crashPoint("take-online:after-restore");
+  // The board is live here again, perhaps edited since: the copy from before the move is no longer needed.
+  if (snapshot && await hasLiveRoadmap(planningRoot)) await rm(snapshot, { force: true });
+  crashPoint("take-online:after-snapshot-removed");
 }
 
 /**
@@ -497,11 +646,18 @@ export async function stopTakeOnline(cwdInput: string) {
   return withBoardWriteLock(planningRoot, async () => {
     const journal = await readJournal(planningRoot);
     if (!journal || journal.direction !== "online") return { stopped: false, message: "No Take Online is in progress for this board." };
-    if (journal.phase !== "uploading") throw new PlanbanValidationError("This board already reached the online service. Run take-online again to finish switching to it.");
+    if (journal.phase === "restoring") {
+      // Already cancelled with the service; this finishes putting the board back.
+      await reopenLocalBoard(planningRoot, journal);
+      await rm(transferJournalPath(planningRoot), { force: true });
+      return { stopped: true, message: "Take Online stopped. The board is on this machine, unchanged, and the partly copied online version was removed." };
+    }
+    if (!BEFORE_COMMIT.has(journal.phase)) throw new PlanbanValidationError("This board already reached the online service. Run take-online again to finish switching to it.");
     const outcome = await cancelUpload(journal.url, journal);
     if (outcome === "committed") throw new PlanbanValidationError("This board already reached the online service. Run take-online again to finish switching to it.");
     if (outcome === "other-account") throw new PlanbanValidationError(otherAccountMessage(journal));
     if (outcome === "uncertain") throw new PlanbanValidationError("Planban could not confirm with the online service that the partly copied board was removed. Nothing has changed; try again when online.");
+    await reopenLocalBoard(planningRoot, journal);
     await rm(transferJournalPath(planningRoot), { force: true });
     return { stopped: true, message: "Take Online stopped. The board is on this machine, unchanged, and the partly copied online version was removed." };
   });
@@ -512,7 +668,7 @@ async function uploadBoard(url: string, cwd: string, planningRoot: string, board
   const as = { credentials: options.credentials };
   options.onProgress?.({ step: "prepare", message: "Preparing the board" });
   // History cannot be tidied, so anything embedded in an old version is noted instead.
-  const bundle = historyForOnline(await buildLocalBundle(cwd));
+  const bundle = historyForOnline(await buildLocalBundle(cwd, journal?.phase === "sealed" ? journal.snapshot : undefined));
   bundle.roadmap.project.id = boardId;
   // Resuming continues part by part, so it must send exactly the same upload:
   // the fingerprint covers what begins the upload and every part. Anything
@@ -559,13 +715,16 @@ async function uploadBoard(url: string, cwd: string, planningRoot: string, board
       copying(received.size);
     }
     options.signal?.throwIfAborted();
-    await onlineRequest(url, `/api/v1/transfers/${encodeURIComponent(journal.transferId)}/commit`, { partCount: parts.length }, as);
+  }
+  // Shut before the commit: once the service may hold the board, nothing here can change it.
+  journal = await shutLocalBoard(planningRoot, journal);
+  if (begun.state !== "committed") {
+    await onlineRequest(url, `/api/v1/transfers/${encodeURIComponent(journal.transferId)}/commit`, { partCount: uploadParts(bundle).length }, as);
   }
   crashPoint("take-online:after-commit");
   journal = {
     ...journal, phase: "committed",
-    snapshot: join(planningRoot, `roadmap.local-before-online-${Date.now()}.json`),
-    // Edits made locally after an upload that had already committed are not online.
+    // Edits made locally after an upload that an older Planban committed before shutting the board here.
     unsyncedLocalChanges: journal.localRevision === undefined ? [] : historyAfter(bundle, journal.localRevision),
   };
   await writeJournal(planningRoot, journal);
@@ -577,20 +736,24 @@ async function finishTakeOnline(cwd: string, manifest: PlanbanProjectManifest, p
   const { url, boardId } = journal;
   const snapshot = journal.snapshot!;
   let unsyncedLocalChanges = journal.unsyncedLocalChanges ?? [];
-  const live = join(planningRoot, "roadmap.json");
-  if (await pathExists(live)) {
-    // Still here after a crash: count any local edits made since the upload.
+  let strayRoadmap: string | undefined;
+  if (await pathExists(snapshot)) {
+    // Shut before the commit: anything live here now came from elsewhere, and is never taken for the board.
+    strayRoadmap = await setStrayAside(planningRoot);
+  } else if (await hasLiveRoadmap(planningRoot)) {
+    // Committed by an older Planban, which shut the board here only now: count local edits made since the upload.
     if (journal.localRevision !== undefined) unsyncedLocalChanges = await localChangesAfter(planningRoot, journal.localRevision);
-    // Retain every local byte, but remove the live filename so other checkouts
-    // with an old local manifest cannot continue editing the uploaded board.
-    await rename(live, snapshot);
+    await copyRoadmapTo(planningRoot, snapshot);
   }
-  crashPoint("take-online:after-rename");
+  // Never a moment without roadmap.json once it is replaced (an older Planban may have moved it already).
+  if (!(await isRetiredRoadmap(join(planningRoot, "roadmap.json")))) await atomicWriteFile(join(planningRoot, "roadmap.json"), RETIRED_ROADMAP);
   await atomicWriteFile(join(planningRoot, "ONLINE-BOARD.txt"), `Authority moved to ${url}, board ${boardId}.\nThe roadmap snapshot, documents and history here are recovery evidence. Do not edit them.\n`);
   // Linked first, so every request for the board (this one included) uses the account that took it online.
   await recordBoardAccountAs(url, boardId, pinned).catch(() => undefined);
   const roadmap = (await onlineRequest<{ roadmap: PlanbanResolvedState["roadmap"] }>(url, boardPath(boardId), undefined, { credentials: pinned })).roadmap;
   const onlineManifest: PlanbanProjectManifest = { ...manifest, storage: { kind: "online", url, boardId } };
+  // Before the project switches, so a retry of a request applied here finds its answer where the board is kept next.
+  await carryIdempotencyRecords(planningRoot, onlineCacheRoot({ kind: "online", url, boardId }));
   // The note is written before the project switches, while the record of the
   // move still exists, so a retry after any crash writes it again.
   const onlineNote = await leaveOnlineNote(cwd, { url, boardId, title: roadmap.project.title, onlineSince: new Date().toISOString() });
@@ -601,7 +764,7 @@ async function finishTakeOnline(cwd: string, manifest: PlanbanProjectManifest, p
   await refreshBackup(url, boardId, { force: true });
   // Which account this board went online under, kept on this computer only.
   await recordBoardAccountAs(url, boardId, pinned).catch(() => undefined);
-  return { boardId, url, localSnapshot: snapshot, onlineNote, ...(unsyncedLocalChanges.length ? { unsyncedLocalChanges } : {}) };
+  return { boardId, url, localSnapshot: snapshot, onlineNote, ...(unsyncedLocalChanges.length ? { unsyncedLocalChanges } : {}), ...(strayRoadmap ? { strayRoadmap } : {}) };
 }
 
 /** The project folder's git repository, if it has one. */
@@ -904,7 +1067,7 @@ async function setStaleCopyAside(planningRoot: string, marker: StaleCopy) {
   return withBoardWriteLock(planningRoot, async () => {
     const stamp = Date.now();
     const snapshot = join(planningRoot, `roadmap.stale-copy-${stamp}.json`);
-    if (await pathExists(join(planningRoot, "roadmap.json"))) await rename(join(planningRoot, "roadmap.json"), snapshot);
+    if (await hasLiveRoadmap(planningRoot)) await rename(join(planningRoot, "roadmap.json"), snapshot);
     const report = join(planningRoot, `STALE-COPY-REPORT-${stamp}.md`);
     await atomicWriteFile(report, [
       "# Stale local copy set aside",
