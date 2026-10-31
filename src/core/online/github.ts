@@ -116,15 +116,15 @@ export async function linkGitHubRepo(cwdInput: string, repo: string) {
       hookId = hook.id;
     }
   } catch (error) {
-    // GitHub refused, so nothing was added and the link goes. Otherwise a webhook may have been added
-    // before gh failed: the link stays unfinished, and linking again finds that webhook by its address.
-    if (refusedByGitHub(error)) {
+    // The link goes only if GitHub's own list of webhooks shows none at its address. Otherwise one may
+    // be there, so the link stays unfinished and linking or unlinking again can find it by its address.
+    if (await verifiedAbsent(created.repo, created.webhookUrl)) {
       await onlineRequest(url, boardPath(boardId, "/github/unlink"), { repo })
         .then(() => onlineRequest(url, boardPath(boardId, "/github/unlink/done"), { repo }))
         .catch(() => undefined);
       throw new PlanbanValidationError(`Not linked: ${ghProblem(error, repo)}.`);
     }
-    throw new PlanbanValidationError(`Not linked yet: ${ghProblem(error, repo)}. Run planban online github link ${created.repo} again to finish; it won't add a second webhook.`);
+    throw new PlanbanValidationError(`Not linked yet: ${ghProblem(error, repo)}, and Planban couldn't check whether GitHub has a webhook at ${created.webhookUrl}. Run planban online github link ${created.repo} again once you have access, to finish it without adding a second webhook, or planban online github unlink ${created.repo} to remove it.`);
   }
   try {
     await onlineRequest(url, boardPath(boardId, `/github/links/${encodeURIComponent(created.linkId)}/hook`), { hookId });
@@ -140,33 +140,48 @@ export async function linkGitHubRepo(cwdInput: string, repo: string) {
   };
 }
 
-/** Whether GitHub answered with a refusal (or gh couldn't run at all), so nothing was added. */
-const refusedByGitHub = (error: unknown) => (error as NodeJS.ErrnoException)?.code === "ENOENT"
-  || /HTTP 4\d\d/u.test(String((error as { stderr?: unknown })?.stderr ?? ""));
+/** Whether GitHub's list of the repository's webhooks was read and has none at this address. Any failure is not proof. */
+async function verifiedAbsent(repo: string, webhookUrl: string): Promise<boolean> {
+  try {
+    return await existingHook(repo, webhookUrl) === null;
+  } catch {
+    return false;
+  }
+}
 
-/** Whether gh failed because GitHub no longer has the webhook. */
-const alreadyGone = (error: unknown) => /HTTP 404|Not Found/u.test(String((error as { stderr?: unknown })?.stderr ?? ""));
+/** Whether deleting a known webhook failed because GitHub no longer has it. Only a delete's 404 means that. */
+const alreadyGone = (error: unknown) => /HTTP 404/u.test(String((error as { stderr?: unknown })?.stderr ?? ""));
 
 /**
  * Unlinks a repository: the service stops accepting its deliveries and forgets the secret at once,
  * gh removes the webhook on GitHub, and then the service forgets the link. A webhook whose id was
- * never recorded is found by its address. If GitHub can't be reached, the link stays as "being
- * removed", so running this again finishes.
+ * never recorded is found by its address. The link is forgotten only once GitHub showed the webhook
+ * is gone: a successful delete, a 404 deleting the known webhook, or a list of webhooks without its
+ * address. Anything else keeps it as "being removed", so running this again finishes.
  */
 export async function unlinkGitHubRepo(cwdInput: string, repo: string) {
   if (!isRepoName(repo)) throw new PlanbanValidationError("Name the repository as owner/name, for example planban-ai/planban.");
   const { url, boardId } = await onlineBoard(cwdInput);
   const removed = await onlineRequest<{ repo: string; hookId?: number; webhookUrl: string }>(url, boardPath(boardId, "/github/unlink"), { repo });
-  try {
-    const hookId = removed.hookId ?? await existingHook(removed.repo, removed.webhookUrl);
-    if (hookId !== null) await ghRun(["api", "--method", "DELETE", `repos/${removed.repo}/hooks/${hookId}`]);
-  } catch (error) {
-    if (!alreadyGone(error)) {
-      return {
-        unlinked: removed.repo,
-        finished: false,
-        note: `Planban no longer accepts its deliveries, but its webhook is still on GitHub (${ghProblem(error, removed.repo)}). Run planban online github unlink ${removed.repo} again to finish.`,
-      };
+  const unfinished = (error: unknown) => ({
+    unlinked: removed.repo,
+    finished: false,
+    note: `Planban no longer accepts its deliveries, but couldn't reach the webhook on GitHub (${ghProblem(error, removed.repo)}). Its address is ${removed.webhookUrl}. Run planban online github unlink ${removed.repo} again once you have access, to finish.`,
+  });
+  let hookId = removed.hookId ?? null;
+  if (hookId === null) {
+    try {
+      hookId = await existingHook(removed.repo, removed.webhookUrl);
+    } catch (error) {
+      // Even a 404 here may only mean access was lost, so it isn't proof the webhook is gone.
+      return unfinished(error);
+    }
+  }
+  if (hookId !== null) {
+    try {
+      await ghRun(["api", "--method", "DELETE", `repos/${removed.repo}/hooks/${hookId}`]);
+    } catch (error) {
+      if (!alreadyGone(error)) return unfinished(error);
     }
   }
   await onlineRequest(url, boardPath(boardId, "/github/unlink/done"), { repo: removed.repo });

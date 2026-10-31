@@ -370,8 +370,10 @@ test("linking from a computer: gh gets the secret on its standard input only, an
     assert.deepEqual((await gitHubLinkStatus(cwd)).links, []);
 
     // GitHub refusing the webhook leaves no link behind.
+    // (GitHub's own list shows no webhook at its address, so the link can go.)
     useGhRunner(async (args) => {
       if (args.join(" ") === `api repos/${REPO}`) return JSON.stringify({ permissions: { admin: true } });
+      if (args.includes("--paginate")) return "[[]]";
       throw Object.assign(new Error("gh exited with 1"), { stderr: "HTTP 404: Not Found" });
     });
     await assert.rejects(linkGitHubRepo(cwd, REPO), /Not linked: GitHub says planban-ai\/planban doesn't exist/u);
@@ -508,6 +510,9 @@ test("linking checks admin access, reuses a webhook whose record failed, and ret
   const calls: string[][] = [];
   let admin = true;
   let deleteFails = false;
+  /** GitHub's answer to a listing or an update, when it fails: "HTTP 403: Forbidden", "HTTP 429", "HTTP 404". */
+  let listFails: string | null = null;
+  let patchFails: string | null = null;
   try {
     const cwd = join(root, "project");
     await storage.initializeProject({ cwd, repoId: "retrydemo", title: "Retry demo", updateAgents: false });
@@ -517,7 +522,10 @@ test("linking checks admin access, reuses a webhook whose record failed, and ret
       calls.push(args);
       const line = args.join(" ");
       if (line === `api repos/${REPO}`) return JSON.stringify({ permissions: { admin } });
-      if (args.includes("--paginate")) return JSON.stringify([onGitHub.map((hook) => ({ id: hook.id, config: { url: hook.config.url } }))]);
+      if (args.includes("--paginate")) {
+        if (listFails) throw Object.assign(new Error("gh exited with 1"), { stderr: listFails });
+        return JSON.stringify([onGitHub.map((hook) => ({ id: hook.id, config: { url: hook.config.url } }))]);
+      }
       if (line === `api --method POST repos/${REPO}/hooks --input -`) {
         const hook = { id: 7000 + onGitHub.length, config: JSON.parse(input!).config };
         onGitHub.push(hook);
@@ -525,6 +533,7 @@ test("linking checks admin access, reuses a webhook whose record failed, and ret
       }
       const patched = /^api --method PATCH repos\/.+\/hooks\/(\d+) --input -$/u.exec(line);
       if (patched) {
+        if (patchFails) throw Object.assign(new Error("gh exited with 1"), { stderr: patchFails });
         onGitHub.find((hook) => hook.id === Number(patched[1]))!.config = JSON.parse(input!).config;
         return "{}";
       }
@@ -569,7 +578,7 @@ test("linking checks admin access, reuses a webhook whose record failed, and ret
     deleteFails = true;
     const half = await unlinkGitHubRepo(cwd, REPO);
     assert.equal(half.finished, false);
-    assert.match(half.note, /Run planban online github unlink planban-ai\/planban again to finish/u);
+    assert.match(half.note, /Run planban online github unlink planban-ai\/planban again once you have access/u);
     assert.match((await gitHubLinkStatus(cwd)).links[0]!.webhook as string, /^being removed/u);
     // Linking again now is refused, rather than adding a second webhook.
     await assert.rejects(linkGitHubRepo(cwd, REPO), /Unlinking planban-ai\/planban hasn't finished/u);
@@ -598,6 +607,35 @@ test("linking checks admin access, reuses a webhook whose record failed, and ret
     const removed = await unlinkGitHubRepo(cwd, REPO);
     assert.equal(removed.finished, true);
     assert.equal(onGitHub.length, 0, "no webhook is left on GitHub");
+    assert.deepEqual((await gitHubLinkStatus(cwd)).links, []);
+
+    // A link is forgotten only once GitHub showed its webhook is gone. An unfinished link whose retry
+    // can't list (403) or update (429) the webhook stays unfinished, with the webhook kept on GitHub.
+    failRecord = true;
+    await assert.rejects(linkGitHubRepo(cwd, REPO), /again: it finds that webhook/u);
+    assert.equal(onGitHub.length, 1);
+    const address = onGitHub[0]!.config.url;
+    listFails = "HTTP 403: Forbidden";
+    await assert.rejects(linkGitHubRepo(cwd, REPO), (error: Error) => error.message.startsWith("Not linked yet:") && error.message.includes(address));
+    assert.match((await gitHubLinkStatus(cwd)).links[0]!.webhook as string, /^not added yet/u, "the link is kept");
+    listFails = null;
+    patchFails = "HTTP 429: Too Many Requests";
+    await assert.rejects(linkGitHubRepo(cwd, REPO), /Not linked yet:/u);
+    assert.match((await gitHubLinkStatus(cwd)).links[0]!.webhook as string, /^not added yet/u, "the link is kept");
+    assert.equal(onGitHub.length, 1);
+    patchFails = null;
+    assert.ok(onGitHub[0]!.config.url === address, "the same address, so it can still be found");
+
+    // Unlinking it while GitHub's list answers 404 (access lost) isn't proof the webhook is gone.
+    listFails = "HTTP 404: Not Found";
+    const lost = await unlinkGitHubRepo(cwd, REPO);
+    assert.equal(lost.finished, false);
+    assert.ok(lost.note.includes("couldn't reach the webhook on GitHub") && lost.note.includes(address) && lost.note.includes("once you have access"), lost.note);
+    assert.match((await gitHubLinkStatus(cwd)).links[0]!.webhook as string, /^being removed/u, "the link is kept");
+    assert.equal(onGitHub.length, 1);
+    listFails = null;
+    assert.equal((await unlinkGitHubRepo(cwd, REPO)).finished, true);
+    assert.equal(onGitHub.length, 0);
     assert.deepEqual((await gitHubLinkStatus(cwd)).links, []);
   } finally {
     useGhRunner();
