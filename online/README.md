@@ -130,16 +130,20 @@ added. Until then the link's merges are credited to the person who set it up
 repository as checked.
 
 Linking again after a failure picks up the unfinished link with a new secret, at
-the same address. The computer finds any webhook already on GitHub at that
+the same address. A delivery checked against the old secret and still in flight
+is refused when it is recorded, and a ping the old secret signed no longer
+counts towards confirming the link. The computer finds any webhook already on GitHub at that
 address and reuses it, so a retry never adds a second webhook. Unlinking removes
-the secret at once, so no delivery is accepted, but keeps the webhook id until
-GitHub confirms the webhook is gone. Running unlink again retries the removal,
+the secret at once, so no delivery is accepted, but keeps the link until GitHub
+confirms its webhook is gone; a webhook whose id was never recorded is found by
+its address. Running unlink again retries the removal,
 and linking that repository again is refused until it has finished.
 
 GitHub posts to `/api/v1/github/hooks/<linkId>` (through the edge's existing
-`/api/v1/` route). The edge limits deliveries per link (60 a minute) and per
+`/api/v1/` route). The edge limits deliveries per link (60 a minute), then per
 caller address (1,200 a minute, because GitHub sends every board's deliveries
-from shared addresses), and fails closed without those limiters. With an edge
+from shared addresses; a delivery refused by its link's limit doesn't count
+against it), and fails closed without those limiters. With an edge
 configured, a delivery that skipped it is refused. Each server also admits at
 most 60 deliveries a minute per link before it looks the link up or works out a
 signature. The handler limits the body to 1 MB, checks

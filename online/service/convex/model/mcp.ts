@@ -410,9 +410,9 @@ export class McpService {
   }
 
   /** The board, and the GitHub repositories whose merges it records itself. */
-  async board(boardId: string): Promise<{ roadmap: PlanbanRoadmap; linkedRepos: string[] }> {
-    const board = unpacked<{ roadmap: PlanbanRoadmap; linkedRepos?: string[] }>(await this.call(() => this.ctx.runQuery(internal.boards.getBoard, { connectionId: this.connectionId, boardId })));
-    return { roadmap: board.roadmap, linkedRepos: board.linkedRepos ?? [] };
+  async board(boardId: string): Promise<{ roadmap: PlanbanRoadmap; linkedRepos: string[]; homeRepo: string | null }> {
+    const board = unpacked<{ roadmap: PlanbanRoadmap; linkedRepos?: string[]; homeRepo?: string }>(await this.call(() => this.ctx.runQuery(internal.boards.getBoard, { connectionId: this.connectionId, boardId })));
+    return { roadmap: board.roadmap, linkedRepos: board.linkedRepos ?? [], homeRepo: board.homeRepo ?? null };
   }
 
   readDoc(boardId: string, cardId: string, kind: "spec" | "plan"): Promise<PlanbanDocPayload> {
@@ -494,14 +494,14 @@ async function callTool(service: McpService, origin: string, name: string, args:
       return { boards: await service.listBoards() };
     case "planban_get_board": {
       const boardIdArg = stringArg(args, "boardId");
-      const [{ roadmap, linkedRepos }, { page }] = await Promise.all([service.board(boardIdArg), service.goals(boardIdArg)]);
+      const [{ roadmap, linkedRepos, homeRepo }, { page }] = await Promise.all([service.board(boardIdArg), service.goals(boardIdArg)]);
       // The goal statements only, when the board has goals; planban_read_goals has the rest.
       const goals = goalsBlock({ ...emptyGoals(), goals: page.goals });
       const board = compactBoard(roadmap);
       const { roadmapItems, ...head } = board;
       // The same freshness list as the local tools, from the board alone: merges come from the board's
       // own landing notes, and its notes say what can't be checked here.
-      const attention = stalenessAttention(boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], linkedRepos), roadmap.roadmapItems, roadmap.landingInbox);
+      const attention = stalenessAttention(boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], linkedRepos, homeRepo), roadmap.roadmapItems, roadmap.landingInbox);
       const inbox = inboxForAgents(roadmap.landingInbox);
       return { ...head, ...(goals ? { goals } : {}), attention, ...(inbox.length ? { landingInbox: inbox } : {}), roadmapItems };
     }
@@ -525,7 +525,7 @@ async function callTool(service: McpService, origin: string, name: string, args:
       return { boardId: roadmap.project.id, revision: roadmap.revision, ...queryWorkItems(roadmap.roadmapItems, query as WorkItemQuery) };
     }
     case "planban_get_card": {
-      const { roadmap, linkedRepos } = await service.board(stringArg(args, "boardId"));
+      const { roadmap, linkedRepos, homeRepo } = await service.board(stringArg(args, "boardId"));
       const cardId = stringArg(args, "cardId");
       const card = roadmap.roadmapItems.find((item) => item.id === cardId);
       if (!card) throw new ToolError(`not_found: Card not found: ${cardId}`);
@@ -534,7 +534,7 @@ async function callTool(service: McpService, origin: string, name: string, args:
       await service.notePresence(boardId, cardId);
       const [{ changes }, { working }] = await Promise.all([service.unresolved(boardId, cardId), service.working(boardId, cardId)]);
       const others = working[cardId] ?? [];
-      const freshness = boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], linkedRepos);
+      const freshness = boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], linkedRepos, homeRepo);
       return {
         revision: roadmap.revision, card, ancestry: cardAncestry(roadmap, cardId),
         ...(card.landings?.length ? { landingNotes: card.landings.map(landingNote) } : {}),

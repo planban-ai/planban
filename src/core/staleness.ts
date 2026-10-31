@@ -343,12 +343,21 @@ export function mergesCheckedOnlyNote(repos: string[]): string {
  * can't happen online). Merges the board recorded itself, as landing notes from a linked GitHub
  * repository, are shown. A note says when an active card names a pull request nothing checks.
  */
-export function boardOnlyStaleness(items: PlanbanRoadmapItem[], now: number, history: StalenessInput["history"] = [], linkedRepos: string[] = []): BoardStaleness {
+export function boardOnlyStaleness(
+  items: PlanbanRoadmapItem[],
+  now: number,
+  history: StalenessInput["history"] = [],
+  /** The linked repositories GitHub confirmed, whose merges count as checked. */
+  linkedRepos: string[] = [],
+  /** The board's home repository, whose `#123` a bare reference means, confirmed or not. */
+  homeRepo: string | null = null,
+): BoardStaleness {
   const linked = new Set(linkedRepos.map((repo) => repo.toLowerCase()));
+  // A bare #123 is checked only when the home repository itself is confirmed.
   const unchecked = items.some((item) => ACTIVE_STATUSES.has(item.status)
-    && cardPrRefs(item).some((ref) => (ref.repo ? !linked.has(ref.repo.toLowerCase()) : linked.size === 0)));
+    && cardPrRefs(item).some((ref) => !linked.has((ref.repo ?? homeRepo ?? "").toLowerCase())));
   const note = !unchecked ? [] : linked.size ? [mergesCheckedOnlyNote(linkedRepos)] : [MERGES_NOT_CHECKED_NOTE];
-  return computeStaleness({ items, history, docMtimes: [], merges: [], now, notes: note, homeRepo: linkedRepos[0] ?? null });
+  return computeStaleness({ items, history, docMtimes: [], merges: [], now, notes: note, homeRepo });
 }
 
 export interface StalenessAttention {

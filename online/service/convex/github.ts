@@ -103,7 +103,9 @@ export const createLink = internalMutation({
     const home = existing.find((link) => !link.removing);
     if (same?.removing) fail("conflict", `Unlinking ${same.repo} hasn't finished. Run planban online github unlink ${same.repo} to finish it, then link it again.`);
     if (same && same.hookId === undefined) {
-      await ctx.db.patch(same._id, { secret });
+      // A new secret: deliveries verified with the old one are refused, and a ping the old one
+      // signed no longer counts towards confirming the link.
+      await ctx.db.patch(same._id, { secret, secretGeneration: (same.secretGeneration ?? 0) + 1, pingHookId: undefined, confirmedAt: undefined });
       return { repo: same.repo, home: same === home, linkId: same.linkId, resumed: true };
     }
     if (same) fail("conflict", `${repo} is already linked to this board. Unlink it first to link it again.`);
@@ -130,9 +132,11 @@ export const setHook = internalMutation({
 });
 
 /**
- * Starts unlinking: the secret goes at once, so no delivery is accepted after this. A link with a
- * webhook keeps its id, marked as being removed, until the owner's computer says GitHub removed it
- * (forgetLink); asked again, it returns the same id, so a failed removal can be retried.
+ * Starts unlinking: the secret goes at once, so no delivery is accepted after this. The link stays,
+ * marked as being removed, until the owner's computer says GitHub removed its webhook (forgetLink).
+ * It returns the webhook id if one was recorded, and the link's id either way, so the computer can
+ * find a webhook whose id was never recorded by its address. Asked again, it returns the same, so a
+ * failed removal can be retried.
  */
 export const removeLink = internalMutation({
   args: { connectionId: v.id("connections"), boardId: v.string(), repo: v.string() },
@@ -140,12 +144,8 @@ export const removeLink = internalMutation({
     await ownerAccess(ctx, connectionId, boardId);
     const link = (await boardLinks(ctx, boardId)).find((row) => row.repoKey === repo.toLowerCase());
     if (!link) fail("not_found", `${repo} isn't linked to this board.`);
-    if (link!.hookId === undefined) {
-      await ctx.db.delete(link!._id);
-      return { repo: link!.repo };
-    }
     if (!link!.removing) await ctx.db.patch(link!._id, { removing: true, secret: undefined, confirmedAt: undefined, pingHookId: undefined });
-    return { repo: link!.repo, hookId: link!.hookId! };
+    return { repo: link!.repo, linkId: link!.linkId, ...(link!.hookId === undefined ? {} : { hookId: link!.hookId }) };
   },
 });
 
@@ -167,7 +167,7 @@ export const hookSecret = internalQuery({
   args: { linkId: v.string() },
   handler: async (ctx, { linkId }) => {
     const link = await linkById(ctx, linkId);
-    return link?.secret && !link.removing ? { secret: link.secret, repo: link.repo } : null;
+    return link?.secret && !link.removing ? { secret: link.secret, repo: link.repo, generation: link.secretGeneration ?? 0 } : null;
   },
 });
 
@@ -196,10 +196,10 @@ async function noteOn(ctx: MutationCtx, link: Doc<"githubLinks">, event: string,
 
 /** Records what happened to a delivery that couldn't be recorded (see githubWebhookResponse), within the hourly limit. */
 export const noteDelivery = internalMutation({
-  args: { linkId: v.string(), event: v.string(), outcome: v.string() },
-  handler: async (ctx, { linkId, event, outcome }) => {
+  args: { linkId: v.string(), generation: v.number(), event: v.string(), outcome: v.string() },
+  handler: async (ctx, { linkId, generation, event, outcome }) => {
     const link = await linkById(ctx, linkId);
-    if (!link || link.removing) return;
+    if (!link || link.removing || (link.secretGeneration ?? 0) !== generation) return;
     const counted = await spend(ctx, link, event);
     if (counted) await noteOn(ctx, link, event, outcome, counted);
   },
@@ -232,14 +232,16 @@ const plural = (count: number, word: string) => `${count} ${word}${count === 1 ?
 export const receive = internalMutation({
   args: {
     linkId: v.string(),
+    /** The secret generation the delivery's signature was checked against (hookSecret). */
+    generation: v.number(),
     deliveryId: v.string(),
     ping: v.optional(v.object({ hookId: v.number() })),
     merge: v.optional(v.object({ repo: v.string(), number: v.number(), title: v.string(), mergedAt: v.string(), url: v.string() })),
   },
-  handler: async (ctx, { linkId, deliveryId, ping, merge }): Promise<{ status: number; body: Record<string, unknown> }> => {
+  handler: async (ctx, { linkId, generation, deliveryId, ping, merge }): Promise<{ status: number; body: Record<string, unknown> }> => {
     const link = await linkById(ctx, linkId);
-    // Unlinked between the signature check and now.
-    if (!link || link.removing) return { status: 401, body: { error: "unauthorized" } };
+    // Unlinked, or its secret replaced, between the signature check and now.
+    if (!link || link.removing || (link.secretGeneration ?? 0) !== generation) return { status: 401, body: { error: "unauthorized" } };
     if (!merge) {
       const counted = await spend(ctx, link, "ping");
       if (!counted) return limited;

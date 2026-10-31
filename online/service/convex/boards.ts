@@ -39,7 +39,7 @@ import { historyEntries, historyPage, recordHistory, roadmapAtVersion, type Attr
 import { DOC_KINDS, currentRoadmap, docPayload, docRow, live, retiredIds, stateRow, type DocKind } from "./model/rows";
 import { reserveRetiredId } from "./model/retired";
 import { planClearLanding } from "../../../src/core/landings";
-import { confirmedRepos } from "./model/githubLinks";
+import { confirmedRepos, linkedRepos } from "./model/githubLinks";
 
 export const BOARD_OPERATIONS = [
   "createCard", "createCards", "createGroup", "updateCard", "moveCard",
@@ -370,11 +370,14 @@ export const getBoard = internalQuery({
     // features let a computer's older Planban say it can't show everything (16 October 2026).
     const goals = await goalsOf(ctx, live(board));
     // The GitHub repositories whose merges the board records itself, for the hosted freshness note.
-    // Only links GitHub confirmed count as checked.
+    // Only links GitHub confirmed count as checked. The home repository, whose #123 a bare
+    // reference means, is said separately: it is the first link whether or not it is confirmed.
     const repos = await confirmedRepos(ctx, boardId);
+    const homeRepo = (await linkedRepos(ctx, boardId))[0];
     return {
       roadmap: await currentRoadmap(ctx, live(board)), authority: board.authority, role, features: boardFeatures({ hasGoals: hasGoalsContent(goals) }),
       ...(repos.length ? { linkedRepos: repos } : {}),
+      ...(homeRepo ? { homeRepo } : {}),
     };
   })()),
 });

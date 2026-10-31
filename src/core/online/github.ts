@@ -119,7 +119,9 @@ export async function linkGitHubRepo(cwdInput: string, repo: string) {
     // GitHub refused, so nothing was added and the link goes. Otherwise a webhook may have been added
     // before gh failed: the link stays unfinished, and linking again finds that webhook by its address.
     if (refusedByGitHub(error)) {
-      await onlineRequest(url, boardPath(boardId, "/github/unlink"), { repo }).catch(() => undefined);
+      await onlineRequest(url, boardPath(boardId, "/github/unlink"), { repo })
+        .then(() => onlineRequest(url, boardPath(boardId, "/github/unlink/done"), { repo }))
+        .catch(() => undefined);
       throw new PlanbanValidationError(`Not linked: ${ghProblem(error, repo)}.`);
     }
     throw new PlanbanValidationError(`Not linked yet: ${ghProblem(error, repo)}. Run planban online github link ${created.repo} again to finish; it won't add a second webhook.`);
@@ -147,16 +149,17 @@ const alreadyGone = (error: unknown) => /HTTP 404|Not Found/u.test(String((error
 
 /**
  * Unlinks a repository: the service stops accepting its deliveries and forgets the secret at once,
- * gh removes the webhook on GitHub, and then the service forgets the link. If GitHub can't be
- * reached, the link stays as "being removed", with its webhook id, so running this again finishes.
+ * gh removes the webhook on GitHub, and then the service forgets the link. A webhook whose id was
+ * never recorded is found by its address. If GitHub can't be reached, the link stays as "being
+ * removed", so running this again finishes.
  */
 export async function unlinkGitHubRepo(cwdInput: string, repo: string) {
   if (!isRepoName(repo)) throw new PlanbanValidationError("Name the repository as owner/name, for example planban-ai/planban.");
   const { url, boardId } = await onlineBoard(cwdInput);
-  const removed = await onlineRequest<{ repo: string; hookId?: number }>(url, boardPath(boardId, "/github/unlink"), { repo });
-  if (removed.hookId === undefined) return { unlinked: removed.repo, note: "No webhook was recorded for it; if GitHub still has one, remove it under the repository's Settings, Webhooks." };
+  const removed = await onlineRequest<{ repo: string; hookId?: number; webhookUrl: string }>(url, boardPath(boardId, "/github/unlink"), { repo });
   try {
-    await ghRun(["api", "--method", "DELETE", `repos/${removed.repo}/hooks/${removed.hookId}`]);
+    const hookId = removed.hookId ?? await existingHook(removed.repo, removed.webhookUrl);
+    if (hookId !== null) await ghRun(["api", "--method", "DELETE", `repos/${removed.repo}/hooks/${hookId}`]);
   } catch (error) {
     if (!alreadyGone(error)) {
       return {

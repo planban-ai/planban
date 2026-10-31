@@ -167,13 +167,13 @@ export async function githubWebhookResponse(ctx: ActionCtx, request: Request): P
   const pingHook = payload?.hook?.id ?? payload?.hook_id;
   const ping = event === "ping" && typeof pingHook === "number" && Number.isSafeInteger(pingHook) && pingHook > 0 ? { hookId: pingHook } : undefined;
   try {
-    const result = await ctx.runMutation(internal.github.receive, { linkId, deliveryId, ...(merge ? { merge } : {}), ...(ping ? { ping } : {}) });
+    const result = await ctx.runMutation(internal.github.receive, { linkId, generation: link.generation, deliveryId, ...(merge ? { merge } : {}), ...(ping ? { ping } : {}) });
     return answer(result.status, result.body);
   } catch (error) {
     // A board over its limits, or busy: GitHub shows the answer, and the delivery can be sent again.
     const data = error instanceof ConvexError ? error.data as ServiceErrorData : null;
     const outcome = data ? `Not recorded: ${data.message}` : "Not recorded: the service failed. Redeliver it from GitHub.";
-    await ctx.runMutation(internal.github.noteDelivery, { linkId, event, outcome }).catch(() => undefined);
+    await ctx.runMutation(internal.github.noteDelivery, { linkId, generation: link.generation, event, outcome }).catch(() => undefined);
     return answer(data?.code === "rate_limited" ? 429 : 503, { error: outcome });
   }
 }

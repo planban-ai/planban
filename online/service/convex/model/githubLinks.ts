@@ -8,7 +8,7 @@ export async function boardLinks(ctx: QueryCtx, boardId: string) {
     .sort((a, b) => a._creationTime - b._creationTime);
 }
 
-/** The repositories linked to a board, the home repository first: the first one, whose `#123` a bare reference means. */
+/** The repositories linked to a board, the home repository first: the first one, whose `#123` a bare reference means, confirmed or not. */
 export async function linkedRepos(ctx: QueryCtx, boardId: string): Promise<string[]> {
   return (await boardLinks(ctx, boardId)).filter((link) => !link.removing).map((link) => link.repo);
 }

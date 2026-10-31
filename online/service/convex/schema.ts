@@ -423,6 +423,11 @@ export default defineSchema({
     repoKey: v.string(),
     /** Absent once unlinking began: no delivery is accepted after that. */
     secret: v.optional(v.string()),
+    /**
+     * Counts the secret's replacements. A delivery is recorded only under the generation it was
+     * verified with, so one signed with a replaced secret and still in flight is refused.
+     */
+    secretGeneration: v.optional(v.number()),
     /** The repository webhook's id on GitHub, so unlinking can remove it. */
     hookId: v.optional(v.number()),
     /**

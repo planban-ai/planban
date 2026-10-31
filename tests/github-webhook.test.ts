@@ -583,6 +583,22 @@ test("linking checks admin access, reuses a webhook whose record failed, and ret
     // And relinking makes exactly one webhook.
     await linkGitHubRepo(cwd, REPO);
     assert.equal(onGitHub.length, 1);
+    await unlinkGitHubRepo(cwd, REPO);
+    assert.equal(onGitHub.length, 0);
+
+    // Unlinking a link whose webhook was added but never recorded finds it by its address and removes it.
+    failRecord = true;
+    await assert.rejects(linkGitHubRepo(cwd, REPO), /Run planban online github link planban-ai\/planban again/u);
+    assert.equal(onGitHub.length, 1);
+    deleteFails = true;
+    const pending = await unlinkGitHubRepo(cwd, REPO);
+    assert.equal(pending.finished, false);
+    assert.match((await gitHubLinkStatus(cwd)).links[0]!.webhook as string, /^being removed/u, "kept until GitHub's webhook is gone");
+    deleteFails = false;
+    const removed = await unlinkGitHubRepo(cwd, REPO);
+    assert.equal(removed.finished, true);
+    assert.equal(onGitHub.length, 0, "no webhook is left on GitHub");
+    assert.deepEqual((await gitHubLinkStatus(cwd)).links, []);
   } finally {
     useGhRunner();
     await bridge.close();
@@ -590,4 +606,42 @@ test("linking checks admin access, reuses a webhook whose record failed, and ret
     else process.env.PLANBAN_HOME = savedHome;
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
+});
+
+test("hosted surfaces: a confirmed second repository leaves bare references to the unconfirmed home repository unchecked", async () => {
+  await withServiceEnv(async () => {
+    const setup = await ownerBoard();
+    await setup.card("Card", { summary: "Building it in #95." });
+    await link(setup, REPO, { confirmed: false });
+    await link(setup, "someone/else");
+    const page = await (await setup.service.adapterFor(setup.owner.token).fetch(boardPath(setup.boardId, "/state"), { headers: web })).json() as Json;
+    assert.equal(page.staleness.notes.length, 1);
+    assert.match(page.staleness.notes[0], /linked to this board \(someone\/else\)/u);
+    const read = await mcp(setup, "planban_get_board", { boardId: setup.boardId });
+    assert.ok(JSON.stringify(read.attention.notes ?? []).includes("someone/else"), "the hosted MCP says the same");
+  });
+});
+
+test("a new secret refuses deliveries checked against the old one, and forgets the old ping", async () => {
+  await withServiceEnv(async () => {
+    const setup = await ownerBoard();
+    await setup.card("Card", { summary: "#96" });
+    const first = await link(setup, REPO, { confirmed: false });
+    // GitHub's ping for the first attempt arrives, signed with the first secret.
+    assert.equal((await deliver(setup, first.linkId, first.secret, "ping", pingFor(8080))).status, 200);
+    // Linking again picks the link up with a new secret.
+    const again = await setup.call(`/api/v1/boards/${setup.boardId}/github/links`, { repo: REPO });
+    assert.equal(again.status, 200);
+    assert.equal(again.body.linkId, first.linkId);
+    assert.notEqual(again.body.secret, first.secret);
+    // A delivery verified against the first secret, still in flight, is refused when it is recorded.
+    const stale = await (github.receive as any)._handler(setup.service.ctx, { linkId: first.linkId, generation: 0, deliveryId: "in-flight", merge: { repo: REPO, number: 96, title: "Old", mergedAt: "2026-10-30T09:15:00Z", url: `https://github.com/${REPO}/pull/96` } });
+    assert.deepEqual(stale, { status: 401, body: { error: "unauthorized" } });
+    assert.equal((await deliver(setup, first.linkId, first.secret, "pull_request", merged(96))).status, 401, "the old secret no longer signs");
+    // The old ping no longer counts: recording that webhook id doesn't confirm the link.
+    const recorded = await setup.call(`/api/v1/boards/${setup.boardId}/github/links/${first.linkId}/hook`, { hookId: 8080 });
+    assert.equal(recorded.body.confirmed, false);
+    assert.equal((await deliver(setup, first.linkId, again.body.secret, "ping", pingFor(8080))).status, 200);
+    assert.equal((await setup.call(`/api/v1/boards/${setup.boardId}/github`)).body.links[0].confirmed, true);
+  });
 });

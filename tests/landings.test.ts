@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { committedRoadmap, createEmptyRoadmap, normalizeRoadmap, planMoveCard, planUpdateCard } from "../src/core/boardOperations";
 import { cardsNamingMerge, landingNote, MAX_CARD_LANDINGS, MAX_INBOX, parseLandingRef, planClearLanding, planRecordMerge, type MergeEvent } from "../src/core/landings";
-import { boardOnlyStaleness, computeStaleness, LANDED_LABEL, MERGES_NOT_CHECKED_NOTE, stalenessAttention, stalenessLine } from "../src/core/staleness";
+import { boardOnlyStaleness, computeStaleness, LANDED_LABEL, MERGES_NOT_CHECKED_NOTE, mergesCheckedOnlyNote, stalenessAttention, stalenessLine } from "../src/core/staleness";
 import type { PlanbanRoadmap, PlanbanRoadmapItem } from "../src/core/types";
 
 const NOW = Date.parse("2026-10-30T12:00:00Z");
@@ -189,11 +189,11 @@ test("hosted surfaces show landed cards, and drop the 'not checked' note once a 
   const unlinked = boardOnlyStaleness(landed.roadmapItems, NOW);
   assert.equal(unlinked.cards.card?.[0]?.detail, `${LANDED_LABEL} (${REPO}#12 merged 29 Oct)`);
   assert.deepEqual(unlinked.notes, [MERGES_NOT_CHECKED_NOTE]);
-  const linked = boardOnlyStaleness(landed.roadmapItems, NOW, [], [REPO]);
+  const linked = boardOnlyStaleness(landed.roadmapItems, NOW, [], [REPO], REPO);
   assert.equal(linked.cards.card?.[0]?.detail, `${LANDED_LABEL} (${REPO}#12 merged 29 Oct)`);
   assert.equal(linked.notes, undefined);
   // A card naming another repository's pull request still says what isn't checked.
-  const elsewhere = boardOnlyStaleness([...landed.roadmapItems, item({ id: "other", summary: "Waits on someone/else#3" })], NOW, [], [REPO]);
+  const elsewhere = boardOnlyStaleness([...landed.roadmapItems, item({ id: "other", summary: "Waits on someone/else#3" })], NOW, [], [REPO], REPO);
   assert.match(elsewhere.notes?.[0] ?? "", /linked to this board \(planban-ai\/planban\)\. Pull requests in other repositories aren't checked here/u);
 });
 
@@ -208,4 +208,11 @@ test("agents hear about the inbox in the attention section and the session line"
     `7 merged pull requests name no card (${REPO}#7, ${REPO}#6, ${REPO}#5, ${REPO}#4, ${REPO}#3, +2 more; planban_get_board lists them all); write what each finished into the right card and assign it there, or dismiss it, with planban_clear_landing.`,
   );
   assert.equal(stalenessAttention(freshness(board([])), [], []).inbox, undefined);
+});
+
+test("a confirmed second repository doesn't make bare references to an unconfirmed home repository checked", () => {
+  const items = [item({ id: "card", summary: "Building it in #12." })];
+  // The home repository (first linked) isn't confirmed; another one is.
+  assert.deepEqual(boardOnlyStaleness(items, NOW, [], ["someone/else"], REPO).notes, [mergesCheckedOnlyNote(["someone/else"])]);
+  assert.equal(boardOnlyStaleness(items, NOW, [], ["someone/else", REPO], REPO).notes, undefined);
 });

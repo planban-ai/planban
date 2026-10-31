@@ -166,12 +166,14 @@ export default {
       if (!(await limiter.limit({ key: caller })).success) return refuse(429, "rate_limited");
     }
     // GitHub deliveries: limited per link before the backend looks the link up or checks a signature.
+    // The link's own limit comes first, so a flood to one link never spends the shared per-address
+    // budget that every board's deliveries from GitHub's addresses rely on.
     if (url.pathname.startsWith(GITHUB_HOOK_PREFIX)) {
       const caller = request.headers.get("CF-Connecting-IP");
       if (!env.GITHUB_HOOK_LIMITER || !env.GITHUB_HOOK_IP_LIMITER || !caller) return refuse(503, "temporarily_unavailable");
       const link = url.pathname.slice(GITHUB_HOOK_PREFIX.length).slice(0, 100);
-      if (!(await env.GITHUB_HOOK_IP_LIMITER.limit({ key: caller })).success) return refuse(429, "rate_limited");
       if (!(await env.GITHUB_HOOK_LIMITER.limit({ key: link })).success) return refuse(429, "rate_limited");
+      if (!(await env.GITHUB_HOOK_IP_LIMITER.limit({ key: caller })).success) return refuse(429, "rate_limited");
     }
     const length = request.headers.get("Content-Length");
     if (length !== null && !(/^\d+$/.test(length) && Number(length) <= MAX_BODY_BYTES)) return refuse(413, "payload_too_large");

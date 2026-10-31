@@ -171,11 +171,14 @@ test("GitHub deliveries are limited per caller address and per link before forwa
   };
   const delivery = () => new Request(`${PUBLIC}/api/v1/github/hooks/ghl_abc123abc123abc123`, { method: "POST", headers: { "CF-Connecting-IP": "140.82.115.1" }, body: "{}" });
   assert.equal((await through(delivery(), undefined, limited)).response.status, 200);
-  assert.deepEqual(keys, ["ip:140.82.115.1", "link:ghl_abc123abc123abc123"]);
+  assert.deepEqual(keys, ["link:ghl_abc123abc123abc123", "ip:140.82.115.1"]);
   allowLink = false;
+  keys.length = 0;
   const refused = await through(delivery(), undefined, limited);
   assert.equal(refused.response.status, 429);
   assert.equal(refused.seen.length, 0);
+  // Refused by its link's own limit, it never spends the address budget other boards share.
+  assert.deepEqual(keys, ["link:ghl_abc123abc123abc123"]);
   const unlimited = await through(delivery());
   assert.equal(unlimited.response.status, 503, "fails closed without the limiters");
   assert.equal(unlimited.seen.length, 0);

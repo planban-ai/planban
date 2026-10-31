@@ -335,7 +335,10 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
   }
   if (rest[0] === "github" && rest[1] === "unlink" && rest.length === 2 && method === "POST") {
     const input = await body(request);
-    return json(await ctx.runMutation(internal.github.removeLink, { connectionId, boardId, repo: String(input.repo ?? "") }));
+    // The link's address goes back to its owner, so their computer can find a webhook whose id was never recorded.
+    const removed = await ctx.runMutation(internal.github.removeLink, { connectionId, boardId, repo: String(input.repo ?? "") });
+    const { linkId, ...rest } = removed;
+    return json({ ...rest, webhookUrl: `${publicOrigin()}${GITHUB_HOOK_PREFIX}${linkId}` });
   }
   if (rest[0] === "github" && rest[1] === "unlink" && rest[2] === "done" && rest.length === 3 && method === "POST") {
     const input = await body(request);

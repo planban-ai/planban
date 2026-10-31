@@ -56,8 +56,8 @@ export interface HostedBoardState {
  * landing notes a board with a linked GitHub repository records itself, and a note says when a card
  * names a pull request nothing checks. The board shows the notes that need a person.
  */
-function pageStaleness(roadmap: PlanbanRoadmap, linkedRepos: string[] = []) {
-  const { cards, notes } = boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], linkedRepos);
+function pageStaleness(roadmap: PlanbanRoadmap, repos: { linkedRepos: string[]; homeRepo: string | null } = { linkedRepos: [], homeRepo: null }) {
+  const { cards, notes } = boardOnlyStaleness(roadmap.roadmapItems, Date.now(), [], repos.linkedRepos, repos.homeRepo);
   return { cards, ...(notes?.length ? { notes } : {}) };
 }
 
@@ -131,7 +131,7 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
   /** The person's role on each board, from the last time the service said. */
   const roles = new Map<string, { role: BoardRole | null; authority: string | null }>();
   // The GitHub repositories each board links, from its last read: their merges show on the page.
-  const linked = new Map<string, string[]>();
+  const linked = new Map<string, { linkedRepos: string[]; homeRepo: string | null }>();
 
   /**
    * Calls the service. A request that fails on the network is resent once
@@ -234,10 +234,10 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
   }
 
   async function loadBoard(boardId: string, request?: PageRequest): Promise<PageReply> {
-    const board = await get<{ roadmap: PlanbanRoadmap; authority?: string; role?: BoardRole; linkedRepos?: string[] }>(serviceBoard(boardId), request);
+    const board = await get<{ roadmap: PlanbanRoadmap; authority?: string; role?: BoardRole; linkedRepos?: string[]; homeRepo?: string }>(serviceBoard(boardId), request);
     if (!board.ok) return board.reply;
     roles.set(boardId, { role: board.value.role ?? roles.get(boardId)?.role ?? null, authority: board.value.authority ?? null });
-    linked.set(boardId, board.value.linkedRepos ?? []);
+    linked.set(boardId, { linkedRepos: board.value.linkedRepos ?? [], homeRepo: board.value.homeRepo ?? null });
     return reply({ ...boardState(boardId, board.value.roadmap), staleness: pageStaleness(board.value.roadmap, linked.get(boardId)) });
   }
 
