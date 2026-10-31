@@ -290,6 +290,8 @@ Each person also chooses what their own agents may do: read, plan, or plan and c
 
 **For agents.** An agent never does more than its person allows. Planban's service enforces this for agents connected through ChatGPT, claude.ai and the web address. On your own computer it relies on Planban's tools and command line saying they act for an agent (they always do), because an agent there uses your sign-in. Completing a card needs `--completion-confirmed` (`completionConfirmed` in the tools), and `-o json` gives results and failures as JSON. The [Planban protocol](plugins/planban/skills/planban/references/planban-protocol.md) has the details.
 
+**Merged pull requests, recorded for you.** Link a GitHub repository to an online board with `planban online github link <owner/name>` (you need admin access to the repository, and the GitHub CLI, `gh`, signed in on that computer). From then on, whenever a pull request merges, the board notes it on every card that names it, such as `#123`, `owner/name#123` or its address, and asks your agents to write what it means into the card. Merges that name no card wait for your agents to sort out, out of your way. `planban online github status` shows the link and the last delivery; `planban online github unlink <owner/name>` stops it and removes the webhook from GitHub.
+
 **Connect AI apps.** Codex and Claude Code with the Planban plugin already work with online boards once this computer is signed in. Other apps connect to `https://app.planban.ai/mcp` and ask you to sign in and click Allow:
 
 - ChatGPT and claude.ai: add a custom connector with that address.

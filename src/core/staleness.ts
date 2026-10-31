@@ -1,6 +1,6 @@
 // Stale signals: derived hints that an active card may no longer match reality.
 // Pure and browser-safe; the git, history and file inputs are gathered by stalenessSources.ts.
-import type { PlanbanHistoryEntry, PlanbanRoadmapItem } from "./types";
+import type { PlanbanHistoryEntry, PlanbanLanding, PlanbanRoadmapItem } from "./types";
 import { planbanCommand } from "./command";
 
 export type StalenessKind = "holds-files" | "merged" | "doc-edited" | "quiet" | "large-doc" | "awaiting-owner" | "group-behind";
@@ -32,6 +32,9 @@ export function prKey(repo: string | null | undefined, number: number): string {
 
 const prName = (repo: string | null | undefined, number: number) => `${repo ?? ""}#${number}`;
 
+/** How a card's freshness reads after a merge was noted on it, until its summary or next action is rewritten. */
+export const LANDED_LABEL = "Landed: needs a wrap-up";
+
 export interface DocMtime {
   cardId: string;
   kind: "spec" | "plan";
@@ -49,6 +52,12 @@ export interface StalenessInput {
   cardFiles?: Record<string, string[]> | undefined;
   /** Why some signals may be missing, such as GitHub being out of reach. Passed through to readers. */
   notes?: string[] | undefined;
+  /**
+   * The repository a bare `#123` on a card means: the board's home repository (its first linked
+   * one), or this project's GitHub origin. Unknown, a bare reference is never taken to be a
+   * landing note's pull request.
+   */
+  homeRepo?: string | null | undefined;
   now: number;
 }
 
@@ -248,14 +257,29 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
     // to its summary or next action, or completing it, notes progress; a touch or a metadata edit doesn't.
     const floor = Math.max(progressFloor(item) ?? -Infinity, firstSeen.get(item.id) ?? -Infinity);
     if (floor > -Infinity) {
+      // Landing notes the board recorded itself (an Online Board's linked GitHub repository) come
+      // first; a merge found in git or GitHub that a note already covers isn't said twice.
+      const landed = (item.landings ?? [])
+        .map((landing) => ({ name: prName(landing.repo, landing.number), number: landing.number, at: time(landing.mergedAt) }))
+        .filter((entry): entry is { name: string; number: number; at: number } => entry.at !== null && entry.at > floor && entry.at <= input.now);
+      // By repository and number: #12 in one repository is not #12 in another.
+      const noted = new Set((item.landings ?? []).map((landing) => prKey(landing.repo, landing.number)));
       const merged = cardPrRefs(item)
-        .map((ref) => ({ ref, at: mergedAt.get(prKey(ref.repo, ref.number)) ?? null }))
-        .filter((entry): entry is { ref: PrRef; at: number } => entry.at !== null && entry.at > floor && entry.at <= input.now)
-        .sort((left, right) => right.at - left.at);
-      if (merged.length) {
-        const names = merged.slice(0, 3).map((entry) => prName(entry.ref.repo, entry.ref.number)).join(", ");
-        const latest = merged[0]!.at;
-        signals.push({ kind: "merged", detail: `${names} merged ${shortDate(latest)}`, since: new Date(latest).toISOString() });
+        .filter((ref) => {
+          const repo = ref.repo ?? input.homeRepo;
+          return !(repo && noted.has(prKey(repo, ref.number)));
+        })
+        .map((ref) => ({ name: prName(ref.repo, ref.number), at: mergedAt.get(prKey(ref.repo, ref.number)) ?? null }))
+        .filter((entry): entry is { name: string; at: number } => entry.at !== null && entry.at > floor && entry.at <= input.now);
+      const all = [...landed.sort((left, right) => right.at - left.at), ...merged.sort((left, right) => right.at - left.at)];
+      if (all.length) {
+        const names = all.slice(0, 3).map((entry) => entry.name).join(", ");
+        const latest = Math.max(...all.map((entry) => entry.at));
+        signals.push({
+          kind: "merged",
+          detail: landed.length ? `${LANDED_LABEL} (${names} merged ${shortDate(latest)})` : `${names} merged ${shortDate(latest)}`,
+          since: new Date(latest).toISOString(),
+        });
       }
     }
 
@@ -308,14 +332,32 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
 /** Said wherever merged-PR warnings can't be worked out, so their absence is never read as "nothing merged". */
 export const MERGES_NOT_CHECKED_NOTE = "Merged-PR warnings aren't checked here, because this view can't see GitHub. Planban on a computer with the GitHub CLI (gh) signed in checks them, for example planban_status or planban_get_board from a coding agent.";
 
+/** Said when a board's linked repositories don't cover every pull request its active cards name. */
+export function mergesCheckedOnlyNote(repos: string[]): string {
+  return `Merged-PR warnings here come from the GitHub ${repos.length === 1 ? "repository" : "repositories"} linked to this board (${repos.join(", ")}). Pull requests in other repositories aren't checked here; Planban on a computer with the GitHub CLI (gh) signed in checks them.`;
+}
+
 /**
  * Freshness from the board alone, for the hosted web page and the hosted MCP tools, which have no
- * git or GitHub: every signal but "merged" (and "edited outside Planban", which can't happen online),
- * with a note when an active card names a PR.
+ * git or GitHub: every signal but merges found in git or GitHub (and "edited outside Planban", which
+ * can't happen online). Merges the board recorded itself, as landing notes from a linked GitHub
+ * repository, are shown. A note says when an active card names a pull request nothing checks.
  */
-export function boardOnlyStaleness(items: PlanbanRoadmapItem[], now: number, history: StalenessInput["history"] = []): BoardStaleness {
-  const namesPr = items.some((item) => ACTIVE_STATUSES.has(item.status) && cardPrRefs(item).length > 0);
-  return computeStaleness({ items, history, docMtimes: [], merges: [], now, notes: namesPr ? [MERGES_NOT_CHECKED_NOTE] : [] });
+export function boardOnlyStaleness(
+  items: PlanbanRoadmapItem[],
+  now: number,
+  history: StalenessInput["history"] = [],
+  /** The linked repositories GitHub confirmed, whose merges count as checked. */
+  linkedRepos: string[] = [],
+  /** The board's home repository, whose `#123` a bare reference means, confirmed or not. */
+  homeRepo: string | null = null,
+): BoardStaleness {
+  const linked = new Set(linkedRepos.map((repo) => repo.toLowerCase()));
+  // A bare #123 is checked only when the home repository itself is confirmed.
+  const unchecked = items.some((item) => ACTIVE_STATUSES.has(item.status)
+    && cardPrRefs(item).some((ref) => !linked.has((ref.repo ?? homeRepo ?? "").toLowerCase())));
+  const note = !unchecked ? [] : linked.size ? [mergesCheckedOnlyNote(linkedRepos)] : [MERGES_NOT_CHECKED_NOTE];
+  return computeStaleness({ items, history, docMtimes: [], merges: [], now, notes: note, homeRepo });
 }
 
 export interface StalenessAttention {
@@ -327,12 +369,20 @@ export interface StalenessAttention {
   holdingFiles: { ids: string[]; total: number };
   wip: BoardStaleness["wip"];
   notes?: string[] | undefined;
+  /**
+   * Merges from a linked GitHub repository that named no card, waiting for an agent to assign
+   * each to a card or dismiss it. The first few, with the total.
+   */
+  inbox?: { total: number; items: Array<{ ref: string; title: string; mergedAt: string; url: string }> } | undefined;
 }
+
+/** How many inbox merges the attention section lists. */
+export const ATTENTION_INBOX_ITEMS = 10;
 
 /** How many card ids a one-line summary names before "+N more". */
 export const SUMMARY_IDS = 5;
 
-export function stalenessAttention(staleness: BoardStaleness, items: PlanbanRoadmapItem[]): StalenessAttention {
+export function stalenessAttention(staleness: BoardStaleness, items: PlanbanRoadmapItem[], inbox: PlanbanLanding[] = []): StalenessAttention {
   const byId = new Map(items.map((item) => [item.id, item]));
   const rank = (signals: StalenessSignal[]) => STALENESS_KIND_ORDER.indexOf(signals[0]!.kind);
   const stale = Object.entries(staleness.cards)
@@ -354,6 +404,12 @@ export function stalenessAttention(staleness: BoardStaleness, items: PlanbanRoad
     })(),
     wip: staleness.wip,
     ...(staleness.notes?.length ? { notes: staleness.notes } : {}),
+    ...(inbox.length ? {
+      inbox: {
+        total: inbox.length,
+        items: inbox.slice(0, ATTENTION_INBOX_ITEMS).map((landing) => ({ ref: `${landing.repo}#${landing.number}`, title: landing.title, mergedAt: landing.mergedAt, url: landing.url })),
+      },
+    } : {}),
   };
 }
 
@@ -372,6 +428,11 @@ export function stalenessLine(attention: StalenessAttention, allListedBy?: strin
   if (attention.total > 0) {
     const ids = attention.cards.slice(0, SUMMARY_IDS).map((card) => card.id).join(", ");
     parts.push(`${attention.total} active card${attention.total === 1 ? "" : "s"} look${attention.total === 1 ? "s" : ""} stale (${ids}${more(attention.total)}); fix any you touch.`);
+  }
+  if (attention.inbox?.total) {
+    const { total, items } = attention.inbox;
+    const refs = items.slice(0, SUMMARY_IDS).map((item) => item.ref).join(", ");
+    parts.push(`${total} merged pull request${total === 1 ? " names" : "s name"} no card (${refs}${more(total)}); write what each finished into the right card and assign it there, or dismiss it, with planban_clear_landing.`);
   }
   if (attention.wip) parts.push(`${attention.wip.count} Items are In Progress (over ${attention.wip.threshold}).`);
   // A note only matters beside a warning or a quiet board an agent would otherwise trust.

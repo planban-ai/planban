@@ -38,12 +38,14 @@ import { addStored, chargeWrite, sizeOf } from "./model/limits";
 import { historyEntries, historyPage, recordHistory, roadmapAtVersion, type Attribution, type BoardRows } from "./model/history";
 import { DOC_KINDS, currentRoadmap, docPayload, docRow, live, retiredIds, stateRow, type DocKind } from "./model/rows";
 import { reserveRetiredId } from "./model/retired";
+import { planClearLanding } from "../../../src/core/landings";
+import { confirmedRepos, linkedRepos } from "./model/githubLinks";
 
 export const BOARD_OPERATIONS = [
   "createCard", "createCards", "createGroup", "updateCard", "moveCard",
   "setCardParent", "reorderCards", "deleteArchivedCard", "writeDoc",
   "restoreBoard", "restoreCard", "restoreDoc", "dropChange", "writeDocSection",
-  "editGoals", "suggestGoalChange", "decideGoalSuggestion",
+  "editGoals", "suggestGoalChange", "decideGoalSuggestion", "clearLanding",
 ] as const;
 export type BoardOperation = (typeof BOARD_OPERATIONS)[number];
 
@@ -60,12 +62,13 @@ export interface BoardBundle {
 
 // ---- helpers ------------------------------------------------------------
 
-export function attributionFor(connection: Doc<"connections">, actor: unknown): Attribution {
+/** Who a request's change is credited to: always a person or their agent, never an integration. */
+export function attributionFor(connection: Doc<"connections">, actor: unknown): Attribution & { actor: "user" | "agent" } {
   return { userId: connection.userId, clientName: connection.clientName, actor: connection.canAdminister && actor === "user" ? "user" : "agent", connectionId: connection._id };
 }
 
 /** Writes the roadmap, documents and one history version. Runs inside the caller's mutation. */
-async function commit(ctx: MutationCtx, board: Doc<"boards">, previous: PlanbanRoadmap, change: PlannedChange, attribution: Attribution, now: string) {
+export async function commit(ctx: MutationCtx, board: Doc<"boards">, previous: PlanbanRoadmap, change: PlannedChange, attribution: Attribution, now: string) {
   assertCommittable(change.roadmap);
   // Planban is an index, not storage (owner decision 18).
   checkCards(change.roadmap, previous);
@@ -263,6 +266,8 @@ async function describeChanges(ctx: QueryCtx, entries: PlanbanHistoryEntry[], ba
   return changesSince(entries, base, (entry) => {
     const attribution = (entry as { attribution?: { userId?: string; clientName?: string; actor?: string } }).attribution;
     const name = attribution?.userId ? names.get(attribution.userId)! : "someone on the board";
+    // An integration (GitHub recording a merge) is named as itself.
+    if (entry.actor === "system" && attribution?.clientName) return attribution.clientName;
     return entry.actor === "agent" ? `${name}'s agent${attribution?.clientName ? ` (${attribution.clientName})` : ""}` : name;
   });
 }
@@ -364,7 +369,16 @@ export const getBoard = internalQuery({
     // The role lets the web page show a viewer a board they can read but not change. The
     // features let a computer's older Planban say it can't show everything (16 October 2026).
     const goals = await goalsOf(ctx, live(board));
-    return { roadmap: await currentRoadmap(ctx, live(board)), authority: board.authority, role, features: boardFeatures({ hasGoals: hasGoalsContent(goals) }) };
+    // The GitHub repositories whose merges the board records itself, for the hosted freshness note.
+    // Only links GitHub confirmed count as checked. The home repository, whose #123 a bare
+    // reference means, is said separately: it is the first link whether or not it is confirmed.
+    const repos = await confirmedRepos(ctx, boardId);
+    const homeRepo = (await linkedRepos(ctx, boardId))[0];
+    return {
+      roadmap: await currentRoadmap(ctx, live(board)), authority: board.authority, role, features: boardFeatures({ hasGoals: hasGoalsContent(goals) }),
+      ...(repos.length ? { linkedRepos: repos } : {}),
+      ...(homeRepo ? { homeRepo } : {}),
+    };
   })()),
 });
 
@@ -812,6 +826,16 @@ export const run = internalMutation({
         outcome = await changeGoals(ctx, access.board, current, op, input, now, attribution);
       } else if (op === "dropChange") {
         outcome = await dropChange(ctx, access.board, current, input, now, attribution);
+      } else if (op === "clearLanding") {
+        // The inbox merge is named by its repository and number, so a stale baseRevision doesn't matter;
+        // one already cleared is refused as not found.
+        const change = planClearLanding(current, {
+          repo: String(input.repo ?? ""), number: Number(input.number), actor: attribution.actor,
+          ...(typeof input.cardId === "string" && input.cardId ? { cardId: input.cardId } : {}),
+          ...(typeof input.reason === "string" ? { reason: input.reason } : {}),
+        }, { now });
+        const { committed, version } = await commit(ctx, access.board, current, change, attribution, now);
+        outcome = { committed, version, result: { cleared: `${String(input.repo)}#${Number(input.number)}`, ...(typeof input.cardId === "string" && input.cardId ? { assignedTo: input.cardId } : { dismissed: true }) } };
       } else if (op === "writeDoc") {
         if (attribution.actor === "agent" && typeof input.cardId === "string" && (input.kind === "spec" || input.kind === "plan")) {
           settled = await settledBy(ctx, at, [{ cardId: input.cardId, field: input.kind }], null);

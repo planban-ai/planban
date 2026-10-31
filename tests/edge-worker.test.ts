@@ -160,3 +160,26 @@ test("registrations use their own limiter, and a streamed body past the cap fail
   const { seen } = await through(new Request(`${PUBLIC}/mcp`, { method: "POST", body: big, duplex: "half" } as any));
   await assert.rejects(new Response(seen[0]!.init.body as ReadableStream).arrayBuffer());
 });
+
+test("GitHub deliveries are limited per caller address and per link before forwarding, and refused without the limiters", async () => {
+  const keys: string[] = [];
+  let allowLink = true;
+  const limited: Env = {
+    ...env,
+    GITHUB_HOOK_IP_LIMITER: { limit: async ({ key }) => { keys.push(`ip:${key}`); return { success: true }; } },
+    GITHUB_HOOK_LIMITER: { limit: async ({ key }) => { keys.push(`link:${key}`); return { success: allowLink }; } },
+  };
+  const delivery = () => new Request(`${PUBLIC}/api/v1/github/hooks/ghl_abc123abc123abc123`, { method: "POST", headers: { "CF-Connecting-IP": "140.82.115.1" }, body: "{}" });
+  assert.equal((await through(delivery(), undefined, limited)).response.status, 200);
+  assert.deepEqual(keys, ["link:ghl_abc123abc123abc123", "ip:140.82.115.1"]);
+  allowLink = false;
+  keys.length = 0;
+  const refused = await through(delivery(), undefined, limited);
+  assert.equal(refused.response.status, 429);
+  assert.equal(refused.seen.length, 0);
+  // Refused by its link's own limit, it never spends the address budget other boards share.
+  assert.deepEqual(keys, ["link:ghl_abc123abc123abc123"]);
+  const unlimited = await through(delivery());
+  assert.equal(unlimited.response.status, 503, "fails closed without the limiters");
+  assert.equal(unlimited.seen.length, 0);
+});

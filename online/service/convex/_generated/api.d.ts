@@ -13,6 +13,7 @@ import type * as connections from "../connections.js";
 import type * as copies from "../copies.js";
 import type * as erasure from "../erasure.js";
 import type * as crons from "../crons.js";
+import type * as github from "../github.js";
 import type * as historyMaintenance from "../historyMaintenance.js";
 import type * as http from "../http.js";
 import type * as invites from "../invites.js";
@@ -68,6 +69,7 @@ declare const fullApi: ApiFromModules<{
   copies: typeof copies;
   erasure: typeof erasure;
   crons: typeof crons;
+  github: typeof github;
   historyMaintenance: typeof historyMaintenance;
   http: typeof http;
   invites: typeof invites;
