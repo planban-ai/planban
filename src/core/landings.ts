@@ -42,9 +42,18 @@ function longDate(iso: string) {
   return Number.isFinite(date.getTime()) ? `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}` : iso;
 }
 
-/** The note as people and agents read it: "30 Oct 2026: pull request 1412 merged in owner/name: Fix the thing". */
-export function landingNote(landing: Pick<PlanbanLanding, "repo" | "number" | "title" | "mergedAt">): string {
-  return `${longDate(landing.mergedAt)}: pull request ${landing.number} merged in ${landing.repo}${landing.title ? `: ${landing.title}` : ""}`;
+/** Who a merge is credited to: GitHub, or the person whose unconfirmed link reported it. */
+export function landingSource(landing: Pick<PlanbanLanding, "reportedThrough">): string {
+  return landing.reportedThrough ? `Reported through the link ${landing.reportedThrough} set up` : "GitHub";
+}
+
+/**
+ * The note as people and agents read it: "30 Oct 2026: pull request 1412 merged in owner/name: Fix the thing",
+ * with "(reported through the link Ana set up)" when GitHub hadn't confirmed that link.
+ */
+export function landingNote(landing: Pick<PlanbanLanding, "repo" | "number" | "title" | "mergedAt" | "reportedThrough">): string {
+  const via = landing.reportedThrough ? ` (reported through the link ${landing.reportedThrough} set up)` : "";
+  return `${longDate(landing.mergedAt)}: pull request ${landing.number} merged in ${landing.repo}${landing.title ? `: ${landing.title}` : ""}${via}`;
 }
 
 /** Whether these references name this merge. A bare `#123` is a pull request in the home repository. */
@@ -75,9 +84,12 @@ function cleanTitle(title: string) {
   return flat.length > MAX_LANDING_TITLE ? `${flat.slice(0, MAX_LANDING_TITLE - 1)}…` : flat;
 }
 
-/** A merge as stored: a clean title, and when Planban recorded it. */
-export function toLanding(merge: MergeEvent, now: string): PlanbanLanding {
-  return { repo: merge.repo, number: merge.number, title: cleanTitle(merge.title), mergedAt: merge.mergedAt, url: merge.url, recordedAt: now };
+/** A merge as stored: a clean title, when Planban recorded it, and whose word it is if not GitHub's. */
+export function toLanding(merge: MergeEvent, now: string, reportedThrough?: string | null): PlanbanLanding {
+  return {
+    repo: merge.repo, number: merge.number, title: cleanTitle(merge.title), mergedAt: merge.mergedAt, url: merge.url, recordedAt: now,
+    ...(reportedThrough ? { reportedThrough: reportedThrough.slice(0, 200) } : {}),
+  };
 }
 
 function withLanding(item: PlanbanRoadmapItem, landing: PlanbanLanding, now: string): PlanbanRoadmapItem {
@@ -95,9 +107,16 @@ const titleList = (items: PlanbanRoadmapItem[]) => items.map((item) => item.titl
 export function planRecordMerge(
   roadmap: PlanbanRoadmap,
   merge: MergeEvent,
-  options: { homeRepo: string | null; specs?: ReadonlyMap<string, string> | undefined; now: string },
+  options: {
+    homeRepo: string | null;
+    specs?: ReadonlyMap<string, string> | undefined;
+    now: string;
+    /** The person who set up a link GitHub hasn't confirmed; the merge is credited to them, not GitHub. */
+    reportedThrough?: string | null | undefined;
+  },
 ): PlannedChange | null {
-  const landing = toLanding(merge, options.now);
+  const landing = toLanding(merge, options.now, options.reportedThrough);
+  const source = landingSource(landing);
   const key = landingKey(landing);
   const recorded = roadmap.roadmapItems.some((item) => item.landings?.some((entry) => landingKey(entry) === key))
     || roadmap.landingInbox?.some((entry) => landingKey(entry) === key);
@@ -108,13 +127,13 @@ export function planRecordMerge(
     const items = roadmap.roadmapItems.map((item) => (ids.has(item.id) ? withLanding(item, landing, options.now) : item));
     return {
       roadmap: { ...roadmap, roadmapItems: items },
-      history: { actor: "system", operation: "github.merge.landed", summary: `GitHub: ${said}; noted on ${titleList(items.filter((item) => ids.has(item.id)))}`, affectedCards: [...ids] },
+      history: { actor: "system", operation: "github.merge.landed", summary: `${source}: ${said}; noted on ${titleList(items.filter((item) => ids.has(item.id)))}`, affectedCards: [...ids] },
       docWrites: [],
     };
   }
   return {
     roadmap: { ...roadmap, landingInbox: [landing, ...(roadmap.landingInbox ?? [])].slice(0, MAX_INBOX) },
-    history: { actor: "system", operation: "github.merge.inbox", summary: `GitHub: ${said}; no card names it, so it waits in the inbox`, affectedCards: [] },
+    history: { actor: "system", operation: "github.merge.inbox", summary: `${source}: ${said}; no card names it, so it waits in the inbox`, affectedCards: [] },
     docWrites: [],
   };
 }

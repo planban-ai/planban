@@ -77,6 +77,11 @@ export interface PlanbanLanding {
   url: string;
   /** When Planban recorded it. */
   recordedAt: string;
+  /**
+   * Set when GitHub hadn't confirmed the link that reported it: the name of the person who set
+   * the link up, whose word it is. Absent when GitHub's own confirmed webhook reported it.
+   */
+  reportedThrough?: string | undefined;
 }
 
 export interface PlanbanRoadmap {

@@ -421,15 +421,31 @@ export default defineSchema({
     /** "owner/name" as the owner typed it; repoKey is it lower-cased. */
     repo: v.string(),
     repoKey: v.string(),
-    secret: v.string(),
+    /** Absent once unlinking began: no delivery is accepted after that. */
+    secret: v.optional(v.string()),
     /** The repository webhook's id on GitHub, so unlinking can remove it. */
     hookId: v.optional(v.number()),
+    /**
+     * Unlinking began but GitHub hasn't yet confirmed the webhook is gone. The
+     * row keeps the webhook id until it is, so unlinking can be retried.
+     */
+    removing: v.optional(v.boolean()),
+    /**
+     * When a correctly signed ping from GitHub named this link's repository and
+     * webhook id. Until then the link is unconfirmed: its merges are credited to
+     * the person who set it up, and hosted surfaces don't count it as checked.
+     */
+    confirmedAt: v.optional(v.string()),
+    /** The webhook id GitHub's ping named, kept until the linking computer records its own. */
+    pingHookId: v.optional(v.number()),
     createdBy: v.string(),
     createdAt: v.string(),
     lastDelivery: v.optional(v.object({ at: v.string(), event: v.string(), outcome: v.string() })),
-    /** Merges recorded in the current hour, for the per-link limit. */
+    /** Deliveries that wrote anything in the current hour, for the per-link limit. */
     hour: v.optional(v.number()),
     hourCount: v.optional(v.number()),
+    /** The hour the limit was last reached and said so, so the refusal is noted once an hour. */
+    limitedHour: v.optional(v.number()),
   }).index("by_linkId", ["linkId"]).index("by_board", ["boardId"]),
 
   /** GitHub delivery ids already handled, so a replayed or redelivered request does nothing. Kept for a week. */

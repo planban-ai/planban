@@ -162,11 +162,26 @@ test("a landed card reads 'needs a wrap-up' until its summary or next action is 
 test("a landing note and a merge found in GitHub for the same pull request are said once", () => {
   const landed = record(board([item({ id: "card", summary: "Building it in #12 and #13." })]), merge(12))!.roadmap;
   const signals = computeStaleness({
-    items: landed.roadmapItems, history: [], docMtimes: [], now: NOW,
+    items: landed.roadmapItems, history: [], docMtimes: [], now: NOW, homeRepo: REPO,
     merges: [{ pr: 12, mergedAt: iso(NOW - DAY) }, { pr: 13, mergedAt: iso(NOW - 2 * DAY) }],
   }).cards.card!;
   assert.equal(signals.length, 1);
   assert.equal(signals[0]!.detail, `${LANDED_LABEL} (${REPO}#12, #13 merged 29 Oct)`);
+});
+
+test("pull requests with the same number in different repositories are each said", () => {
+  // The card names this project's #12 and another repository's #12; only the other one landed here.
+  const other = "someone/else";
+  const landed = record(board([item({ id: "card", summary: `Building it in #12, after ${other}#12.` })]), merge(12, { repo: other, url: `https://github.com/${other}/pull/12` }))!.roadmap;
+  const merges = [{ pr: 12, mergedAt: iso(NOW - 2 * DAY) }];
+  const signals = computeStaleness({ items: landed.roadmapItems, history: [], docMtimes: [], now: NOW, homeRepo: REPO, merges }).cards.card!;
+  assert.equal(signals[0]!.detail, `${LANDED_LABEL} (${other}#12, #12 merged 29 Oct)`);
+  // Unknown home repository: a bare #12 is never taken for another repository's landing.
+  const unknown = computeStaleness({ items: landed.roadmapItems, history: [], docMtimes: [], now: NOW, merges }).cards.card!;
+  assert.equal(unknown[0]!.detail, `${LANDED_LABEL} (${other}#12, #12 merged 29 Oct)`);
+  // With the other repository as home, the bare #12 is that landing, said once.
+  const same = computeStaleness({ items: landed.roadmapItems, history: [], docMtimes: [], now: NOW, homeRepo: other, merges }).cards.card!;
+  assert.equal(same[0]!.detail, `${LANDED_LABEL} (${other}#12 merged 29 Oct)`);
 });
 
 test("hosted surfaces show landed cards, and drop the 'not checked' note once a repository is linked", () => {

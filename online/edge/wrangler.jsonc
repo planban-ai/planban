@@ -21,7 +21,11 @@
   // Per caller address. Registrations come from Anthropic's shared addresses, so they get more room.
   "ratelimits": [
     { "name": "SIGNIN_LIMITER", "namespace_id": "1001", "simple": { "limit": 6, "period": 60 } },
-    { "name": "REGISTER_LIMITER", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } }
+    { "name": "REGISTER_LIMITER", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } },
+    // GitHub webhook deliveries: per link address, and per caller address. GitHub sends every
+    // board's deliveries from its own shared addresses, so the per-address limit is generous.
+    { "name": "GITHUB_HOOK_LIMITER", "namespace_id": "1003", "simple": { "limit": 60, "period": 60 } },
+    { "name": "GITHUB_HOOK_IP_LIMITER", "namespace_id": "1004", "simple": { "limit": 1200, "period": 60 } }
   ],
   "vars": {
     "PUBLIC_HOST": "app.planban.ai",

@@ -323,11 +323,11 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
   if (rest[0] === "github" && rest[1] === "links" && rest.length === 2 && method === "POST") {
     // The link's secret is made here and returned this once, to the owner's own sign-in, for
     // their computer to hand to GitHub. It is never shown again.
+    // Linking again after a failure picks up the unfinished link, with a new secret, at the same address.
     const input = await body(request);
-    const linkId = randomSecret("ghl_");
     const secret = randomSecret("");
-    const created = await ctx.runMutation(internal.github.createLink, { connectionId, boardId, repo: String(input.repo ?? ""), linkId, secret });
-    return json({ ...created, linkId, webhookUrl: `${publicOrigin()}${GITHUB_HOOK_PREFIX}${linkId}`, secret }, 201);
+    const created = await ctx.runMutation(internal.github.createLink, { connectionId, boardId, repo: String(input.repo ?? ""), linkId: randomSecret("ghl_"), secret });
+    return json({ ...created, webhookUrl: `${publicOrigin()}${GITHUB_HOOK_PREFIX}${created.linkId}`, secret }, created.resumed ? 200 : 201);
   }
   if (rest[0] === "github" && rest[1] === "links" && rest[3] === "hook" && rest.length === 4 && method === "POST") {
     const input = await body(request);
@@ -336,6 +336,10 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
   if (rest[0] === "github" && rest[1] === "unlink" && rest.length === 2 && method === "POST") {
     const input = await body(request);
     return json(await ctx.runMutation(internal.github.removeLink, { connectionId, boardId, repo: String(input.repo ?? "") }));
+  }
+  if (rest[0] === "github" && rest[1] === "unlink" && rest[2] === "done" && rest.length === 3 && method === "POST") {
+    const input = await body(request);
+    return json(await ctx.runMutation(internal.github.forgetLink, { connectionId, boardId, repo: String(input.repo ?? "") }));
   }
   if (rest[0] === "goals" && rest.length === 1 && method === "GET") return json(unpacked(await ctx.runQuery(internal.boards.goals, { connectionId, boardId })));
   if (rest[0] === "unresolved" && rest.length === 1 && method === "GET") {

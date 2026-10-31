@@ -31,6 +31,7 @@ export const landingSchema = z.object({
   mergedAt: z.string().min(1),
   url: z.string(),
   recordedAt: z.string().min(1),
+  reportedThrough: z.string().min(1).max(200).optional(),
 });
 
 const roadmapItemBaseSchema = z.object({

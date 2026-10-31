@@ -52,6 +52,12 @@ export interface StalenessInput {
   cardFiles?: Record<string, string[]> | undefined;
   /** Why some signals may be missing, such as GitHub being out of reach. Passed through to readers. */
   notes?: string[] | undefined;
+  /**
+   * The repository a bare `#123` on a card means: the board's home repository (its first linked
+   * one), or this project's GitHub origin. Unknown, a bare reference is never taken to be a
+   * landing note's pull request.
+   */
+  homeRepo?: string | null | undefined;
   now: number;
 }
 
@@ -256,9 +262,13 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
       const landed = (item.landings ?? [])
         .map((landing) => ({ name: prName(landing.repo, landing.number), number: landing.number, at: time(landing.mergedAt) }))
         .filter((entry): entry is { name: string; number: number; at: number } => entry.at !== null && entry.at > floor && entry.at <= input.now);
-      const noted = new Set((item.landings ?? []).map((landing) => landing.number));
+      // By repository and number: #12 in one repository is not #12 in another.
+      const noted = new Set((item.landings ?? []).map((landing) => prKey(landing.repo, landing.number)));
       const merged = cardPrRefs(item)
-        .filter((ref) => !noted.has(ref.number))
+        .filter((ref) => {
+          const repo = ref.repo ?? input.homeRepo;
+          return !(repo && noted.has(prKey(repo, ref.number)));
+        })
         .map((ref) => ({ name: prName(ref.repo, ref.number), at: mergedAt.get(prKey(ref.repo, ref.number)) ?? null }))
         .filter((entry): entry is { name: string; at: number } => entry.at !== null && entry.at > floor && entry.at <= input.now);
       const all = [...landed.sort((left, right) => right.at - left.at), ...merged.sort((left, right) => right.at - left.at)];
@@ -338,7 +348,7 @@ export function boardOnlyStaleness(items: PlanbanRoadmapItem[], now: number, his
   const unchecked = items.some((item) => ACTIVE_STATUSES.has(item.status)
     && cardPrRefs(item).some((ref) => (ref.repo ? !linked.has(ref.repo.toLowerCase()) : linked.size === 0)));
   const note = !unchecked ? [] : linked.size ? [mergesCheckedOnlyNote(linkedRepos)] : [MERGES_NOT_CHECKED_NOTE];
-  return computeStaleness({ items, history, docMtimes: [], merges: [], now, notes: note });
+  return computeStaleness({ items, history, docMtimes: [], merges: [], now, notes: note, homeRepo: linkedRepos[0] ?? null });
 }
 
 export interface StalenessAttention {

@@ -554,6 +554,8 @@ An Online Board whose owner linked a GitHub repository (`planban online github l
   **landing note** to that card: its
   `landings` list, which `get-card` and `planban_get_card` show (`landingNotes` reads them
   as sentences). The note never changes the person's text. Nobody edits it directly.
+  A note ending "(reported through the link Ana set up)" came through a link GitHub
+  hasn't confirmed yet: treat it as that person's report, not as GitHub's.
 - The card's freshness then reads "Landed: needs a wrap-up". Write what the merge means
   into the summary or next action: what is now true, and what is next. That clears it;
   completing the card does too. Touching the card or editing its metadata doesn't.

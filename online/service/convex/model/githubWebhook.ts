@@ -8,16 +8,52 @@
 // repository get the same answer, so a caller learns nothing about which
 // boards or repositories are linked. The body is size-limited before it is
 // read in full, and the signature is checked before it is parsed.
+//
+// Before any of that, cheap checks bound the work a flood can cause: with a
+// public address in front (the edge Worker, which limits deliveries per link
+// and per caller address), a delivery that skipped it is refused; and each
+// link admits a bounded number of deliveries a minute on this server, before
+// its secret is looked up or any signature is worked out.
 import { ConvexError } from "convex/values";
 import { internal } from "../_generated/api";
 import type { ActionCtx } from "../_generated/server";
 import type { ServiceErrorData } from "./errors";
+import { atServiceAddress } from "./auth";
 
 export const GITHUB_HOOK_PREFIX = "/api/v1/github/hooks/";
 /** GitHub caps payloads at 25 MB; a pull request event, description included, is far below this. */
 export const MAX_WEBHOOK_BYTES = 1024 * 1024;
 const LINK_ID = /^[A-Za-z0-9_-]{16,80}$/u;
 const DELIVERY_ID = /^[A-Za-z0-9-]{1,100}$/u;
+/** Deliveries one link address is admitted a minute on one server, before its secret is looked up. */
+export const ADMITTED_PER_LINK_PER_MINUTE = 60;
+const ADMISSION_WINDOW_MS = 60_000;
+/** Link addresses tracked at once; past this the oldest windows are dropped, which only ever admits more. */
+const ADMISSION_KEYS = 10_000;
+const admissions = new Map<string, { start: number; count: number }>();
+
+/**
+ * Whether one more delivery to this link address is admitted in the current minute. Kept in this
+ * server's memory, so it is cheap and best-effort: the edge's limits and the link's hourly write
+ * limit (github.ts) are the ones that hold across servers.
+ */
+export function admitDelivery(linkId: string, now = Date.now()): boolean {
+  const window = admissions.get(linkId);
+  if (!window || now - window.start >= ADMISSION_WINDOW_MS) {
+    if (admissions.size >= ADMISSION_KEYS) admissions.delete(admissions.keys().next().value!);
+    admissions.delete(linkId);
+    admissions.set(linkId, { start: now, count: 1 });
+    return true;
+  }
+  window.count += 1;
+  return window.count <= ADMITTED_PER_LINK_PER_MINUTE;
+}
+
+/** Forgets every admission window, for tests. */
+export function resetAdmissions() {
+  admissions.clear();
+}
+
 /** Checked against when the link is unknown, so an unknown link takes as long to refuse as a wrong signature. */
 const STAND_IN_SECRET = "planban-unknown-link-stand-in-secret";
 
@@ -102,6 +138,9 @@ export function mergedPullRequest(payload: unknown, repo: string): MergedPullReq
 export async function githubWebhookResponse(ctx: ActionCtx, request: Request): Promise<Response> {
   if (request.method !== "POST") return answer(405, { error: "method_not_allowed" });
   const linkId = new URL(request.url).pathname.slice(GITHUB_HOOK_PREFIX.length);
+  // Straight to the native address, past the edge's limits: refused like any other bad delivery.
+  if (!(await atServiceAddress(request))) return refused();
+  if (!admitDelivery(LINK_ID.test(linkId) ? linkId : "")) return answer(429, { error: "rate_limited" });
   const declared = request.headers.get("content-length");
   if (declared !== null && !(/^\d+$/u.test(declared) && Number(declared) <= MAX_WEBHOOK_BYTES)) return answer(413, { error: "payload_too_large" });
   const body = await boundedBody(request, MAX_WEBHOOK_BYTES);
@@ -109,7 +148,7 @@ export async function githubWebhookResponse(ctx: ActionCtx, request: Request): P
   const link = LINK_ID.test(linkId) ? await ctx.runQuery(internal.github.hookSecret, { linkId }) : null;
   const signed = await verifyGitHubSignature(link?.secret ?? STAND_IN_SECRET, body, request.headers.get("x-hub-signature-256"));
   if (!link || !signed) return refused();
-  let payload: { repository?: { full_name?: unknown } };
+  let payload: { repository?: { full_name?: unknown }; hook_id?: unknown; hook?: { id?: unknown } };
   try {
     payload = JSON.parse(new TextDecoder().decode(body));
   } catch {
@@ -124,8 +163,11 @@ export async function githubWebhookResponse(ctx: ActionCtx, request: Request): P
   if (event !== "ping" && event !== "pull_request") return answer(202, { ignored: "Only merged pull requests are recorded." });
   const merge = event === "pull_request" ? mergedPullRequest(payload, link.repo) : null;
   if (event === "pull_request" && !merge) return answer(202, { ignored: "Only merged pull requests are recorded." });
+  // GitHub's ping names the webhook it came from; matching the id the linking computer recorded confirms the link.
+  const pingHook = payload?.hook?.id ?? payload?.hook_id;
+  const ping = event === "ping" && typeof pingHook === "number" && Number.isSafeInteger(pingHook) && pingHook > 0 ? { hookId: pingHook } : undefined;
   try {
-    const result = await ctx.runMutation(internal.github.receive, { linkId, deliveryId, ...(merge ? { merge } : {}) });
+    const result = await ctx.runMutation(internal.github.receive, { linkId, deliveryId, ...(merge ? { merge } : {}), ...(ping ? { ping } : {}) });
     return answer(result.status, result.body);
   } catch (error) {
     // A board over its limits, or busy: GitHub shows the answer, and the delivery can be sent again.

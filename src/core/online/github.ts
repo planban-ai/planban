@@ -4,6 +4,7 @@
 // The service makes the link and its secret. This computer hands the secret to GitHub once, when
 // it adds the repository's webhook through the GitHub CLI (gh) signed in here: on gh's standard
 // input, never in its arguments, on disk or in anything printed. Planban stores no GitHub token.
+// Linking needs admin access to the repository, which gh checks first.
 import { spawn } from "node:child_process";
 import { PlanbanValidationError } from "../boardOperations";
 import { isRepoName } from "../landings";
@@ -62,39 +63,93 @@ interface CreatedLink {
   linkId: string;
   webhookUrl: string;
   secret: string;
+  /** An unfinished link picked up again: its webhook may already be on GitHub. */
+  resumed: boolean;
+}
+
+/** Whether the account gh is signed in as administers the repository. Linking needs it, to add the webhook. */
+async function checkAdmin(repo: string) {
+  let permissions: { admin?: unknown } | undefined;
+  try {
+    permissions = (JSON.parse(await ghRun(["api", `repos/${repo}`])) as { permissions?: { admin?: unknown } }).permissions;
+  } catch (error) {
+    throw new PlanbanValidationError(`Not linked: ${ghProblem(error, repo)}.`);
+  }
+  if (permissions?.admin !== true) {
+    throw new PlanbanValidationError(`Not linked: the account gh is signed in as doesn't administer ${repo}. Linking needs admin access to the repository, to add its webhook.`);
+  }
+}
+
+/** The webhook already on GitHub at this link's address, from an earlier attempt that didn't finish. */
+async function existingHook(repo: string, webhookUrl: string): Promise<number | null> {
+  const pages = JSON.parse(await ghRun(["api", "--paginate", "--slurp", `repos/${repo}/hooks`])) as Array<Array<{ id?: unknown; config?: { url?: unknown } }>>;
+  const hook = pages.flat().find((entry) => entry?.config?.url === webhookUrl && typeof entry.id === "number");
+  return hook ? hook.id as number : null;
 }
 
 /**
- * Links a repository: the service makes the link, gh adds the webhook on GitHub with its secret,
- * and the service records the webhook's id. If GitHub refuses, the link is removed again.
+ * Links a repository: gh checks the account it is signed in as administers the repository, the
+ * service makes the link, gh adds the webhook on GitHub with its secret, and the service records
+ * the webhook's id. A link that didn't finish is picked up again: its webhook, found on GitHub by
+ * its address, gets the new secret instead of a second webhook being added. If GitHub refuses a
+ * new link, the link is removed again.
  */
 export async function linkGitHubRepo(cwdInput: string, repo: string) {
   if (!isRepoName(repo)) throw new PlanbanValidationError("Name the repository as owner/name, for example planban-ai/planban.");
   const { url, boardId } = await onlineBoard(cwdInput);
+  await checkAdmin(repo);
   const created = await onlineRequest<CreatedLink>(url, boardPath(boardId, "/github/links"), { repo });
+  const config = { url: created.webhookUrl, content_type: "json", secret: created.secret, insecure_ssl: "0" };
   let hookId: number;
+  let reused = false;
   try {
-    const hook = JSON.parse(await ghRun(["api", "--method", "POST", `repos/${repo}/hooks`, "--input", "-"], JSON.stringify({
-      name: "web",
-      active: true,
-      events: ["pull_request"],
-      config: { url: created.webhookUrl, content_type: "json", secret: created.secret, insecure_ssl: "0" },
-    }))) as { id?: unknown };
-    if (typeof hook.id !== "number") throw new Error("GitHub didn't say which webhook it added.");
-    hookId = hook.id;
+    const found = created.resumed ? await existingHook(created.repo, created.webhookUrl) : null;
+    if (found !== null) {
+      await ghRun(["api", "--method", "PATCH", `repos/${created.repo}/hooks/${found}`, "--input", "-"], JSON.stringify({ active: true, events: ["pull_request"], config }));
+      hookId = found;
+      reused = true;
+    } else {
+      const hook = JSON.parse(await ghRun(["api", "--method", "POST", `repos/${created.repo}/hooks`, "--input", "-"], JSON.stringify({
+        name: "web", active: true, events: ["pull_request"], config,
+      }))) as { id?: unknown };
+      if (typeof hook.id !== "number") throw new Error("GitHub didn't say which webhook it added.");
+      hookId = hook.id;
+    }
   } catch (error) {
-    await onlineRequest(url, boardPath(boardId, "/github/unlink"), { repo }).catch(() => undefined);
-    throw new PlanbanValidationError(`Not linked: ${ghProblem(error, repo)}.`);
+    // GitHub refused, so nothing was added and the link goes. Otherwise a webhook may have been added
+    // before gh failed: the link stays unfinished, and linking again finds that webhook by its address.
+    if (refusedByGitHub(error)) {
+      await onlineRequest(url, boardPath(boardId, "/github/unlink"), { repo }).catch(() => undefined);
+      throw new PlanbanValidationError(`Not linked: ${ghProblem(error, repo)}.`);
+    }
+    throw new PlanbanValidationError(`Not linked yet: ${ghProblem(error, repo)}. Run planban online github link ${created.repo} again to finish; it won't add a second webhook.`);
   }
-  await onlineRequest(url, boardPath(boardId, `/github/links/${encodeURIComponent(created.linkId)}/hook`), { hookId });
+  try {
+    await onlineRequest(url, boardPath(boardId, `/github/links/${encodeURIComponent(created.linkId)}/hook`), { hookId });
+  } catch {
+    throw new PlanbanValidationError(`The webhook was added on GitHub, but Planban couldn't record it. Run planban online github link ${created.repo} again: it finds that webhook and finishes, without adding another.`);
+  }
+  // GitHub pings a new webhook by itself; an existing one is asked to, so the link can be confirmed.
+  if (reused) await ghRun(["api", "--method", "POST", `repos/${created.repo}/hooks/${hookId}/pings`]).catch(() => undefined);
   return {
     linked: created.repo,
     home: created.home,
-    note: `${created.home ? `Merged pull requests in ${created.repo} are now recorded on this board, and a bare #123 on a card means ${created.repo}#123.` : `Merged pull requests in ${created.repo} are now recorded on this board; name them on cards as ${created.repo}#123.`} GitHub sends a test delivery now; planban online github status shows whether it arrived.`,
+    note: `${created.home ? `Merged pull requests in ${created.repo} are now recorded on this board, and a bare #123 on a card means ${created.repo}#123.` : `Merged pull requests in ${created.repo} are now recorded on this board; name them on cards as ${created.repo}#123.`} GitHub sends a test delivery now, which confirms the link; until it arrives, merges are credited to you rather than to GitHub. planban online github status shows whether it arrived.`,
   };
 }
 
-/** Unlinks a repository: the service forgets the link and its secret, and gh removes the webhook on GitHub. */
+/** Whether GitHub answered with a refusal (or gh couldn't run at all), so nothing was added. */
+const refusedByGitHub = (error: unknown) => (error as NodeJS.ErrnoException)?.code === "ENOENT"
+  || /HTTP 4\d\d/u.test(String((error as { stderr?: unknown })?.stderr ?? ""));
+
+/** Whether gh failed because GitHub no longer has the webhook. */
+const alreadyGone = (error: unknown) => /HTTP 404|Not Found/u.test(String((error as { stderr?: unknown })?.stderr ?? ""));
+
+/**
+ * Unlinks a repository: the service stops accepting its deliveries and forgets the secret at once,
+ * gh removes the webhook on GitHub, and then the service forgets the link. If GitHub can't be
+ * reached, the link stays as "being removed", with its webhook id, so running this again finishes.
+ */
 export async function unlinkGitHubRepo(cwdInput: string, repo: string) {
   if (!isRepoName(repo)) throw new PlanbanValidationError("Name the repository as owner/name, for example planban-ai/planban.");
   const { url, boardId } = await onlineBoard(cwdInput);
@@ -102,10 +157,17 @@ export async function unlinkGitHubRepo(cwdInput: string, repo: string) {
   if (removed.hookId === undefined) return { unlinked: removed.repo, note: "No webhook was recorded for it; if GitHub still has one, remove it under the repository's Settings, Webhooks." };
   try {
     await ghRun(["api", "--method", "DELETE", `repos/${removed.repo}/hooks/${removed.hookId}`]);
-    return { unlinked: removed.repo, note: "Its webhook was removed from GitHub too." };
   } catch (error) {
-    return { unlinked: removed.repo, note: `Planban no longer accepts its deliveries, but its webhook is still on GitHub (${ghProblem(error, removed.repo)}). Remove it under the repository's Settings, Webhooks.` };
+    if (!alreadyGone(error)) {
+      return {
+        unlinked: removed.repo,
+        finished: false,
+        note: `Planban no longer accepts its deliveries, but its webhook is still on GitHub (${ghProblem(error, removed.repo)}). Run planban online github unlink ${removed.repo} again to finish.`,
+      };
+    }
   }
+  await onlineRequest(url, boardPath(boardId, "/github/unlink/done"), { repo: removed.repo });
+  return { unlinked: removed.repo, finished: true, note: "Its webhook was removed from GitHub too." };
 }
 
 /** The repositories linked to this project's Online Board, and the last delivery from each. */
