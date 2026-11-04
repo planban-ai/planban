@@ -207,6 +207,29 @@ function compactBoardSummary(state) {
   return { ...summary, itemCount: roadmapItems.length };
 }
 
+function compactQueryResult(result) {
+  return {
+    query: result.query,
+    items: result.matches.map(({ item }) => item),
+    counts: result.counts,
+    wip: result.wip,
+  };
+}
+
+function leanQueryResult(result) {
+  return {
+    query: result.query,
+    items: result.matches.map(({ item }) => ({
+      id: item.id,
+      title: item.title,
+      status: item.status,
+      nextAction: item.nextAction ? item.nextAction.slice(0, 80) : null,
+    })),
+    counts: result.counts,
+    wip: result.wip,
+  };
+}
+
 const DEFAULT_BOARD_ORIGIN = "http://127.0.0.1:4317";
 const BOARD_URL_PROBE_TIMEOUT_MS = 600;
 
@@ -548,7 +571,7 @@ const tools = [
   {
     name: "planban_query_cards",
     title: "Query Planban Work Items",
-    description: "Search and compose projection, hierarchy, Group-role, status, blocked, and tag filters without changing roadmap state.",
+    description: "Search and compose projection, hierarchy, Group-role, status, blocked, and tag filters without changing roadmap state. Cost policy: always use lean=true for listing or discovery; request the full response only after selecting a card or when all details are explicitly needed.",
     inputSchema: schema.object({
       ...commonBoardProperties,
       search: { type: "string", description: "Search id, title, summary, next action, and tags." },
@@ -559,6 +582,8 @@ const tools = [
       statuses: { type: "array", items: { type: "string", enum: [...PLANBAN_STATUSES] } },
       blocked: { type: "string", enum: ["any", "blocked", "unblocked"] },
       tags: { type: "array", items: { type: "string" } },
+      compact: { type: "boolean", description: "Return only matched Items, counts, and WIP; omit repeated context, visible projection, and ancestry." },
+      lean: { type: "boolean", description: "Return only status, id, title, and nextAction (80 chars) per Item." },
     }),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -852,6 +877,7 @@ async function callToolImpl(name, args) {
     const board = await boardStaleness(state);
     const staleness = Object.fromEntries(result.matches.flatMap((entry) => board.cards[entry.item.id] ? [[entry.item.id, board.cards[entry.item.id]]] : []));
     const staleCount = Object.keys(staleness).length;
+    const payload = args.lean === true ? leanQueryResult(result) : args.compact === true ? compactQueryResult(result) : result;
     return textResult(withLine(
       `Matched ${result.matches.length} Planban Work Items at revision ${state.roadmap.revision}.`,
       staleCount ? `${staleCount} matched Item${staleCount === 1 ? " has" : "s have"} stale signals (see staleness).` : null,
@@ -859,7 +885,7 @@ async function callToolImpl(name, args) {
       cwd: state.cwd,
       repoId: state.manifest.repoId,
       revision: state.roadmap.revision,
-      ...result,
+      ...payload,
       staleness,
     });
   }
