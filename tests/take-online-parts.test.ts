@@ -155,3 +155,18 @@ test("an upload part that fails on the way is sent again, so one dropped request
   await assert.rejects(sendPart(async () => { tries += 1; throw failures[0]; }, undefined, [0, 0]));
   assert.equal(tries, 3);
 });
+
+test("part failures are sorted: network errors and timeouts retry, a stop doesn't, and a stop during the pause ends at once", async () => {
+  const { sendPart, partFailureIsTransient } = await import("../src/core/online/transfers");
+  assert.equal(partFailureIsTransient(new TypeError("fetch failed")), true);
+  assert.equal(partFailureIsTransient(new DOMException("The operation timed out.", "TimeoutError")), true);
+  assert.equal(partFailureIsTransient(new DOMException("This operation was aborted", "AbortError")), false);
+  const stop = new AbortController();
+  let tries = 0;
+  const started = Date.now();
+  const pending = sendPart(async () => { tries += 1; throw Object.assign(new Error("busy"), { statusCode: 503 }); }, stop.signal, [60_000]);
+  setTimeout(() => stop.abort(), 20);
+  await assert.rejects(pending);
+  assert.equal(tries, 1);
+  assert.ok(Date.now() - started < 5_000, "the pause ends when the move is stopped");
+});

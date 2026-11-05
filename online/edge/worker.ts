@@ -128,6 +128,27 @@ function capped(body: ReadableStream<Uint8Array>, limit: number): ReadableStream
   }));
 }
 
+type FixedLengthStreamConstructor = new (length: number) => { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
+
+/**
+ * The body sent upstream, never longer than MAX_BODY_BYTES. A body with a
+ * checked Content-Length goes through the Workers runtime's own
+ * FixedLengthStream, which refuses a body longer or shorter than declared
+ * without running JavaScript per chunk: counting every byte in a
+ * TransformStream cost Worker CPU on each 1 MB upload part, and over a large
+ * board's few hundred parts one request ran over Cloudflare's CPU limit (a bare
+ * 503, 5 November 2026). A body with no declared length, or outside the
+ * Workers runtime, is counted as it streams.
+ */
+export function bounded(body: ReadableStream<Uint8Array>, length: string | null): ReadableStream<Uint8Array> {
+  const Fixed = (globalThis as { FixedLengthStream?: FixedLengthStreamConstructor }).FixedLengthStream;
+  if (length === null || !Fixed) return capped(body, MAX_BODY_BYTES);
+  const fixed = new Fixed(Number(length));
+  // A mismatched length errors the readable side, so the upstream request fails.
+  body.pipeTo(fixed.writable).catch(() => {});
+  return fixed.readable;
+}
+
 /** A redirect may only go to the consent page on this public address. */
 function allowedLocation(location: string, host: string): boolean {
   if (location.startsWith(`${CONSENT_PATH}?`)) return true;
@@ -176,12 +197,7 @@ export default {
       upstream = await fetch(target.href, {
         method: request.method,
         headers,
-        // A body with a checked Content-Length passes straight through: piping
-        // every byte through a JavaScript stream costs Worker CPU, and on a
-        // large board's few hundred 1 MB upload parts that cost ran one request
-        // over Cloudflare's CPU limit (a bare 503). Only a body without a
-        // declared length is counted as it streams.
-        body: hasBody && request.body ? (length !== null ? request.body : capped(request.body, MAX_BODY_BYTES)) : undefined,
+        body: hasBody && request.body ? bounded(request.body, length) : undefined,
         redirect: "manual",
         cache: "no-store",
         signal: request.signal,

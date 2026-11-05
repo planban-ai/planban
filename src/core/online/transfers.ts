@@ -746,7 +746,8 @@ async function uploadBoard(url: string, cwd: string, planningRoot: string, board
       if (received.has(seq)) continue;
       options.signal?.throwIfAborted();
       const partPath = `/api/v1/transfers/${encodeURIComponent(journal.transferId)}/parts`;
-      await sendPart(() => onlineRequest(url, partPath, { seq, ...part }, as), options.signal);
+      // The caller's stop reaches the part in flight, not only the pause between tries.
+      await sendPart(() => onlineRequest(url, partPath, { seq, ...part }, { ...as, ...(options.signal ? { signal: options.signal } : {}) }), options.signal);
       crashPoint("take-online:after-part");
       received.add(seq);
       copying(received.size);
