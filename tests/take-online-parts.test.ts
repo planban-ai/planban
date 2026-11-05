@@ -134,3 +134,24 @@ test("history exports rebuild only the versions that fit: a large board's page h
     JSON.parse = parse;
   }
 });
+
+test("an upload part that fails on the way is sent again, so one dropped request doesn't cancel a large board's move", async () => {
+  const { sendPart, partFailureIsTransient } = await import("../src/core/online/transfers");
+  const { PlanbanValidationError } = await import("../src/core/boardOperations");
+  const failures = [Object.assign(new Error("Online Board request failed (503)."), { statusCode: 503 }), Object.assign(new PlanbanValidationError("This upload part arrived incomplete. Send it again."), { code: "incomplete_body" })];
+  let calls = 0;
+  const result = await sendPart(async () => { if (calls < failures.length) throw failures[calls++]; calls += 1; return "stored"; }, undefined, [0, 0, 0]);
+  assert.equal(result, "stored");
+  assert.equal(calls, 3);
+  // Refusals that a retry can't fix fail at once.
+  for (const error of [new PlanbanValidationError("seq must be a whole number."), Object.assign(new Error("limit"), { statusCode: 429 }), Object.assign(new Error("gone"), { statusCode: 404 })]) {
+    assert.equal(partFailureIsTransient(error), false);
+    let tries = 0;
+    await assert.rejects(sendPart(async () => { tries += 1; throw error; }, undefined, [0, 0, 0]));
+    assert.equal(tries, 1);
+  }
+  // A failure that keeps coming back gives up after the last pause.
+  let tries = 0;
+  await assert.rejects(sendPart(async () => { tries += 1; throw failures[0]; }, undefined, [0, 0]));
+  assert.equal(tries, 3);
+});

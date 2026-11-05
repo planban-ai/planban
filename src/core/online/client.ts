@@ -159,14 +159,14 @@ async function authorizedResponse(urlInput: string, path: string, body: unknown,
       Object.assign(error, { currentRevision: payload.currentRevision ?? payload.error?.currentRevision });
       throw error;
     }
-    if (response.status === 400) throw new PlanbanValidationError(message);
+    if (response.status === 400) throw Object.assign(new PlanbanValidationError(message), { code: payload.error?.code });
     if (response.status === 404) throw new PlanbanNotFoundError(message);
     if (response.status === 401) throw loginRequired(url, "expired", linked?.email);
     if (response.status === 403) throw new PlanbanForbiddenError(message);
     if (response.status === UPDATE_REQUIRED_STATUS) throw new PlanbanUpdateRequiredError(payload.error?.message);
     // A daily limit (owner decision 18): kept as 429 so the board page and agents see a limit, not a failure.
     if (response.status === 429) throw Object.assign(new Error(message), { name: "OnlineLimitError", statusCode: 429 });
-    throw new Error(message);
+    throw Object.assign(new Error(message), { statusCode: response.status });
   }
   return response;
 }

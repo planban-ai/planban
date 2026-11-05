@@ -105,6 +105,9 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
     }
     const transferId = parts[1]!;
     if (parts[2] === "parts" && parts.length === 3) {
+      // A part whose body was cut off on the way in parses as {}: say so,
+      // rather than reporting a misleading part number.
+      if (typeof input.seq !== "number") return json({ error: { code: "incomplete_body", message: "This upload part arrived incomplete. Send it again." } }, 400);
       return json(await ctx.runMutation(internal.transfers.part, {
         connectionId, transferId, seq: Number(input.seq),
         payload: packJson({

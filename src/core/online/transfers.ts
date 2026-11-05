@@ -53,6 +53,42 @@ export type BoardBundle = z.infer<typeof bundleSchema>;
  * version that size travels alone. Exported for the test that keeps it so.
  */
 export const PART_BYTES = 1024 * 1024;
+
+/** Pauses before each retry of an upload part, in milliseconds. Exported for tests. */
+export const PART_RETRY_DELAYS_MS = [1_000, 3_000, 10_000];
+
+/**
+ * True for a part failure worth sending again: a network failure, a server
+ * or front-door error (5xx), or a part the service says arrived incomplete.
+ * Parts are keyed by their number, so sending one twice is safe.
+ */
+export function partFailureIsTransient(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const { statusCode, code } = error as Error & { statusCode?: number; code?: string };
+  if (code === "incomplete_body") return true;
+  if (typeof statusCode === "number") return statusCode >= 500;
+  return error.name === "TypeError" || error.name === "TimeoutError";
+}
+
+/**
+ * One upload part, retried after a short pause on a transient failure, so one
+ * dropped request among hundreds doesn't cancel a large board's whole move.
+ */
+export async function sendPart<T>(send: () => Promise<T>, signal?: AbortSignal, delays: readonly number[] = PART_RETRY_DELAYS_MS): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await send();
+    } catch (error) {
+      if (attempt >= delays.length || !partFailureIsTransient(error) || signal?.aborted) throw error;
+      await new Promise<void>((resolve) => {
+        const stop = () => { clearTimeout(timer); resolve(); };
+        const timer = setTimeout(() => { signal?.removeEventListener("abort", stop); resolve(); }, delays[attempt]);
+        signal?.addEventListener("abort", stop, { once: true });
+      });
+      signal?.throwIfAborted();
+    }
+  }
+}
 const HISTORY_PAGE = 8;
 const DOCS_PAGE = 100;
 
@@ -709,7 +745,8 @@ async function uploadBoard(url: string, cwd: string, planningRoot: string, board
     for (const [seq, part] of parts.entries()) {
       if (received.has(seq)) continue;
       options.signal?.throwIfAborted();
-      await onlineRequest(url, `/api/v1/transfers/${encodeURIComponent(journal.transferId)}/parts`, { seq, ...part }, as);
+      const partPath = `/api/v1/transfers/${encodeURIComponent(journal.transferId)}/parts`;
+      await sendPart(() => onlineRequest(url, partPath, { seq, ...part }, as), options.signal);
       crashPoint("take-online:after-part");
       received.add(seq);
       copying(received.size);

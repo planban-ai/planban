@@ -176,7 +176,12 @@ export default {
       upstream = await fetch(target.href, {
         method: request.method,
         headers,
-        body: hasBody && request.body ? capped(request.body, MAX_BODY_BYTES) : undefined,
+        // A body with a checked Content-Length passes straight through: piping
+        // every byte through a JavaScript stream costs Worker CPU, and on a
+        // large board's few hundred 1 MB upload parts that cost ran one request
+        // over Cloudflare's CPU limit (a bare 503). Only a body without a
+        // declared length is counted as it streams.
+        body: hasBody && request.body ? (length !== null ? request.body : capped(request.body, MAX_BODY_BYTES)) : undefined,
         redirect: "manual",
         cache: "no-store",
         signal: request.signal,

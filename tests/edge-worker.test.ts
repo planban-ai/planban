@@ -160,3 +160,17 @@ test("registrations use their own limiter, and a streamed body past the cap fail
   const { seen } = await through(new Request(`${PUBLIC}/mcp`, { method: "POST", body: big, duplex: "half" } as any));
   await assert.rejects(new Response(seen[0]!.init.body as ReadableStream).arrayBuffer());
 });
+
+test("a body with a checked length passes through untouched; only a body without one is counted as it streams", async () => {
+  // Counting every byte in JavaScript cost Worker CPU on each 1 MB upload part,
+  // and over a large board's few hundred parts one request ran over Cloudflare's
+  // CPU limit (5 November 2026, Revival's Take Online).
+  const sized = new Request(`${PUBLIC}/mcp`, { method: "POST", headers: { "Content-Length": "2" }, body: "{}" });
+  const original = sized.body;
+  const { seen } = await through(sized);
+  assert.equal(seen[0]!.init.body, original);
+  const unsized = new Request(`${PUBLIC}/mcp`, { method: "POST", body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("{}")); c.close(); } }), duplex: "half" } as RequestInit);
+  const { seen: counted } = await through(unsized);
+  assert.ok(counted[0]!.init.body instanceof ReadableStream);
+  assert.notEqual(counted[0]!.init.body, unsized.body);
+});
