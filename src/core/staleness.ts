@@ -3,7 +3,7 @@
 import type { PlanbanHistoryEntry, PlanbanRoadmapItem } from "./types";
 import { planbanCommand } from "./command";
 
-export type StalenessKind = "holds-files" | "merged" | "doc-edited" | "quiet" | "large-doc" | "awaiting-owner" | "group-behind";
+export type StalenessKind = "holds-files" | "merged" | "blocker-done" | "date-passed" | "doc-edited" | "quiet" | "large-doc" | "awaiting-owner" | "group-behind";
 
 export interface StalenessSignal {
   kind: StalenessKind;
@@ -73,13 +73,37 @@ const DOC_WRITE_SLACK_MS = 2_000;
 const ACTIVE_STATUSES = new Set(["in-progress", "up-next"]);
 export const isActiveStatus = (status: string) => ACTIVE_STATUSES.has(status);
 // Order used for the board chip and for sorting attention lists.
-export const STALENESS_KIND_ORDER: StalenessKind[] = ["holds-files", "merged", "doc-edited", "quiet", "group-behind", "large-doc", "awaiting-owner"];
+export const STALENESS_KIND_ORDER: StalenessKind[] = ["holds-files", "merged", "blocker-done", "date-passed", "doc-edited", "quiet", "group-behind", "large-doc", "awaiting-owner"];
 // Kinds an agent can fix by editing the card; awaiting-owner waits on the human instead, and
 // holds-files blocks editing until the card's files are moved out.
-export const STALE_KINDS = new Set<StalenessKind>(["merged", "doc-edited", "quiet", "group-behind", "large-doc"]);
+export const STALE_KINDS = new Set<StalenessKind>(["merged", "blocker-done", "date-passed", "doc-edited", "quiet", "group-behind", "large-doc"]);
 
 // The next step is the owner's when Next action starts with "Owner:", the house-style convention.
 const AWAITING_OWNER = [/^\s*Owner:/u];
+
+const MONTH_NAMES = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+const DAY_MONTH = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${MONTH_NAMES.join("|")}|sept|${MONTH_NAMES.map((month) => month.slice(0, 3)).join("|")})\\b\\.?(?:,?\\s+(\\d{4}))?`, "giu");
+const ISO_DAY = /\b(\d{4})-(\d{2})-(\d{2})\b/gu;
+
+/**
+ * The latest day a next action names that was still to come when the card was last updated and has
+ * now ended, or null. Days written without a year take the year of that update. Days on or before
+ * the update are history ("since 3 October"), not a plan, so they never count.
+ */
+export function passedDate(text: string | null | undefined, updatedAt: number | null, now: number): number | null {
+  if (!text || updatedAt === null) return null;
+  const year = new Date(updatedAt).getUTCFullYear();
+  const days: number[] = [];
+  for (const match of text.matchAll(DAY_MONTH)) {
+    const month = MONTH_NAMES.findIndex((name) => name.startsWith(match[2]!.toLowerCase().slice(0, 3)));
+    const day = Number(match[1]);
+    if (month >= 0 && day >= 1 && day <= 31) days.push(Date.UTC(match[3] ? Number(match[3]) : year, month, day));
+  }
+  for (const match of text.matchAll(ISO_DAY)) days.push(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  const startOfUpdate = Date.UTC(new Date(updatedAt).getUTCFullYear(), new Date(updatedAt).getUTCMonth(), new Date(updatedAt).getUTCDate());
+  const passed = days.filter((day) => Number.isFinite(day) && day > startOfUpdate && day + DAY_MS <= now);
+  return passed.length ? Math.max(...passed) : null;
+}
 
 function time(value: string | null | undefined): number | null {
   if (!value) return null;
@@ -232,6 +256,7 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
     keepMax(latestChildUpdate, item.parentId, at);
   }
 
+  const byId = new Map(input.items.map((item) => [item.id, item]));
   const cards: Record<string, StalenessSignal[]> = {};
   for (const item of input.items) {
     const files = input.cardFiles?.[item.id];
@@ -257,6 +282,18 @@ export function computeStaleness(input: StalenessInput): BoardStaleness {
         const latest = merged[0]!.at;
         signals.push({ kind: "merged", detail: `${names} merged ${shortDate(latest)}`, since: new Date(latest).toISOString() });
       }
+    }
+
+    // Waits on a card that is already finished or set aside.
+    const blocker = item.blockedBy ? byId.get(item.blockedBy) : undefined;
+    if (blocker && (blocker.status === "complete" || blocker.status === "archived")) {
+      signals.push({ kind: "blocker-done", detail: `Blocked by ${blocker.id}, which is ${blocker.status === "complete" ? "Complete" : "Archived"}`, since: blocker.completedAt ?? blocker.updatedAt ?? new Date(input.now).toISOString() });
+    }
+
+    // The next action names a day, written as still to come, that has now passed.
+    const passed = passedDate(item.nextAction, updatedAt, input.now);
+    if (passed !== null) {
+      signals.push({ kind: "date-passed", detail: `Next action names ${shortDate(passed)}, which has passed`, since: new Date(passed + DAY_MS).toISOString() });
     }
 
     // Spec or Plan changed on disk after the last Planban write of that document, and the card has

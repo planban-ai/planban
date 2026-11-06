@@ -80,5 +80,10 @@ Roadmap status protocol for agent work:
 - move a card to Complete only when the user explicitly asks, manually confirms completion after testing/review, or clearly waives user-side verification
 - agent-side tests and verification are enough to update the next action for user review/testing; they are not enough by themselves to self-complete the roadmap item
 - a landing is a card event: whoever merges a PR, pushes to a release branch or retires a branch updates every In Progress Item that names it, before reporting the landing
+- the card is the record, not your own notes: when you relay a worker's result or a person's answer, or a merge, release, deploy or production change happens, update every card it concerns in the same step
+- before starting or handing off work, make sure a card exists; give the worker its card id and ask it to update the card when it finishes
+- when a card waits on a later step someone else takes (a release, a deploy, a review), whoever takes that step updates the card
+- when only the person's confirmation remains, start the next action with "Owner: confirm Complete"
+- when a card waits on another card, set Blocked by rather than saying so in prose; give a dated next action a real day, so Planban can flag it once it has passed
 `;
 }

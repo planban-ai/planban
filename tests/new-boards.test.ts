@@ -140,7 +140,7 @@ test("the board list gives the dashboard people, cards per column, and \"need yo
   const roadmap = createEmptyRoadmap({ repoId: boardId, title: "Shared", now: new Date().toISOString() });
   roadmap.roadmapItems = [
     item("a", "in-progress", "Owner: pick a supplier"), item("b", "in-progress", "Agent: build it"),
-    item("c", "up-next", "  Owner: approve"), item("d", "complete", "Owner: old"), item("g", "pending", "Owner: group", true),
+    item("c", "up-next", "  Owner: approve"), item("d", "complete", "Owner: old"), item("e", "pending", "Owner: later"), item("g", "pending", "Owner: group", true),
   ] as any;
   state.roadmap = packJson(roadmap);
   await ctx.db.insert("people", { userId: "user_alice", name: "Alice", updatedAt: "" });
@@ -149,8 +149,8 @@ test("the board list gives the dashboard people, cards per column, and \"need yo
 
   const [own] = await run(listBoards, ctx, { connectionId: alice });
   assert.equal(own.people, 2);
-  assert.deepEqual(own.cardCounts, { "in-progress": 2, "up-next": 1, complete: 1 });
-  assert.equal(own.needYou, 2, "open cards whose next action starts with Owner:, groups and completed cards left out");
+  assert.deepEqual(own.cardCounts, { "in-progress": 2, "up-next": 1, complete: 1, pending: 1 });
+  assert.equal(own.needYou, 2, "In Progress and Up Next cards whose next action starts with Owner:, as on the board; Pending, groups and completed cards left out");
   assert.equal(own.ownerName, undefined);
   assert.ok(own.lastChangedAt);
 

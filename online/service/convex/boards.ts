@@ -313,7 +313,8 @@ export const listBoards = internalQuery({
       for (const item of roadmap.roadmapItems) {
         if (item.isGroup) continue;
         cardCounts[item.status] = (cardCounts[item.status] ?? 0) + 1;
-        if (item.status !== "complete" && item.status !== "archived" && /^\s*Owner:/.test(item.nextAction ?? "")) needYou += 1;
+        // The same cards the board itself marks "Needs you": active ones (In Progress, Up Next) whose next action is the owner's.
+        if ((item.status === "in-progress" || item.status === "up-next") && /^\s*Owner:/.test(item.nextAction ?? "")) needYou += 1;
       }
       const people = (await ctx.db.query("members").withIndex("by_board", (q) => q.eq("boardId", board.boardId)).take(MAX_LISTED_PEOPLE + 1)).length;
       const owner = board.ownerId === connection.userId ? null

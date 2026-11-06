@@ -493,6 +493,20 @@ Follow this protocol exactly:
 - A landing is a card event: whoever merges a PR, pushes to a release branch or
   retires a branch updates every In Progress Item that names it, before reporting the
   landing.
+- The card is the record, not your own notes. When you relay a worker's result or a
+  person's answer, or a merge, release, deploy or production change happens, update
+  every card it concerns in the same step. A checkpoint, log or Plan doesn't stand in
+  for the card's summary and next action.
+- Before starting or handing off work, make sure a card exists for it. Give the worker
+  the card id and ask it to update that card when it finishes.
+- When a card waits on a later step that someone else takes (a release, a deploy, a
+  person's review), whoever takes that step updates the card.
+- When only the person's confirmation remains, start the next action with
+  "Owner: confirm Complete" so it shows as needing them, rather than leaving it to
+  wait unseen.
+- When a card waits on another card, set Blocked by to that card rather than saying so
+  in prose, so Planban can tell once it is finished. Give a dated next action a real
+  day ("Saturday 7 November"): Planban flags it once that day has passed.
 
 ## Goals
 
@@ -536,6 +550,10 @@ When changing roadmap state:
 - Create a separate plan doc only when the work is complex enough to need one.
 - If a tool result shows stale signals for a card you own or touch, re-read it and fix
   it in the same mutation batch.
+- A "blocked by a finished card" signal means the card it waits on is Complete or
+  Archived: clear Blocked by or say what still holds it up. A "date passed" signal
+  means a day the next action planned for has ended: say what happened and set the
+  next step.
 - A merged-PR signal clears only when the card's summary or next action changes to
   say what the merge means, or the card is completed. Touching the card or editing its
   metadata leaves it in place. A Spec or Plan over 100 KB is flagged too: rewrite it to

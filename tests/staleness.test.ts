@@ -672,3 +672,35 @@ test("the session-start line names stale cards and stays silent otherwise", asyn
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("blocker-done: a card blocked by a card that is Complete or Archived", () => {
+  const blocker = item({ id: "done", status: "complete", completedAt: iso(NOW - 3 * DAY), updatedAt: iso(NOW - 3 * DAY) });
+  const shelved = item({ id: "shelved", status: "archived", updatedAt: iso(NOW - 2 * DAY) });
+  const open = item({ id: "open", status: "pending", updatedAt: iso(NOW - 2 * DAY) });
+  const staleness = computeStaleness({
+    items: [blocker, shelved, open,
+      item({ id: "a", status: "up-next", blockedBy: "done", updatedAt: iso(NOW - DAY) }),
+      item({ id: "b", status: "in-progress", blockedBy: "shelved", updatedAt: iso(NOW - DAY) }),
+      item({ id: "c", status: "up-next", blockedBy: "open", updatedAt: iso(NOW - DAY) })],
+    history: [], docMtimes: [], merges: [], now: NOW,
+  });
+  assert.deepEqual(staleness.cards.a?.map((signal) => [signal.kind, signal.detail]), [["blocker-done", "Blocked by done, which is Complete"]]);
+  assert.equal(staleness.cards.b?.[0]?.detail, "Blocked by shelved, which is Archived");
+  assert.equal(staleness.cards.c, undefined);
+});
+
+test("date-passed: a day the next action planned for has ended; days already past when written don't count", async () => {
+  const { passedDate } = await import("../src/core/staleness");
+  const written = Date.parse("2026-09-20T10:00:00Z");
+  assert.equal(passedDate("Pierce does it on Saturday 24 September.", written, NOW), Date.UTC(2026, 8, 24));
+  assert.equal(passedDate("Review before 2026-09-28, then release.", written, NOW), Date.UTC(2026, 8, 28));
+  assert.equal(passedDate("Since 3 September the copy is live; next, ship on 5 Oct.", written, NOW), null);
+  assert.equal(passedDate("Ship on 1 October.", written, NOW), null, "the day hasn't ended yet");
+  assert.equal(passedDate("No date here.", written, NOW), null);
+  const staleness = computeStaleness({
+    items: [item({ id: "dated", status: "up-next", nextAction: "Owner: sign on 24th Sept 2026.", updatedAt: iso(written) })],
+    history: [], docMtimes: [], merges: [], now: NOW,
+  });
+  assert.deepEqual(staleness.cards.dated?.map((signal) => signal.kind), ["date-passed", "awaiting-owner"]);
+  assert.equal(staleness.cards.dated?.[0]?.detail, "Next action names 24 Sep, which has passed");
+});
