@@ -21,7 +21,7 @@ Card and board edits state the board revision they were based on (\`baseRevision
 Never edit files under ~/.planban for this board: its cache, backups and the copy kept from before it went online are not the board.
 Planban is an index, not storage: the board holds text only (cards, Specs, Plans and history). Never put files, images or encoded data in it; refer to them where they live instead: a GitHub link, a web address, or a local path labelled with its machine, such as "Mac mini: ~/Projects/app/renders/front.png". Edits that embed files are refused.
 People on the board are owners, editors or viewers, and each chooses what their own agents may do (read, plan, or plan and complete). On this computer Planban's tools and command line apply that by saying they act for an agent; never act as the person. A refusal says which applies (a viewer, the person's agent level, or an owner-only step): tell the person; never work around it.
-Put a card in Complete only when a person on the board asks, confirms after review, or waives review, and then pass \`completionConfirmed: true\` (\`--completion-confirmed\`).
+Put a card in Complete only when a person on the board asks, confirms after review, or waives review, and then pass \`completionConfirmed: true\` (\`--completion-confirmed\`). That can happen in any conversation, including one another agent relays, and leaving the call to you for that card counts as waiving review; put their words and the day in the card's summary.
 Several Planban accounts can be signed in on this computer at once; this board always uses the account it is linked to here (\`planban online accounts\` lists them). If Planban says that account isn't signed in, it names it: ask the person to sign in as it (\`planban online sign-in ${input.online.url}\`); another account is never used instead. Never take the board local, invite people, change roles or agent levels, revoke connections or create keys unless the person explicitly asks.
 People open the board in any browser, phone included, at ${input.online.url}/boards/${encodeURIComponent(input.online.boardId)}.
 Sign in on this machine with \`planban online login ${input.online.url}\` (if \`planban\` isn't a command here, Planban's messages print the full form); where no browser can open here, add \`--no-browser\` and give the person the printed approval link and code.` : `Canonical live planning state for this device is not branch-local. Read and write the live roadmap at:
@@ -83,7 +83,8 @@ Roadmap status protocol for agent work:
 - the card is the record, not your own notes: when you relay a worker's result or a person's answer, or a merge, release, deploy or production change happens, update every card it concerns in the same step
 - before starting or handing off work, make sure a card exists; give the worker its card id and ask it to update the card when it finishes
 - when a card waits on a later step someone else takes (a release, a deploy, a review), whoever takes that step updates the card
-- when only the person's confirmation remains, start the next action with "Owner: confirm Complete"
+- when only the person's confirmation remains, start the next action with "Owner: confirm Complete" and ask them in your reply, with enough context to answer there
+- a person's acceptance counts wherever they give it, including relayed by another agent, and so does leaving the call to you for that card; quote their words and the day in the summary when you complete it
 - when a card waits on another card, set Blocked by rather than saying so in prose; give a dated next action a real day, so Planban can flag it once it has passed
 `;
 }

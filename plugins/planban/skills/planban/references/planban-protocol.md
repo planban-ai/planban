@@ -503,7 +503,11 @@ Follow this protocol exactly:
   person's review), whoever takes that step updates the card.
 - When only the person's confirmation remains, start the next action with
   "Owner: confirm Complete" so it shows as needing them, rather than leaving it to
-  wait unseen.
+  wait unseen. Ask them in your reply too, with enough context to answer there.
+- A person's acceptance counts wherever they give it: on the board, in your
+  conversation, or relayed by another agent ("the owner said this looks good").
+  Leaving the call to you for that card ("you decide") counts as waiving review.
+  When you complete the card, quote their words and the day in its summary.
 - When a card waits on another card, set Blocked by to that card rather than saying so
   in prose, so Planban can tell once it is finished. Give a dated next action a real
   day ("Saturday 7 November"): Planban flags it once that day has passed.
