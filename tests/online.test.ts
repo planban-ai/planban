@@ -574,6 +574,24 @@ test("hosted errors retain domain classes, access status and revision details", 
   }
 });
 
+test("take-online reads history entries that list their documents as plain paths", async () => {
+  const state = await storage.loadState(cwd);
+  const indexPath = historyIndexPath(state.planningRoot);
+  const original = await readFile(indexPath, "utf8");
+  try {
+    const index = JSON.parse(original);
+    const entry = index.entries.find((candidate: any) => candidate.affectedDocs.some((doc: any) => doc.cardId === "alpha" && doc.kind === "spec"));
+    entry.affectedDocs = ["items/alpha/spec.md", "notes/unknown.txt"];
+    await writeFile(indexPath, JSON.stringify(index, null, 2) + "\n");
+    const bundle = await buildLocalBundle(cwd);
+    const legacy = bundle.history.find((version) => version.entry.version === entry.version)!;
+    assert.deepEqual(legacy.entry.affectedDocs, [{ cardId: "alpha", kind: "spec", path: "items/alpha/spec.md" }]);
+    assert.ok(bundle.historyDocs!.some((doc) => doc.version === entry.version && doc.cardId === "alpha" && doc.kind === "spec"));
+  } finally {
+    await writeFile(indexPath, original);
+  }
+});
+
 test("take-online sends every retained roadmap and current and historical document body", async () => {
   await storage.writeDoc({ cwd, cardId: "alpha", kind: "spec", markdown: "# Second spec" });
   const before = await storage.loadState(cwd);

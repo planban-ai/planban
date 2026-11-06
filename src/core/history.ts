@@ -131,8 +131,27 @@ async function readHistoryIndex(planningRoot: string): Promise<PlanbanHistoryInd
     version: 1,
     latestVersion: payload.latestVersion ?? 0,
     retention: { ...HISTORY_RETENTION, ...(payload.retention ?? {}) },
-    entries: Array.isArray(payload.entries) ? payload.entries : [],
+    entries: Array.isArray(payload.entries) ? payload.entries.map((entry) => ({ ...entry, affectedDocs: historyDocRefs(entry.affectedDocs) })) : [],
   };
+}
+
+/**
+ * An entry's documents as card id and kind. Some older boards list them as a
+ * plain path such as "items/<card>/spec.md"; those are read as that card's
+ * Spec or Plan, and anything else unrecognisable is left out.
+ */
+function historyDocRefs(docs: unknown): PlanbanHistoryDocRef[] {
+  if (!Array.isArray(docs)) return [];
+  return docs.flatMap((doc): PlanbanHistoryDocRef[] => {
+    if (typeof doc === "string") {
+      const match = /^items\/(.+)\/(spec|plan)\.md$/.exec(doc);
+      return match ? [{ cardId: match[1]!, kind: match[2] as "spec" | "plan", path: doc }] : [];
+    }
+    if (doc && typeof doc === "object" && typeof doc.cardId === "string" && (doc.kind === "spec" || doc.kind === "plan")) {
+      return [{ cardId: doc.cardId, kind: doc.kind, path: typeof doc.path === "string" ? doc.path : null }];
+    }
+    return [];
+  });
 }
 
 async function writeHistoryIndex(planningRoot: string, index: PlanbanHistoryIndex) {
