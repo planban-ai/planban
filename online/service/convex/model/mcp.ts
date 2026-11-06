@@ -54,7 +54,7 @@ const INSTRUCTIONS = [
   "A pasted planban:<board>/<item> token is a Planban reference: <board> is the boardId and <item> is the cardId; any quoted title beside it is display context only.",
   "Pass an idempotencyKey with each edit: a fresh one per edit, and the same one only to resend that unchanged edit after a lost reply, so it is never applied twice. A revised edit, such as one merged after a conflict, gets a new key.",
   "Serialize writes: one mutation at a time per board.",
-  "Complete is person-controlled: put a card in complete (by moving it or creating it complete) only when a person on the board explicitly asks, confirms it after review or testing, or clearly waives review, and set completionConfirmed true.",
+  "Complete is person-controlled: put a card in complete (by moving it or creating it complete) only when a person on the board explicitly asks, confirms it after review or testing, or clearly waives review, and set completionConfirmed true. Their acceptance counts wherever they give it, including relayed by another agent, and leaving the call to you for that card waives review; quote their words and the day in the summary.",
   "A refusal says why: a viewer can't change the board; the person's agents may be limited to read or plan (they can change that in the board's People settings); this connection may reach only some boards; some steps are for the owner's own sign-in. Tell the person instead of working around it.",
   "Deleting cards and taking a board back to Local Mode are not available to agents.",
   `Planban is an index, not storage: boards hold text only (cards, Specs, Plans and history). Never put files, images or encoded data in a card or document. ${HOW_TO_REFER} Edits that embed files are refused.`,
