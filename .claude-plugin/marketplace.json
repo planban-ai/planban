@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "Agent-native Kanban boards for agent-led planning, local by default and online when you share them.",
-    "version": "2.0.0"
+    "version": "2.0.1"
   },
   "plugins": [
     {

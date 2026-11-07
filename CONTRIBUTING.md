@@ -150,6 +150,8 @@ The manual `Release readiness` workflow runs the preflight, both upgrade rehears
 and the full updater rehearsal against an exact commit SHA. Give it the branch or tag
 whose head is that commit as `target_ref`, since the updater rehearsal updates from
 it as people do. Preflight fails if that workflow stops running any of these.
+Start it only after the pull request's own updater rehearsal on that branch has
+finished: they share one group, so whichever starts later cancels the other.
 
 In release notes, write Planban CLI examples as `node "$PLANBAN_ROOT/bin/planban.mjs" <command>`.
 Planban is not published to npm, so users do not have a bare `planban` command on
