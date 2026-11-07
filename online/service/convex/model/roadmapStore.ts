@@ -248,11 +248,14 @@ export async function insertState(ctx: MutationCtx, at: BoardRows, roadmap: Plan
 export async function writeRoadmap(ctx: MutationCtx, at: BoardRows, previous: PlanbanRoadmap, next: PlanbanRoadmap, state?: StateRow) {
   const row = state ?? await stateRow(ctx, at);
   if (row.roadmap) {
+    const was = sizeOf(row.roadmap);
     const packed = packJson(next);
     await ctx.db.patch(row._id, { roadmap: packed });
-    await addStored(ctx, at, sizeOf(packed) - sizeOf(row.roadmap));
+    await addStored(ctx, at, sizeOf(packed) - was);
     return;
   }
+  // Read before anything is patched: a document read earlier may be the same object.
+  const indexWas = sizeOf(row.index!);
   const index = indexOf(row);
   const chunkOf = new Map(index.ids.map((id, position) => [id, index.chunks[position]!]));
   const before = new Map(previous.roadmapItems.map((item) => [item.id, JSON.stringify(stored(item))]));
@@ -317,14 +320,15 @@ export async function writeRoadmap(ctx: MutationCtx, at: BoardRows, previous: Pl
     nextChunk, summary: boardSummary(next),
   });
   await ctx.db.patch(row._id, { index: packed });
-  await addStored(ctx, at, delta + sizeOf(packed) - sizeOf(row.index!));
+  await addStored(ctx, at, delta + sizeOf(packed) - indexWas);
 }
 
 /** Moves a state row stored whole into chunks. Returns false when it already was, or would not read back exactly. */
 export async function splitState(ctx: MutationCtx, row: StateRow): Promise<boolean> {
   if (!row.roadmap) return false;
   const at = { boardId: row.boardId, generation: row.generation };
-  const roadmap = unpackJson<PlanbanRoadmap>(row.roadmap);
+  const whole = row.roadmap;
+  const roadmap = unpackJson<PlanbanRoadmap>(whole);
   // A board left over from a failed earlier attempt has stray chunks: start clean.
   for (const stray of await chunkRows(ctx, at)) await ctx.db.delete(stray._id);
   const { index, bytes } = await insertChunks(ctx, at, roadmap);
@@ -333,10 +337,10 @@ export async function splitState(ctx: MutationCtx, row: StateRow): Promise<boole
   if (JSON.stringify(check) !== JSON.stringify(roadmap)) {
     // Never expected; if it happens the board stays as it was.
     for (const chunk of await chunkRows(ctx, at)) await ctx.db.delete(chunk._id);
-    await ctx.db.patch(row._id, { roadmap: row.roadmap, index: undefined });
+    await ctx.db.patch(row._id, { roadmap: whole, index: undefined });
     return false;
   }
-  await addStored(ctx, at, bytes + sizeOf(index) - sizeOf(row.roadmap), { allowOverLimit: true });
+  await addStored(ctx, at, bytes + sizeOf(index) - sizeOf(whole), { allowOverLimit: true });
   return true;
 }
 

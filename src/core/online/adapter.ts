@@ -5,7 +5,7 @@ import { agentContextPath, defaultPlanbanRoot, manifestPath } from "../paths";
 import { normalizeRoadmap, PlanbanNotFoundError, PlanbanValidationError } from "../boardOperations";
 import { boardAccount, findBoardAccount, recordBoardAccountAs, withIdentity } from "./accounts";
 import { readCredentials } from "./credentials";
-import type { PlanbanProjectManifest, PlanbanResolvedState, PlanbanRoadmap } from "../types";
+import type { PlanbanProjectManifest, PlanbanResolvedState, PlanbanRoadmap, PlanbanRoadmapItem } from "../types";
 import { refreshBackup } from "./backup";
 import { boardPath, onlineRequest } from "./client";
 import { serviceUrl } from "./credentials";
@@ -36,22 +36,49 @@ function withBehindNotice(state: PlanbanResolvedState, storage: OnlineStorage) {
   return state;
 }
 
-export async function loadOnlineState(cwd: string, manifest: PlanbanProjectManifest) {
-  if (manifest.storage?.kind !== "online") throw new Error("Expected an Online Board.");
-  const storage = manifest.storage;
+/** A read of the board's own address, with the account the board is linked to here. */
+async function boardRead<T>(storage: OnlineStorage, suffix = ""): Promise<T> {
   // A board not yet linked here is opened with the default account, pinned, and linked to that same account.
   const linked = await boardAccount(storage.url, storage.boardId);
   const unlinkedDefault = linked ? undefined : (await readCredentials()).services[serviceUrl(storage.url)];
   const pinned = unlinkedDefault ? await withIdentity(storage.url, unlinkedDefault) : undefined;
-  type BoardRead = { roadmap: PlanbanRoadmap; features?: string[] };
-  const { roadmap, features } = await onlineRequest<BoardRead>(storage.url, boardPath(storage.boardId), undefined, pinned ? { credentials: pinned } : {}).catch(async (error: unknown) => {
+  const path = boardPath(storage.boardId, suffix);
+  const read = await onlineRequest<T>(storage.url, path, undefined, pinned ? { credentials: pinned } : {}).catch(async (error: unknown) => {
     // "Not found" for a board not yet linked here may mean another signed-in account is the one.
-    if (error instanceof PlanbanNotFoundError) return findBoardAccount<BoardRead>(storage.url, storage.boardId, boardPath(storage.boardId), error);
+    if (error instanceof PlanbanNotFoundError && error.message !== UNKNOWN_ENDPOINT) return findBoardAccount<T>(storage.url, storage.boardId, path, error);
     throw error;
   });
   if (pinned?.person && !(await boardAccount(storage.url, storage.boardId))) {
     await recordBoardAccountAs(storage.url, storage.boardId, pinned).catch(() => undefined);
   }
+  return read;
+}
+
+/** What a service answers for an address it doesn't have (one older than the address). */
+const UNKNOWN_ENDPOINT = "Unknown endpoint.";
+
+/**
+ * One card of an Online Board, its Groups above it and the board's revision,
+ * read without downloading the whole board. Null from a service too old to
+ * answer that way: read the board instead.
+ */
+export async function loadOnlineCard(manifest: PlanbanProjectManifest, cardId: string) {
+  if (manifest.storage?.kind !== "online") throw new Error("Expected an Online Board.");
+  const storage = manifest.storage;
+  type CardRead = { revision: number; card: PlanbanRoadmapItem; ancestry: PlanbanRoadmapItem[] };
+  const read = await boardRead<CardRead>(storage, `/cards/${encodeURIComponent(cardId)}`).catch((error: unknown) => {
+    if (error instanceof PlanbanNotFoundError && error.message === UNKNOWN_ENDPOINT) return null;
+    throw error;
+  });
+  if (read) void refreshBackup(storage.url, storage.boardId);
+  return read && { revision: read.revision, card: read.card, ancestry: read.ancestry };
+}
+
+export async function loadOnlineState(cwd: string, manifest: PlanbanProjectManifest) {
+  if (manifest.storage?.kind !== "online") throw new Error("Expected an Online Board.");
+  const storage = manifest.storage;
+  type BoardRead = { roadmap: PlanbanRoadmap; features?: string[] };
+  const { roadmap, features } = await boardRead<BoardRead>(storage);
   void refreshBackup(manifest.storage.url, manifest.storage.boardId);
   // Features a newer Planban added to this board, which this one can't show.
   boardFeaturesSeen.set(featuresKey(storage), features ?? []);

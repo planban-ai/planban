@@ -8,6 +8,7 @@ import {
   getStatus,
   initializeProject,
   loadState,
+  loadCard,
   dropChange,
   moveCard,
   unresolvedChanges,
@@ -15,7 +16,6 @@ import {
   readDocSections,
   writeDocSection,
   setCardParent,
-  cardAncestry,
   writeDoc,
   createCard,
   createCards,
@@ -29,6 +29,7 @@ import {
   suggestGoalChange,
 } from "./core/storage";
 import { goalsPageText } from "./core/goals";
+import { PlanbanNotFoundError } from "./core/boardOperations";
 import { PLANBAN_STATUSES, type PlanbanStatus } from "./core/types";
 import { queryWorkItems, workItemQueryFromSearchParams } from "./core/workItemQuery";
 import { friendlyPath } from "./core/indexCheck";
@@ -450,11 +451,12 @@ program
   .option("--cwd <path>", "project directory")
   .option("-o, --output <format>", "output format")
   .action(async (cardId, options) => {
-    const state = await loadState(cwdOption(options.cwd));
-    const card = state.roadmap.roadmapItems.find((item) => item.id === cardId);
-    if (!card) throw new Error(`Card not found: ${cardId}`);
+    // On an online board only this card is downloaded.
+    const { revision, card, ancestry } = await loadCard(cwdOption(options.cwd), cardId).catch((error: unknown) => {
+      throw error instanceof PlanbanNotFoundError && error.message === `Card not found: ${cardId}` ? new Error(error.message) : error;
+    });
     // The board's revision travels with the card, for --base-revision on the next edit.
-    print({ revision: state.roadmap.revision, ...card, ancestry: cardAncestry(state.roadmap, cardId) }, options);
+    print({ revision, ...card, ancestry }, options);
   });
 
 program

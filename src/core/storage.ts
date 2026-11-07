@@ -44,7 +44,7 @@ import type {
 import { PLANBAN_STATUSES } from "./types";
 import { currentVersionInfo } from "./version";
 import { flattenRoadmapForVersion1, hierarchyRecoveryManifest } from "./hierarchyMigration";
-import { loadOnlineState, onlineCacheRoot, onlineOperation, onlineState, refuseOnline } from "./online/adapter";
+import { loadOnlineCard, loadOnlineState, onlineCacheRoot, onlineOperation, onlineState, refuseOnline } from "./online/adapter";
 import { boardPath, onlineRequest } from "./online/client";
 import { cardSubject, changesSince, conflictMessage, lastDocChange, MAX_CONFLICT_DOCUMENT_CHARS, PlanbanEditConflictError, RECONCILE, type ConflictDetails } from "./conflicts";
 import { editSection, sectionList } from "./docSections";
@@ -57,7 +57,7 @@ import { checkIndexCard, checkIndexDocument, checkIndexText, checkIndexValue, MA
 import { appName } from "./agentNames";
 import { addSuggestion, agreedWords, applyAgreedChange, applyGoalEdit, assertGoalsSize, decideSuggestion, emptyGoals, goalsBlock, goalsPage, normalizeGoals, PEOPLE_ONLY, type GoalsFile, type GoalsPage } from "./goals";
 
-import { assertCompletionConfirmed,
+import { assertCompletionConfirmed, cardAncestry,
   assertBaseRevision as assertRoadmapBaseRevision,
   assertCommittable,
   committedRoadmap,
@@ -303,6 +303,20 @@ export async function readManifest(cwd: string): Promise<PlanbanProjectManifest 
   const path = manifestPath(cwd);
   if (!(await pathExists(path))) return null;
   return manifestSchema.parse(await readJson(path));
+}
+
+/**
+ * One card with its Groups above it and the board's revision. On an Online
+ * Board only that card is downloaded, not the whole board.
+ */
+export async function loadCard(cwdInput: string, cardId: string): Promise<{ revision: number; card: PlanbanRoadmapItem; ancestry: PlanbanRoadmapItem[] }> {
+  const online = await onlineManifest(cwdInput);
+  const read = online ? await loadOnlineCard(online, cardId) : null;
+  if (read) return read;
+  const state = await loadState(cwdInput);
+  const card = state.roadmap.roadmapItems.find((item) => item.id === cardId);
+  if (!card) throw new PlanbanNotFoundError(`Card not found: ${cardId}`);
+  return { revision: state.roadmap.revision, card, ancestry: cardAncestry(state.roadmap, cardId) };
 }
 
 export async function loadState(cwdInput: string): Promise<PlanbanResolvedState> {
