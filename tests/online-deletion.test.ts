@@ -155,7 +155,7 @@ test("deleting an account removes everything of theirs, credits their changes el
 
       assert.equal((await friendApi("GET", `/api/v1/boards/${own}`)).status, 404, "Lee's board is gone for Fran too");
       // The leak check reads inside compressed fields: Lee's card text is found there.
-      assert.ok(leftovers(service, "Lee's idea").includes("boardState"));
+      assert.ok(leftovers(service, "Lee's idea").includes("boardCards"));
       assert.deepEqual(leftovers(service, "user_leaving", ["erasures"]), [], "nothing names the account but its deletion record");
       assert.deepEqual(leftovers(service, own, ["operations", "erasures"]), [], "nothing of the board they owned is left");
       assert.deepEqual(leftovers(service, "lee@example.com"), []);

@@ -9,13 +9,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import * as storage from "../src/core/storage";
-import { createEmptyRoadmap } from "../src/core/boardOperations";
+import { createEmptyRoadmap, normalizeColumnPriorities } from "../src/core/boardOperations";
 import type { PlanbanRoadmap } from "../src/core/types";
 import { onlineLogin } from "../src/core/online/login";
 import { resetCopyChecks } from "../src/core/online/copyCheck";
 import { takeOnline } from "../src/core/online/transfers";
 import { CHUNK_BYTES, currentRoadmap, insertState, writeRoadmap } from "../online/service/convex/model/roadmapStore";
-import * as maintenance from "../online/service/convex/maintenance";
+import { internal } from "../online/service/convex/_generated/api";
 import { memoryService } from "./hosted-harness";
 import { serviceBridge } from "./service-bridge";
 import { largeBoardItems, largeRoadmap } from "./large-board";
@@ -75,7 +75,7 @@ test("boards stored whole move into chunks and back, reading the same throughout
   const service = memoryService();
   const board = roadmap();
   // The rollback's switch: new boards are stored whole, as before this change.
-  await (maintenance.joinRoadmaps as any)._handler(service.ctx, {});
+  await service.call(internal.maintenance.joinRoadmaps, {});
   await insertState(service.ctx, at, board);
   const state = rowsOf(service, "boardState")[0];
   assert.ok(state.roadmap && !state.index, "stored whole");
@@ -86,19 +86,19 @@ test("boards stored whole move into chunks and back, reading the same throughout
   assert.ok(rowsOf(service, "boardState")[0].roadmap);
   assert.equal(rowsOf(service, "boardCards").length, 0);
 
-  const split = await (maintenance.splitRoadmaps as any)._handler(service.ctx, {});
+  const split = await service.call(internal.maintenance.splitRoadmaps, {});
   await service.runJobs();
   assert.deepEqual(split, { moved: 1, kept: 0, done: true });
   assert.ok(!rowsOf(service, "boardState")[0].roadmap && rowsOf(service, "boardState")[0].index);
   assert.equal(JSON.stringify(await currentRoadmap(service.ctx, at)), JSON.stringify(edited));
   assert.equal(stored(service), rowsOf(service, "boardCards").reduce((sum, row) => sum + row.cards.byteLength, 0) + rowsOf(service, "boardState")[0].index.byteLength);
   // Running it again changes nothing.
-  assert.deepEqual(await (maintenance.splitRoadmaps as any)._handler(service.ctx, {}), { moved: 0, kept: 0, done: true });
+  assert.deepEqual(await service.call(internal.maintenance.splitRoadmaps, {}), { moved: 0, kept: 0, done: true });
   // And after the split, new boards are stored in chunks again.
   await insertState(service.ctx, { boardId: "another", generation: 2 }, roadmap());
   assert.ok(service.rows.find((row) => row._table === "boardState" && row.boardId === "another").index);
 
-  const joined = await (maintenance.joinRoadmaps as any)._handler(service.ctx, {});
+  const joined = await service.call(internal.maintenance.joinRoadmaps, {});
   await service.runJobs();
   assert.equal(joined.moved, 2);
   assert.equal(rowsOf(service, "boardCards").length, 0);
@@ -110,18 +110,21 @@ let root: string;
 let bridge: Awaited<ReturnType<typeof serviceBridge>>;
 const savedHome = process.env.PLANBAN_HOME;
 
-async function bigOnlineBoard() {
+async function startBridge() {
   root = await mkdtemp(join(tmpdir(), "planban-card-rows-"));
   process.env.PLANBAN_HOME = join(root, "home");
   bridge = await serviceBridge();
   resetCopyChecks();
+}
+
+async function bigOnlineBoard() {
   const cwd = join(root, "project");
   const state = await storage.initializeProject({ cwd, repoId: "revival-sized", title: "Revival sized", updateAgents: false });
   const items = largeBoardItems();
   // A Group with a child, so get-card's ancestry has something to show.
   items[1] = { ...items[1]!, isGroup: true };
   items[2] = { ...items[2]!, parentId: items[1]!.id, boardRank: null, groupRank: 1, status: items[1]!.status };
-  await storage.saveRoadmap(state, { ...state.roadmap, roadmapItems: items });
+  await storage.saveRoadmap(state, { ...state.roadmap, roadmapItems: normalizeColumnPriorities(items) });
   await storage.writeDoc({ cwd, cardId: "card-000", kind: "spec", markdown: "# Spec\n\nText." });
   await onlineLogin(bridge.url, { devUser: "ana" });
   await takeOnline(bridge.url, cwd);
@@ -142,8 +145,9 @@ const readOf = async <T>(run: () => Promise<T>) => {
 };
 
 test("on a Revival-sized board, one card is read and edited without reading the whole board", { timeout: 180_000 }, async () => {
-  const cwd = await bigOnlineBoard();
+  await startBridge();
   try {
+    const cwd = await bigOnlineBoard();
     const full = await readOf(() => storage.loadState(cwd));
     const card = await readOf(() => storage.loadCard(cwd, "card-002"));
     const fromBoard = full.value.roadmap.roadmapItems.find((item) => item.id === "card-002")!;

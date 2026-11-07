@@ -10,7 +10,8 @@ import { internalMutation } from "./_generated/server";
 import { sizeOf } from "./model/limits";
 import { stateBytes } from "./model/roadmapStore";
 
-const TABLES = ["boardState", "boardCards", "docs", "history", "historyPayloads", "historyDocs", "retiredIds"] as const;
+// New tables go last: a measurement under way keeps its place by number.
+const TABLES = ["boardState", "docs", "history", "historyPayloads", "historyDocs", "retiredIds", "boardCards"] as const;
 const BATCH = 100;
 
 export const backfillAll = internalMutation({

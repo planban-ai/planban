@@ -46,7 +46,8 @@ try {
   }
   await refreshBackup(bridge.url, "revival-sized", { force: true });
 
-  const read = await measure("get-card / list-cards / query-cards (one board read)", () => storage.loadState(cwd));
+  const read = await measure("list-cards / query-cards / get-board (whole board read)", () => storage.loadState(cwd));
+  await measure("get-card", () => storage.loadCard(cwd, "card-005"));
   const revision = read.roadmap.revision;
   await measure("read-doc", () => storage.readDoc({ cwd, cardId: "card-000", kind: "spec" }));
   await measure("goals", () => storage.readGoals({ cwd }));

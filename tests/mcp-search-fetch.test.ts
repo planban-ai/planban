@@ -7,9 +7,17 @@ const roadmap: any = {
   revision: 3, project: { id: "deadleg", title: "Deadleg" }, updatedAt: new Date().toISOString(),
   roadmapItems: [{ id: "vest", title: "Choose the vest supplier", status: "in-progress", summary: "Two suppliers left.", nextAction: "Owner: pick one.", tags: [], metadata: {}, isGroup: false, parentId: null, priority: 1 }],
 };
+/** The service's one-card read, answered from a whole board. */
+const cardFrom = (board: any) => async (_boardId: string, cardId: string) => {
+  const card = board.roadmapItems.find((item: any) => item.id === cardId);
+  if (!card) fail("not_found", `Card not found: ${cardId}`);
+  const related = board.roadmapItems.filter((item: any) => item.id === card.blockedBy || (card.isGroup && item.parentId === card.id));
+  return { revision: board.revision, card, ancestry: [], related };
+};
 const service: any = {
   listBoards: async () => [{ boardId: "deadleg", title: "Deadleg" }],
   getBoard: async () => roadmap,
+  getCard: cardFrom(roadmap),
   readDoc: async () => ({ markdown: "## Purpose\nOne supplier for 300 units." }),
   goals: async () => ({ page: { goals: [], context: "", retired: [], suggestions: [], recentlyDismissed: [] }, revision: 3 }),
 };
@@ -59,7 +67,7 @@ test("the hosted tools show every freshness warning they can, and say merges are
       { id: "shipped", title: "Shipped", status: "complete", summary: "Landed in PR 40.", nextAction: null, tags: [], isGroup: false, parentId: null, priority: 1, updatedAt: week },
     ],
   };
-  const hosted: any = { ...service, getBoard: async () => board, unresolved: async () => ({ changes: [] }), working: async () => ({ working: {} }), notePresence: async () => undefined };
+  const hosted: any = { ...service, getBoard: async () => board, getCard: cardFrom(board), unresolved: async () => ({ changes: [] }), working: async () => ({ working: {} }), notePresence: async () => undefined };
   const ask = async (name: string, args: Record<string, unknown>) => {
     const response = await handleMcp(new Request("https://app.planban.example/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) }), hosted, "https://app.planban.example");
     return (await response.json()).result.structuredContent;
