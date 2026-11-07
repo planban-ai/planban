@@ -85,6 +85,7 @@ Roadmap status protocol for agent work:
 - when a card waits on a later step someone else takes (a release, a deploy, a review), whoever takes that step updates the card
 - when only the person's confirmation remains, start the next action with "Owner: confirm Complete" and ask them in your reply, with enough context to answer there
 - a person's acceptance counts wherever they give it, including relayed by another agent, and so does leaving the call to you for that card; quote their words and the day in the summary when you complete it
+- to change the board's goals, ask the person in chat; if they agree, pass their own words with \`agreed\` (\`--agreed\`) to suggest_goal_change and the change is saved at once, with their words and the day; never invent agreement; with no person in the conversation (an unattended run), only suggest
 - when a card waits on another card, set Blocked by rather than saying so in prose; give a dated next action a real day, so Planban can flag it once it has passed
 `;
 }

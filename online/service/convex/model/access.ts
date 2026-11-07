@@ -82,8 +82,8 @@ export interface BoardAccess {
  * its remedy: the person's role, the connection's own scope, or the person's
  * setting for their agents.
  */
-export function refusalFor(access: BoardAccess, need: "plan" | "complete"): string {
-  const doing = need === "plan" ? "change this board" : "mark cards complete on this board";
+export function refusalFor(access: BoardAccess, need: "plan" | "complete", what?: string): string {
+  const doing = what ?? (need === "plan" ? "change this board" : "mark cards complete on this board");
   if (access.role === "viewer") return "You can only view this board, so you and your agents can't change it. Ask its owner to make you an editor.";
   if (RANK[access.connectionLevel] < RANK[need]) {
     return `This connection (an app or access key) was given ${access.connectionLevel === "read" ? "read-only" : "plan-only"} access, so it can't ${doing}. The person can make a new connection with more access from Connections.`;

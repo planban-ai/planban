@@ -527,19 +527,25 @@ judgement, not rules.
   chosen work keeps landing outside the goals, a goal has seen no work for weeks, or
   the person keeps picking differently from your goal-based suggestions (or a goal
   looks out of date), say so briefly in chat, with that evidence, and ask whether the
-  goals still say what they want, offering to suggest a change to them. Ask even if
-  you think the goals are right: their choices may mean the goals have moved. Leave one with
-  `suggest_goal_change` only if they say yes, or if no person is in the conversation
-  (an unattended run). Don't repeat a dismissed suggestion unless something new has
-  happened.
+  goals still say what they want, offering to change them. Ask even if you think
+  the goals are right: their choices may mean the goals have moved.
+- If they agree in chat, save the change with `suggest_goal_change`, passing their
+  own words as `agreed` (`--agreed` on the command line). It is made at once, and
+  the history records it as your change, agreed by them, with their words and the
+  day. Never invent agreement: a change they haven't agreed to is only a suggestion.
+- With no person in the conversation (an unattended run), leave out `agreed`: the
+  change waits on the Goals page for them to accept or dismiss. Don't repeat a
+  dismissed suggestion unless something new has happened.
 - No goals: rank as usual, and don't mention goals. Don't ask for goals unless the
   person is planning priorities.
 
 Board reads (`get_board`, `status`) list the goal statements when there are any;
 `read_goals` returns the whole Goals page, with notes, context, suggestions waiting
-and those dismissed in the last 30 days. Only people change goals. A suggestion made
-with `suggest_goal_change` (after the person agreed, or in an unattended run) waits on
-the Goals page for them to accept or dismiss; tell them it is there.
+and those dismissed in the last 30 days. Only people decide goals. A change saved with
+`agreed` is made straight away; tell the person what changed. If their agents may only
+plan on the board, it is left as a suggestion instead, and the reply says so. A
+suggestion made without `agreed` (in an unattended run) waits on the Goals page for
+them to accept or dismiss; tell them it is there.
 
 ## Updating Roadmap State
 
