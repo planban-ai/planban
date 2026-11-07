@@ -4,7 +4,7 @@
 import { PRESENCE_KEEP_MS } from "./model/presence";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
-import { internalMutation, type MutationCtx } from "./_generated/server";
+import { internalMutation, internalQuery, type MutationCtx } from "./_generated/server";
 import { abortTransfer } from "./model/transfer";
 import { joinState, splitState, WHOLE_ROADMAPS } from "./model/roadmapStore";
 
@@ -76,52 +76,117 @@ export const expireInvites = internalMutation({
 
 /**
  * Moves every board stored as one whole roadmap into per-card chunks
- * (model/roadmapStore.ts), a few boards per step, continuing in the
- * background until done. Safe to run again: a board already moved is left
- * alone, and one that would not read back exactly stays as it was.
+ * (model/roadmapStore.ts), one board per step, continuing in the background
+ * until done. A board that can't be moved (it wouldn't read back exactly, or
+ * a step failed) keeps its whole roadmap, gets the reason recorded on it and
+ * is skipped, so the rest still move. Safe to run again: moved boards are
+ * left alone and skipped ones are tried again.
  * Run once after deploying:  npx convex run maintenance:splitRoadmaps
+ * Then check:                npx convex run maintenance:roadmapStorage
  */
 export const splitRoadmaps = internalMutation({
   args: { cursor: v.optional(v.union(v.string(), v.null())) },
-  handler: async (ctx, { cursor }) => {
-    // New boards are stored in chunks again (a rollback may have asked for whole ones).
-    if (!cursor) await setWholeRoadmaps(ctx, false);
-    const page = await ctx.db.query("boardState").paginate({ numItems: ROADMAP_STEP, cursor: cursor ?? null, maximumBytesRead: ROADMAP_STEP_BYTES });
-    let moved = 0;
-    let kept = 0;
-    for (const row of page.page) {
-      if (!row.roadmap) continue;
-      if (await splitState(ctx, row)) moved += 1;
-      else kept += 1;
-    }
-    if (!page.isDone) await ctx.scheduler.runAfter(0, internal.maintenance.splitRoadmaps, { cursor: page.continueCursor });
-    return { moved, kept, done: page.isDone };
-  },
+  handler: async (ctx, { cursor }) => roadmapStep(ctx, "split", cursor ?? null),
 });
 
 /**
  * The rollback of splitRoadmaps: every board back to one whole roadmap, and
  * new boards made that way, so the code from before can be deployed again
- * once it has finished.  npx convex run maintenance:joinRoadmaps
+ * once roadmapStorage says it has finished with every board stored whole.
+ * npx convex run maintenance:joinRoadmaps
  */
 export const joinRoadmaps = internalMutation({
   args: { cursor: v.optional(v.union(v.string(), v.null())) },
-  handler: async (ctx, { cursor }) => {
-    if (!cursor) await setWholeRoadmaps(ctx, true);
-    const page = await ctx.db.query("boardState").paginate({ numItems: ROADMAP_STEP, cursor: cursor ?? null, maximumBytesRead: ROADMAP_STEP_BYTES });
-    let moved = 0;
-    for (const row of page.page) if (await joinState(ctx, row)) moved += 1;
-    if (!page.isDone) await ctx.scheduler.runAfter(0, internal.maintenance.joinRoadmaps, { cursor: page.continueCursor });
-    return { moved, done: page.isDone };
+  handler: async (ctx, { cursor }) => roadmapStep(ctx, "join", cursor ?? null),
+});
+
+/** Scheduled step of a move: one board, so a step never reads or writes more than about one board's worth. */
+export const roadmapMoveStep = internalMutation({
+  args: { direction: v.union(v.literal("split"), v.literal("join")), boardStateId: v.id("boardState"), cursor: v.union(v.string(), v.null()) },
+  handler: async (ctx, { direction, boardStateId, cursor }) => {
+    const row = await ctx.db.get(boardStateId);
+    let outcome: Awaited<ReturnType<typeof splitState>> | "gone" = "gone";
+    try {
+      if (row) outcome = direction === "split" ? await splitState(ctx, row) : await joinState(ctx, row);
+    } catch (error) {
+      // Convex keeps what this step wrote before the failure. The state row is written last, so the board still
+      // reads as it was; any card rows written for it are cleared by the next attempt.
+      outcome = { kept: `the step failed: ${String(error instanceof Error ? error.message : error).slice(0, 300)}` };
+    }
+    if (row && typeof outcome === "object") await ctx.db.patch(row._id, { moveIssue: outcome.kept });
+    await bump(ctx, direction, outcome === "moved" ? "moved" : typeof outcome === "object" ? "kept" : "unchanged");
+    await roadmapStep(ctx, direction, cursor);
   },
 });
 
-/** How many boards each step moves: each can be several hundred KB to read and write. */
-const ROADMAP_STEP = 4;
-const ROADMAP_STEP_BYTES = 2_000_000;
+async function roadmapStep(ctx: MutationCtx, direction: "split" | "join", cursor: string | null) {
+  if (cursor === null) {
+    // The first step: say which way new boards are stored, and start the progress record afresh.
+    await setCounter(ctx, WHOLE_ROADMAPS, direction === "join" ? 1 : 0);
+    for (const name of ["moved", "kept", "unchanged"] as const) await setCounter(ctx, `${MOVE}.${direction}.${name}`, 0);
+    await setCounter(ctx, `${MOVE}.${direction}.started`, Date.now());
+    await setCounter(ctx, `${MOVE}.${direction}.finished`, 0);
+  }
+  // Only the next row's id: the board itself is read by its own step.
+  const page = cursor === DONE ? null : await ctx.db.query("boardState").paginate({ numItems: 1, cursor, maximumBytesRead: ROADMAP_PAGE_BYTES });
+  const next = page?.page[0];
+  if (next) {
+    await ctx.scheduler.runAfter(0, internal.maintenance.roadmapMoveStep, { direction, boardStateId: next._id, cursor: page!.isDone ? DONE : page!.continueCursor });
+    return { scheduled: true };
+  }
+  await setCounter(ctx, `${MOVE}.${direction}.finished`, Date.now());
+  return { scheduled: false };
+}
 
-async function setWholeRoadmaps(ctx: MutationCtx, whole: boolean) {
-  const flag = await ctx.db.query("counters").withIndex("by_name", (q) => q.eq("name", WHOLE_ROADMAPS)).unique();
-  if (flag) await ctx.db.patch(flag._id, { value: whole ? 1 : 0 });
-  else if (whole) await ctx.db.insert("counters", { name: WHOLE_ROADMAPS, value: 1 });
+/**
+ * Where a move between whole and chunked storage has got to: how many boards
+ * are stored each way, which were left unmoved and why, and whether the last
+ * move has finished. Reads a page of boards at a time; pass back `cursor`
+ * until `isDone` to see them all.  npx convex run maintenance:roadmapStorage
+ */
+export const roadmapStorage = internalQuery({
+  args: { cursor: v.optional(v.union(v.string(), v.null())) },
+  handler: async (ctx, { cursor }) => {
+    const page = await ctx.db.query("boardState").paginate({ numItems: 50, cursor: cursor ?? null, maximumBytesRead: STATUS_PAGE_BYTES });
+    let whole = 0;
+    let chunked = 0;
+    const unmoved: Array<{ boardId: string; generation: number; storedAs: "whole" | "chunked"; reason: string }> = [];
+    for (const row of page.page) {
+      if (row.roadmap) whole += 1;
+      else chunked += 1;
+      if (row.moveIssue) unmoved.push({ boardId: row.boardId, generation: row.generation, storedAs: row.roadmap ? "whole" : "chunked", reason: row.moveIssue });
+    }
+    const runs: Record<string, unknown> = {};
+    for (const direction of ["split", "join"] as const) {
+      const value = async (name: string) => (await ctx.db.query("counters").withIndex("by_name", (q) => q.eq("name", `${MOVE}.${direction}.${name}`)).unique())?.value ?? 0;
+      const started = await value("started");
+      if (!started) continue;
+      const finished = await value("finished");
+      runs[direction] = {
+        startedAt: new Date(started).toISOString(), finished: finished >= started, ...(finished >= started ? { finishedAt: new Date(finished).toISOString() } : {}),
+        moved: await value("moved"), kept: await value("kept"), unchanged: await value("unchanged"),
+      };
+    }
+    const newBoards = (await ctx.db.query("counters").withIndex("by_name", (q) => q.eq("name", WHOLE_ROADMAPS)).unique())?.value === 1 ? "whole" : "chunked";
+    return { whole, chunked, unmoved, newBoards, runs, isDone: page.isDone, continueCursor: page.continueCursor };
+  },
+});
+
+const MOVE = "roadmapMove";
+/** The cursor a step is given when no rows are left after its own: the chain finishes after it. */
+const DONE = "done";
+/** Finding the next row reads at most one board's state; a status page reads at most this. */
+const ROADMAP_PAGE_BYTES = 1_000_000;
+const STATUS_PAGE_BYTES = 4_000_000;
+
+async function bump(ctx: MutationCtx, direction: "split" | "join", name: "moved" | "kept" | "unchanged") {
+  const key = `${MOVE}.${direction}.${name}`;
+  const row = await ctx.db.query("counters").withIndex("by_name", (q) => q.eq("name", key)).unique();
+  await setCounter(ctx, key, (row?.value ?? 0) + 1);
+}
+
+async function setCounter(ctx: MutationCtx, name: string, value: number) {
+  const row = await ctx.db.query("counters").withIndex("by_name", (q) => q.eq("name", name)).unique();
+  if (row) await ctx.db.patch(row._id, { value });
+  else if (value !== 0 || name.startsWith(MOVE)) await ctx.db.insert("counters", { name, value });
 }

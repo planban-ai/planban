@@ -56,15 +56,27 @@ export function boardSummary(roadmap: PlanbanRoadmap): BoardSummary {
   return { cardCounts, needYou };
 }
 
+/**
+ * A position field the card has. One set to undefined counts as absent: the
+ * whole roadmap was stored as JSON, which drops it, so it never read back.
+ */
+function hasPlace(item: Record<string, unknown>, field: string) {
+  return item[field] !== undefined;
+}
+
 /** The card as a chunk stores it: position fields kept in place (so key order survives) but blanked. */
 function stored(item: PlanbanRoadmapItem): Record<string, unknown> {
   const copy: Record<string, unknown> = { ...item };
-  for (const field of PLACES) if (field in copy) copy[field] = null;
+  for (const field of PLACES) {
+    if (hasPlace(copy, field)) copy[field] = null;
+    else delete copy[field];
+  }
   return copy;
 }
 
 function placesOf(item: PlanbanRoadmapItem): unknown[] {
-  return PLACES.map((field) => (field in item ? (item as unknown as Record<string, unknown>)[field] : ABSENT));
+  const fields = item as unknown as Record<string, unknown>;
+  return PLACES.map((field) => (hasPlace(fields, field) ? fields[field] : ABSENT));
 }
 
 function restored(card: Record<string, unknown>, places: unknown[]): PlanbanRoadmapItem {
@@ -197,27 +209,36 @@ function packedIndex(index: RoadmapIndex & { itemsAt?: number }) {
   return packJson(index);
 }
 
-/** The cards written into chunk rows from scratch, and the index for them. Inserts the rows. */
-async function insertChunks(ctx: MutationCtx, at: BoardRows, roadmap: PlanbanRoadmap) {
+/** A roadmap laid out in chunks from scratch, in memory: each chunk's packed cards, and the index. */
+function chunked(roadmap: PlanbanRoadmap) {
   const cards = roadmap.roadmapItems.map((item) => ({ item, card: stored(item) }));
   const chunkOf = new Map<string, number>();
-  let bytes = 0;
-  let chunk = 0;
+  const chunks: ArrayBuffer[] = [];
   for (const run of runs(cards, ({ card }) => rawSize(card))) {
-    const packed = packJson(run.map(({ card }) => card));
-    await ctx.db.insert("boardCards", { ...at, chunk, cards: packed });
-    bytes += sizeOf(packed);
-    for (const { item } of run) chunkOf.set(item.id, chunk);
-    chunk += 1;
+    for (const { item } of run) chunkOf.set(item.id, chunks.length);
+    chunks.push(packJson(run.map(({ card }) => card)));
   }
   const index: RoadmapIndex & { itemsAt: number } = {
     format: 1, meta: metaOf(roadmap), itemsAt: itemsPosition(roadmap),
     ids: roadmap.roadmapItems.map((item) => item.id),
     chunks: roadmap.roadmapItems.map((item) => chunkOf.get(item.id)!),
     places: roadmap.roadmapItems.map(placesOf), parents: roadmap.roadmapItems.map((item) => item.parentId ?? null),
-    nextChunk: chunk, summary: boardSummary(roadmap),
+    nextChunk: chunks.length, summary: boardSummary(roadmap),
   };
-  return { index: packedIndex(index), bytes };
+  return { chunks, index: packedIndex(index), bytes: chunks.reduce((sum, chunk) => sum + sizeOf(chunk), 0) };
+}
+
+/** Reads a chunked layout back in memory, as currentRoadmap would read it from its rows. */
+function fromChunks(layout: ReturnType<typeof chunked>): PlanbanRoadmap {
+  const index = unpackJson<RoadmapIndex & { itemsAt: number }>(layout.index);
+  const cards = new Map(layout.chunks.flatMap((chunk) => unpackJson<Array<Record<string, unknown>>>(chunk)).map((card) => [card.id as string, card]));
+  return assemble(index.meta, index.ids.map((id, position) => restored(cards.get(id)!, index.places[position]!)), index.itemsAt);
+}
+
+/** The cards written into chunk rows from scratch, and the index for them. Inserts the rows. */
+async function insertChunks(ctx: MutationCtx, at: BoardRows, roadmap: PlanbanRoadmap, layout = chunked(roadmap)) {
+  for (const [chunk, cards] of layout.chunks.entries()) await ctx.db.insert("boardCards", { ...at, chunk, cards });
+  return layout;
 }
 
 /** New boards are stored in chunks, unless maintenance:joinRoadmaps asked for the old shape (a rollback under way). */
@@ -257,6 +278,10 @@ export async function writeRoadmap(ctx: MutationCtx, at: BoardRows, previous: Pl
   // Read before anything is patched: a document read earlier may be the same object.
   const indexWas = sizeOf(row.index!);
   const index = indexOf(row);
+  // The chunks to rewrite are worked out from `previous`, so it must be what is stored.
+  if (index.meta.revision !== previous.revision) {
+    throw new Error(`Online Board ${at.boardId} is at revision ${index.meta.revision}, but the change was planned from revision ${previous.revision}.`);
+  }
   const chunkOf = new Map(index.ids.map((id, position) => [id, index.chunks[position]!]));
   const before = new Map(previous.roadmapItems.map((item) => [item.id, JSON.stringify(stored(item))]));
   const dirty = new Set<number>();
@@ -323,41 +348,58 @@ export async function writeRoadmap(ctx: MutationCtx, at: BoardRows, previous: Pl
   await addStored(ctx, at, delta + sizeOf(packed) - indexWas);
 }
 
-/** Moves a state row stored whole into chunks. Returns false when it already was, or would not read back exactly. */
-export async function splitState(ctx: MutationCtx, row: StateRow): Promise<boolean> {
-  if (!row.roadmap) return false;
+/** The largest packed chunk a move will write, well inside Convex's 1 MB per document. */
+const MAX_CHUNK_BYTES = 900 * 1024;
+
+/**
+ * Why a board stored whole can't be moved into chunks as it is, or null when
+ * it can. Worked out in memory, before anything is written.
+ */
+function cannotSplit(roadmap: PlanbanRoadmap, layout: ReturnType<typeof chunked>): string | null {
+  const largest = Math.max(0, ...layout.chunks.map((chunk) => sizeOf(chunk)));
+  if (largest > MAX_CHUNK_BYTES || sizeOf(layout.index) > MAX_CHUNK_BYTES) return `a chunk would be ${Math.ceil(Math.max(largest, sizeOf(layout.index)) / 1024)} KB, over the ${MAX_CHUNK_BYTES / 1024} KB a move writes`;
+  if (JSON.stringify(fromChunks(layout)) !== JSON.stringify(roadmap)) return "the board would not read back exactly from chunks";
+  return null;
+}
+
+/**
+ * Moves a state row stored whole into chunks. Returns "moved", "already" when
+ * it was not stored whole, or the reason it was left as it was. The check is
+ * made before writing; the card rows are written first and the state row last,
+ * so a step that fails part way leaves the board reading its whole roadmap
+ * (and any stray card rows are cleared by the next attempt).
+ */
+export async function splitState(ctx: MutationCtx, row: StateRow): Promise<"moved" | "already" | { kept: string }> {
+  if (!row.roadmap) return "already";
   const at = { boardId: row.boardId, generation: row.generation };
   const whole = row.roadmap;
   const roadmap = unpackJson<PlanbanRoadmap>(whole);
-  // A board left over from a failed earlier attempt has stray chunks: start clean.
+  const layout = chunked(roadmap);
+  const reason = cannotSplit(roadmap, layout);
+  if (reason) return { kept: reason };
   for (const stray of await chunkRows(ctx, at)) await ctx.db.delete(stray._id);
-  const { index, bytes } = await insertChunks(ctx, at, roadmap);
-  await ctx.db.patch(row._id, { index, roadmap: undefined });
-  const check = await currentRoadmap(ctx, at, (await ctx.db.get(row._id))!);
-  if (JSON.stringify(check) !== JSON.stringify(roadmap)) {
-    // Never expected; if it happens the board stays as it was.
-    for (const chunk of await chunkRows(ctx, at)) await ctx.db.delete(chunk._id);
-    await ctx.db.patch(row._id, { roadmap: whole, index: undefined });
-    return false;
-  }
-  await addStored(ctx, at, bytes + sizeOf(index) - sizeOf(whole), { allowOverLimit: true });
-  return true;
+  await insertChunks(ctx, at, roadmap, layout);
+  await ctx.db.patch(row._id, { index: layout.index, roadmap: undefined, moveIssue: undefined });
+  await addStored(ctx, at, layout.bytes + sizeOf(layout.index) - sizeOf(whole), { allowOverLimit: true });
+  return "moved";
 }
 
 /** Moves a chunked state row back to one whole roadmap (the rollback). */
-export async function joinState(ctx: MutationCtx, row: StateRow): Promise<boolean> {
-  if (row.roadmap || !row.index) return false;
+export async function joinState(ctx: MutationCtx, row: StateRow): Promise<"moved" | "already" | { kept: string }> {
+  if (row.roadmap || !row.index) return "already";
   const at = { boardId: row.boardId, generation: row.generation };
   const roadmap = await currentRoadmap(ctx, at, row);
+  const packed = packJson(roadmap);
+  // A board that grew past what one document holds can't go back to one whole roadmap.
+  if (sizeOf(packed) > MAX_CHUNK_BYTES) return { kept: `the whole roadmap would be ${Math.ceil(sizeOf(packed) / 1024)} KB, over the ${MAX_CHUNK_BYTES / 1024} KB one document can safely hold` };
   let bytes = sizeOf(row.index);
   for (const chunk of await chunkRows(ctx, at)) {
     bytes += sizeOf(chunk.cards);
     await ctx.db.delete(chunk._id);
   }
-  const packed = packJson(roadmap);
-  await ctx.db.patch(row._id, { roadmap: packed, index: undefined });
+  await ctx.db.patch(row._id, { roadmap: packed, index: undefined, moveIssue: undefined });
   await addStored(ctx, at, sizeOf(packed) - bytes, { allowOverLimit: true });
-  return true;
+  return "moved";
 }
 
 /** Stored bytes of a state row's roadmap, for measuring a board from scratch (limits:backfillBoard). */

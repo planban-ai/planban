@@ -67,6 +67,8 @@ export default defineSchema({
     generation: v.number(),
     roadmap: v.optional(v.bytes()),
     index: v.optional(v.bytes()),
+    /** Why the last move between whole and chunked storage left this board as it was (maintenance:roadmapStorage lists them). */
+    moveIssue: v.optional(v.string()),
     /** The board's goals (src/core/goals.ts), when it has any. */
     goals: v.optional(v.bytes()),
   }).index("by_board_generation", ["boardId", "generation"]),

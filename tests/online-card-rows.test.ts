@@ -10,6 +10,7 @@ import { join } from "node:path";
 import test from "node:test";
 import * as storage from "../src/core/storage";
 import { createEmptyRoadmap, normalizeColumnPriorities } from "../src/core/boardOperations";
+import { deflateSync, strToU8 } from "fflate";
 import type { PlanbanRoadmap } from "../src/core/types";
 import { onlineLogin } from "../src/core/online/login";
 import { resetCopyChecks } from "../src/core/online/copyCheck";
@@ -86,24 +87,66 @@ test("boards stored whole move into chunks and back, reading the same throughout
   assert.ok(rowsOf(service, "boardState")[0].roadmap);
   assert.equal(rowsOf(service, "boardCards").length, 0);
 
-  const split = await service.call(internal.maintenance.splitRoadmaps, {});
+  await service.call(internal.maintenance.splitRoadmaps, {});
   await service.runJobs();
-  assert.deepEqual(split, { moved: 1, kept: 0, done: true });
+  const afterSplit = await service.call(internal.maintenance.roadmapStorage, {});
+  assert.deepEqual([afterSplit.whole, afterSplit.chunked, afterSplit.unmoved, afterSplit.newBoards, afterSplit.isDone], [0, 1, [], "chunked", true]);
+  assert.deepEqual([afterSplit.runs.split.finished, afterSplit.runs.split.moved, afterSplit.runs.split.kept], [true, 1, 0]);
   assert.ok(!rowsOf(service, "boardState")[0].roadmap && rowsOf(service, "boardState")[0].index);
   assert.equal(JSON.stringify(await currentRoadmap(service.ctx, at)), JSON.stringify(edited));
   assert.equal(stored(service), rowsOf(service, "boardCards").reduce((sum, row) => sum + row.cards.byteLength, 0) + rowsOf(service, "boardState")[0].index.byteLength);
   // Running it again changes nothing.
-  assert.deepEqual(await service.call(internal.maintenance.splitRoadmaps, {}), { moved: 0, kept: 0, done: true });
+  await service.call(internal.maintenance.splitRoadmaps, {});
+  await service.runJobs();
+  const again = (await service.call(internal.maintenance.roadmapStorage, {})).runs.split;
+  assert.deepEqual([again.finished, again.moved, again.unchanged], [true, 0, 1]);
   // And after the split, new boards are stored in chunks again.
   await insertState(service.ctx, { boardId: "another", generation: 2 }, roadmap());
   assert.ok(service.rows.find((row) => row._table === "boardState" && row.boardId === "another").index);
 
-  const joined = await service.call(internal.maintenance.joinRoadmaps, {});
+  await service.call(internal.maintenance.joinRoadmaps, {});
   await service.runJobs();
-  assert.equal(joined.moved, 2);
+  const afterJoin = await service.call(internal.maintenance.roadmapStorage, {});
+  assert.deepEqual([afterJoin.whole, afterJoin.chunked, afterJoin.newBoards, afterJoin.runs.join.finished, afterJoin.runs.join.moved], [2, 0, "whole", true, 2]);
   assert.equal(rowsOf(service, "boardCards").length, 0);
   assert.equal(JSON.stringify(await currentRoadmap(service.ctx, at)), JSON.stringify(edited));
   assert.ok(Math.abs(stored(service) - whole) < 2_000, "the stored size is back to the whole roadmap's");
+});
+
+test("a board that can't be moved is recorded and skipped, and the rest still move", async () => {
+  const service = memoryService();
+  await service.call(internal.maintenance.joinRoadmaps, {});
+  await insertState(service.ctx, { boardId: "first", generation: 1 }, roadmap());
+  await insertState(service.ctx, { boardId: "broken", generation: 2 }, roadmap());
+  await insertState(service.ctx, { boardId: "last", generation: 3 }, roadmap());
+  // Bytes that don't unpack: the step fails on this board.
+  service.rows.find((row) => row._table === "boardState" && row.boardId === "broken").roadmap = new Uint8Array([1, 2, 3]).buffer;
+  await service.call(internal.maintenance.splitRoadmaps, {});
+  await service.runJobs();
+  const status = await service.call(internal.maintenance.roadmapStorage, {});
+  assert.deepEqual([status.whole, status.chunked, status.runs.split.finished, status.runs.split.moved, status.runs.split.kept], [1, 2, true, 2, 1]);
+  assert.equal(status.unmoved.length, 1);
+  assert.deepEqual([status.unmoved[0].boardId, status.unmoved[0].storedAs], ["broken", "whole"]);
+  assert.match(status.unmoved[0].reason, /the step failed/);
+});
+
+test("a write planned from another revision than the one stored is refused", async () => {
+  const service = memoryService();
+  const board = roadmap();
+  await insertState(service.ctx, at, board);
+  const stale = { ...board, revision: board.revision - 1 };
+  await assert.rejects(writeRoadmap(service.ctx, at, stale, { ...board, revision: board.revision + 1 }), /planned from revision/);
+});
+
+test("position fields set to undefined read back as absent, as when the whole roadmap was stored", async () => {
+  const service = memoryService();
+  const board = roadmap();
+  board.roadmapItems[0] = { ...board.roadmapItems[0]!, priority: undefined as never, groupRank: undefined as never };
+  await insertState(service.ctx, at, board);
+  const back = await currentRoadmap(service.ctx, at);
+  // What the whole roadmap stored as JSON gave back: those keys gone.
+  assert.deepEqual(back, JSON.parse(JSON.stringify(board)));
+  assert.equal("priority" in back.roadmapItems[0]!, false);
 });
 
 let root: string;
@@ -154,6 +197,9 @@ test("on a Revival-sized board, one card is read and edited without reading the 
     // What get-card shows is the same as from the whole board.
     assert.deepEqual(card.value, { revision: full.value.roadmap.revision, card: fromBoard, ancestry: storage.cardAncestry(full.value.roadmap, "card-002") });
     assert.equal(JSON.stringify(card.value.card), JSON.stringify(fromBoard), "field order too");
+    // Pinned: a whole-board read costs about what one compressed copy did (chunk overhead aside).
+    const blob = deflateSync(strToU8(JSON.stringify(full.value.roadmap)), { level: 6 }).byteLength;
+    assert.ok(full.read < 1.3 * blob, `board read ${full.read} bytes, one compressed copy ${blob}`);
     // Pinned: a one-card read stays a small fraction of a board read.
     assert.ok(card.read < 25_000, `get-card read ${card.read} bytes`);
     assert.ok(full.read > 8 * card.read, `board read ${full.read} bytes, card ${card.read}`);
@@ -164,9 +210,11 @@ test("on a Revival-sized board, one card is read and edited without reading the 
 
     // An edit writes the card's chunk, not the board.
     const before = bridge.service.meter.written;
-    await storage.updateCard({ cwd, cardId: "card-050", summary: "Edited", baseRevision: full.value.roadmap.revision, actor: "agent" });
+    const edit = await readOf(() => storage.updateCard({ cwd, cardId: "card-050", summary: "Edited", baseRevision: full.value.roadmap.revision, actor: "agent" }));
     const written = bridge.service.meter.written - before;
     assert.ok(written < 40_000, `update-card wrote ${written} bytes`);
+    // Pinned: an edit reads the board once (the planning rules need all of it), never twice.
+    assert.ok(edit.read < 1.4 * blob, `update-card read ${edit.read} bytes, one compressed copy ${blob}`);
 
     // A card that isn't there says so, as before.
     await assert.rejects(storage.loadCard(cwd, "no-such-card"), /Card not found: no-such-card/);
