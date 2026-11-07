@@ -68,8 +68,8 @@ test("people add, reword, reorder, retire and restore goals and set the context;
 
 test("agents can't change goals; they suggest, and the person accepts or dismisses", async () => {
   await revivalGoals();
-  await assert.rejects(storage.editGoals({ cwd, edit: { kind: "add", statement: "Mine" }, actor: "agent" }), /Only people change a board's goals/);
-  await assert.rejects(storage.decideGoalSuggestion({ cwd, suggestionId: "x", decision: "accept", actor: "agent" }), /Only people change a board's goals/);
+  await assert.rejects(storage.editGoals({ cwd, edit: { kind: "add", statement: "Mine" }, actor: "agent" }), /Only people decide a board's goals/);
+  await assert.rejects(storage.decideGoalSuggestion({ cwd, suggestionId: "x", decision: "accept", actor: "agent" }), /Only people decide a board's goals/);
   const suggested = await storage.suggestGoalChange({ cwd, change: { kind: "add", statement: "Win back lapsed clubs", position: 4 }, reason: "Three clubs from last year haven't reordered.", agentName: "Claude" });
   assert.equal(suggested.page.suggestions[0]!.summary, 'add "Win back lapsed clubs" as goal 4');
   assert.equal(suggested.page.suggestions[0]!.by, "Claude");
@@ -84,6 +84,34 @@ test("agents can't change goals; they suggest, and the person accepts or dismiss
   const accepted = await storage.decideGoalSuggestion({ cwd, suggestionId: retire.page.suggestions[0]!.id, decision: "accept" });
   assert.deepEqual(accepted.page.goals.map((goal) => goal.statement), ["Win clubs", "Onboard and deliver without the owner", "Keep clubs for life"]);
   assert.equal(accepted.page.suggestions.length, 0);
+});
+
+test("a change the person agreed in chat is saved straight away, as the agent's, with their words and the day", async () => {
+  await revivalGoals();
+  // Already waiting as a suggestion: saving it with agreement settles that one too.
+  await storage.suggestGoalChange({ cwd, change: { kind: "retire", goal: "4" }, reason: "No work on it for six weeks." });
+  const before = await revision();
+  const saved = await storage.suggestGoalChange({
+    cwd, change: { kind: "retire", goal: "4" }, reason: "No work on it for six weeks.", agentName: "Claude",
+    agreed: "  Yes, retire faster building,\n it's done. ",
+  });
+  assert.deepEqual(saved.page.goals.map((goal) => goal.statement), ["Win clubs", "Onboard and deliver without the owner", "Keep clubs for life"]);
+  assert.equal(saved.page.suggestions.length, 0);
+  assert.equal(saved.revision, before + 1);
+  assert.match(saved.applied!, /^Goals: retired "Faster building" \(Claude, agreed by you in chat on \d{4}-\d{2}-\d{2}: "Yes, retire faster building, it's done\."\)$/);
+  const entry = (await storage.historyPayload(cwd)).entries.find((item) => item.operation === "goals.edit" && item.summary === saved.applied);
+  assert.equal(entry?.actor, "agent");
+  // The part it changed remembers who changed it and on whose word, for later clashes.
+  const stored = JSON.parse(await readFile(join((await storage.loadState(cwd)).planningRoot, "goals.json"), "utf8")) as GoalsFile;
+  assert.deepEqual(stored.changed["goal:g4:state"]!.agreed, { by: "you", words: "Yes, retire faster building, it's done.", on: stored.changed["goal:g4:state"]!.at.slice(0, 10) });
+  // A change once dismissed can still be saved when the person agrees to it in chat.
+  const suggested = await storage.suggestGoalChange({ cwd, change: { kind: "add", statement: "Win back lapsed clubs" }, reason: "Three haven't reordered." });
+  await storage.decideGoalSuggestion({ cwd, suggestionId: suggested.page.suggestions[0]!.id, decision: "dismiss" });
+  const added = await storage.suggestGoalChange({ cwd, change: { kind: "add", statement: "Win back lapsed clubs" }, reason: "They asked again.", agreed: "ok add it" });
+  assert.equal(added.page.goals.at(-1)!.statement, "Win back lapsed clubs");
+  assert.equal(added.page.recentlyDismissed.length, 0);
+  // Agreement is the person's own words; it can't be empty.
+  await assert.rejects(storage.suggestGoalChange({ cwd, change: { kind: "retire", goal: "1" }, reason: "x", agreed: "  " }), /the person's own words/);
 });
 
 test("a dismissed suggestion can come back once 30 days have passed", () => {
@@ -138,10 +166,10 @@ test("online: the same rules on the service, and goals move with the board, into
     await takeOnline(bridge.url, cwd);
     assert.deepEqual(await statements(), ["Win clubs", "Onboard and deliver without the owner", "Keep clubs for life", "Faster building"]);
     await edit({ kind: "reword", goalId: "g4", statement: "Faster building, when apt" });
-    await assert.rejects(storage.editGoals({ cwd, edit: { kind: "add", statement: "Mine" }, actor: "agent" }), /Only people change a board's goals/);
+    await assert.rejects(storage.editGoals({ cwd, edit: { kind: "add", statement: "Mine" }, actor: "agent" }), /Only people decide a board's goals/);
     // An agent going straight to the service is refused too.
     const { onlineRequest, boardPath } = await import("../src/core/online/client");
-    await assert.rejects(onlineRequest(bridge.url, boardPath("revival", "/ops/editGoals"), { edit: { kind: "add", statement: "Mine" }, actor: "agent" }), /Only people change a board's goals/);
+    await assert.rejects(onlineRequest(bridge.url, boardPath("revival", "/ops/editGoals"), { edit: { kind: "add", statement: "Mine" }, actor: "agent" }), /Only people decide a board's goals/);
     const suggested = await storage.suggestGoalChange({ cwd, change: { kind: "reorder", goal: "3", position: 1 }, reason: "Two clubs churned this month.", agentName: "Codex" });
     assert.equal(suggested.page.suggestions[0]!.by, "Ana's agent (Codex)");
     const history = (await storage.historyPayload(cwd)).entries.filter((entry) => entry.operation === "goals.edit");

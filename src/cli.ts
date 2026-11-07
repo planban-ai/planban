@@ -730,22 +730,23 @@ program
 
 program
   .command("suggest-goal-change")
-  .description("leave one suggested change to the goals, with the evidence, for the person to accept or dismiss; ask them in chat first and use this only if they agree, or in an unattended run; only people change goals")
+  .description("change the goals as the person agreed in chat (pass their own words with --agreed), or leave a suggestion for them to accept or dismiss; ask them in chat first; without a person in the conversation (an unattended run), only suggest; never invent agreement")
   .requiredOption("--kind <kind>", "add, reword, reorder or retire")
   .option("--goal <goal>", "reword, reorder, retire: the goal's number or id")
   .option("--statement <text>", "add, reword: the goal in one line")
   .option("--notes <text>", "add, reword: optional notes")
   .option("--position <n>", "add, reorder: where it goes, 1 for the top")
   .requiredOption("--reason <reason>", "why, with evidence the person can check")
+  .option("--agreed <words>", "the person's own words agreeing to this change in chat, quoted exactly: the change is saved at once, with their words and the day")
   .option("--idempotency-key <key>", "reuse only to retry the same suggestion after a lost reply")
   .option("--cwd <path>", "project directory")
   .option("-o, --output <format>", "output format")
   .action(async (options) => {
     const result = await suggestGoalChange({
-      cwd: cwdOption(options.cwd), reason: options.reason, agentName: process.env.PLANBAN_AGENT_NAME, idempotencyKey: options.idempotencyKey,
+      cwd: cwdOption(options.cwd), reason: options.reason, agreed: options.agreed, agentName: process.env.PLANBAN_AGENT_NAME, idempotencyKey: options.idempotencyKey,
       change: { kind: options.kind, goal: options.goal, statement: options.statement, notes: options.notes, position: options.position },
     });
-    print(options.output === "json" ? result : result.notAdded ?? `Suggested to ${result.page.suggestions.at(-1)?.summary}. It waits at the top of the Goals page for the person to accept or dismiss.`, options);
+    print(options.output === "json" ? result : result.applied ? `Saved. ${result.applied}` : [result.notApplied, result.notAdded ?? `Suggested to ${result.page.suggestions.at(-1)?.summary}. It waits at the top of the Goals page for the person to accept or dismiss.`].filter(Boolean).join(" "), options);
   });
 
 program

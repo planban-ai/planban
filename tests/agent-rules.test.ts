@@ -161,3 +161,25 @@ test("an app connection that says it is the person still gets the agent's guidan
     /Never just resend it, and never give up silently/,
   );
 });
+
+test("a goal change the person agreed in chat is saved only by agents allowed to complete; otherwise it waits as a suggestion, and the reply says why", async () => {
+  const ben = await sharedBoard("editor", "plan");
+  await storage.editGoals({ cwd: ben, edit: { kind: "add", statement: "Win clubs" } });
+  const planOnly = await storage.suggestGoalChange({ cwd: ben, change: { kind: "add", statement: "Keep clubs" }, reason: "Two churned.", agentName: "Codex", agreed: "yes add it" });
+  assert.deepEqual(planOnly.page.goals.map((goal) => goal.statement), ["Win clubs"]);
+  assert.equal(planOnly.page.suggestions[0]!.summary, 'add "Keep clubs"');
+  assert.equal(planOnly.applied, undefined);
+  assert.match(planOnly.notApplied!, /Your agents may plan but not complete on this board, so they can't save goal changes, even agreed ones\..* It was left as a suggestion/);
+
+  await bridge.service.ctx.db.patch((await bridge.service.ctx.db.query("members").withIndex("by_board_user", (q: any) => q.eq("boardId", "roadmap").eq("userId", "ben")).unique())._id, { agentLevel: "complete" });
+  const saved = await storage.suggestGoalChange({ cwd: ben, change: { kind: "add", statement: "Keep clubs" }, reason: "Two churned.", agentName: "Codex", agreed: "yes add it" });
+  assert.deepEqual(saved.page.goals.map((goal) => goal.statement), ["Win clubs", "Keep clubs"]);
+  assert.equal(saved.page.suggestions.length, 0);
+  assert.match(saved.applied!, /^Goals: added "Keep clubs" as goal 2 \(Ben's agent \(Codex\), agreed by Ben in chat on \d{4}-\d{2}-\d{2}: "yes add it"\)$/);
+  const entry = (await storage.historyPayload(ben)).entries.find((item) => item.summary === saved.applied);
+  assert.equal(entry?.actor, "agent");
+  // Without agreement, nothing changes about suggesting.
+  const plain = await storage.suggestGoalChange({ cwd: ben, change: { kind: "retire", goal: "1" }, reason: "Done." });
+  assert.equal(plain.page.goals.length, 2);
+  assert.equal(plain.notApplied, undefined);
+});

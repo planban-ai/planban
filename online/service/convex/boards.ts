@@ -28,7 +28,7 @@ import { checkIndexValue, MAX_CARD_BYTES, MAX_DOCUMENT_BYTES } from "../../../sr
 import { appName, touchPresence, workingOn, workingSentence } from "./model/presence";
 import type { Doc } from "./_generated/dataModel";
 import { boardFeatures } from "../../../src/core/clientVersion";
-import { addSuggestion, applyGoalEdit, assertGoalsSize, decideSuggestion, goalsPage, normalizeGoals, PEOPLE_ONLY, type GoalsFile } from "../../../src/core/goals";
+import { addSuggestion, agreedWords, applyAgreedChange, applyGoalEdit, assertGoalsSize, decideSuggestion, goalsPage, normalizeGoals, PEOPLE_ONLY, type GoalsFile } from "../../../src/core/goals";
 import { internalMutation, internalQuery, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { asAgent, boardAccess, liveConnection, reaches, refusalFor, type BoardAccess } from "./model/access";
 import { packed, packJson, packText, unpackJson, unpackText } from "./model/codec";
@@ -810,7 +810,7 @@ export const run = internalMutation({
     let settled: Array<{ row: Doc<"unresolvedChanges">; fieldsLeft: string[] }> = [];
     try {
       if (op === "editGoals" || op === "suggestGoalChange" || op === "decideGoalSuggestion") {
-        outcome = await changeGoals(ctx, access.board, current, op, input, now, attribution);
+        outcome = await changeGoals(ctx, access.board, current, op, input, now, attribution, acting);
       } else if (op === "dropChange") {
         outcome = await dropChange(ctx, access.board, current, input, now, attribution);
       } else if (op === "writeDoc") {
@@ -1063,22 +1063,32 @@ async function keepRefused(ctx: MutationCtx, at: BoardRows, op: string, input: R
 /** Drops an unresolved change, with the reason, into the card's history. */
 /**
  * Goals (owner decisions, 16 October 2026): people change them, from their own
- * sign-in; agents only suggest. Each change is a board revision with a history
- * entry, like any edit, so live updates, clashes and retries work the same.
+ * sign-in; agents suggest, or (6 November 2026) save a change the person agreed
+ * to in chat, with their words, if the person lets their agents complete on the
+ * board, as for completing a card; otherwise it waits as a suggestion. Each
+ * change is a board revision with a history entry, like any edit, so live
+ * updates, clashes and retries work the same.
  */
-async function changeGoals(ctx: MutationCtx, board: Doc<"boards">, current: PlanbanRoadmap, op: string, input: Record<string, unknown>, now: string, attribution: Attribution) {
+async function changeGoals(ctx: MutationCtx, board: Doc<"boards">, current: PlanbanRoadmap, op: string, input: Record<string, unknown>, now: string, attribution: Attribution, acting: BoardAccess) {
   if (op !== "suggestGoalChange" && attribution.actor !== "user") fail("forbidden", PEOPLE_ONLY);
   const at = live(board);
   const file = await goalsOf(ctx, at);
   const agentClient = attribution.actor === "agent" ? appName(typeof input.agentName === "string" ? input.agentName : attribution.clientName) : null;
   const stamp = { revision: current.revision + 1, baseRevision: typeof input.baseRevision === "number" ? input.baseRevision : undefined, by: await personName(ctx, attribution.userId, agentClient), now };
   let planned: { goals: GoalsFile; summary: string; suggestion?: unknown };
+  let applied = false;
+  let notApplied: string | undefined;
+  const agreed = op === "suggestGoalChange" && input.agreed !== undefined && input.agreed !== null ? agreedWords(input.agreed) : undefined;
+  if (agreed && !acting.canComplete) notApplied = `${refusalFor(acting, "complete", "save goal changes, even agreed ones")} It was left as a suggestion on the Goals page for them to accept; tell them.`;
   if (op === "editGoals") planned = applyGoalEdit(file, input.edit, stamp);
   else if (op === "decideGoalSuggestion") planned = decideSuggestion(file, { suggestionId: input.suggestionId, decision: input.decision }, stamp);
-  else {
+  else if (agreed && !notApplied) {
+    planned = applyAgreedChange(file, { change: input.change, agreed, agreedBy: await personName(ctx, attribution.userId, null) }, stamp);
+    applied = true;
+  } else {
     const added = addSuggestion(file, { change: input.change, reason: input.reason }, { ...stamp, id: crypto.randomUUID() });
     // Nothing new to show the person: no revision, no history entry.
-    if (!added.goals) return { committed: current, version: 0, result: { page: goalsPage(file), revision: current.revision, notAdded: added.notAdded } };
+    if (!added.goals) return { committed: current, version: 0, result: { page: goalsPage(file), revision: current.revision, notAdded: added.notAdded, ...(notApplied ? { notApplied } : {}) } };
     planned = added;
   }
   // The same measure as on a computer, so goals that fit online still fit after Take Local.
@@ -1093,7 +1103,7 @@ async function changeGoals(ctx: MutationCtx, board: Doc<"boards">, current: Plan
   await chargeWrite(ctx, attribution.userId, sizeOf(packed));
   await ctx.db.patch(state._id, { goals: packed });
   await addStored(ctx, at, sizeOf(packed) - (state.goals ? sizeOf(state.goals) : 0));
-  return { committed, version, result: { page: goalsPage(planned.goals), revision: committed.revision, ...(planned.suggestion ? { suggestion: planned.suggestion } : {}) } };
+  return { committed, version, result: { page: goalsPage(planned.goals), revision: committed.revision, ...(planned.suggestion ? { suggestion: planned.suggestion } : {}), ...(applied ? { applied: planned.summary } : {}), ...(notApplied ? { notApplied } : {}) } };
 }
 
 async function dropChange(ctx: MutationCtx, board: Doc<"boards">, current: PlanbanRoadmap, input: Record<string, unknown>, now: string, attribution: Attribution) {

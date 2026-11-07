@@ -650,7 +650,7 @@ const tools = [
   {
     name: "planban_suggest_goal_change",
     title: "Suggest a Planban Goals Change",
-    description: "Leave one suggested change to the board's goals, with the evidence, on the Goals page for the person to accept or dismiss. Ask the person in chat first and use this only if they agree, or if no person is in the conversation (an unattended run). Only people change goals; agents can't edit them. A suggestion the person dismissed isn't shown again for 30 days.",
+    description: "Change the board's goals as the person agreed in chat, or leave a suggested change for them to accept or dismiss on the Goals page. Ask the person in chat first. If they agree, pass their own words as agreed: the change is saved at once, with their words and the day (if their agents may complete on the board; otherwise it waits as a suggestion and the reply says so). Never invent agreement. With no person in the conversation (an unattended run), leave out agreed: it only suggests. A suggestion the person dismissed isn't shown again for 30 days.",
     inputSchema: schema.object({
       ...commonBoardProperties,
       kind: { type: "string", enum: ["add", "reword", "reorder", "retire"] },
@@ -659,6 +659,7 @@ const tools = [
       notes: { type: "string", description: "add, reword: optional notes for the goal." },
       position: { type: "number", description: "add, reorder: where it goes, 1 for the top." },
       reason: { type: "string", description: "Why, with evidence the person can check, in a sentence or two." },
+      agreed: { type: "string", description: "Only when the person agreed to this change in chat: their own words, quoted exactly. Leave out otherwise." },
       idempotencyKey: { type: "string", description: "Reuse only to retry the same suggestion after a lost reply." },
     }, ["kind", "reason"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -1048,10 +1049,15 @@ async function callToolImpl(name, args) {
     const cwd = await cwdFromArgs(args);
     const kind = requireString(args.kind, "kind");
     const change = { kind, goal: optionalString(args.goal, "goal"), statement: optionalString(args.statement, "statement"), notes: optionalString(args.notes, "notes"), position: args.position };
-    const result = await suggestGoalChange({ cwd, change, reason: requireString(args.reason, "reason"), agentName: clientAgentName ?? undefined, idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey") });
-    if (result.notAdded) return textResult(result.notAdded, { added: false, note: result.notAdded });
+    const result = await suggestGoalChange({ cwd, change, reason: requireString(args.reason, "reason"), agreed: optionalString(args.agreed, "agreed"), agentName: clientAgentName ?? undefined, idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey") });
+    if (result.applied) return textResult(`Saved. ${result.applied}. Tell the person what changed.`, { added: false, applied: true, summary: result.applied, revision: result.revision });
+    if (result.notAdded) {
+      const note = [result.notApplied, result.notAdded].filter(Boolean).join(" ");
+      return textResult(note, { added: false, note });
+    }
     const shown = result.page.suggestions.at(-1);
-    return textResult(`Suggested to ${shown?.summary ?? "change the goals"}. It waits at the top of the Goals page for the person to accept or dismiss; tell them.`, { added: true, suggestion: shown, revision: result.revision });
+    const note = result.notApplied ?? "It waits at the top of the Goals page for the person to accept or dismiss; tell them.";
+    return textResult(`Suggested to ${shown?.summary ?? "change the goals"}. ${note}`, { added: true, suggestion: shown, revision: result.revision });
   }
 
   if (name === "planban_export_flat_v1") {

@@ -1,7 +1,8 @@
 // A board's goals (owner decisions, 16 October 2026): an ordered list of
 // one-line goals with optional notes, one free-text Context section, and the
-// goals retired from it. People change goals; agents can only suggest a change,
-// which a person accepts or dismisses. Goals are never linked to cards and
+// goals retired from it. People change goals; agents suggest a change, which a
+// person accepts or dismisses, or (owner decision, 6 November 2026) save one the
+// person agreed to in chat, with their words and the day. Goals are never linked to cards and
 // never reorder anything. Shared by boards on a computer and the online
 // service, so it uses no Node-only modules.
 import { PlanbanConflictError, PlanbanNotFoundError, PlanbanValidationError } from "./boardOperations";
@@ -63,8 +64,16 @@ export interface DismissedSuggestion {
   dismissedBy: string;
 }
 
-/** For each part of the goals, the board revision that last changed it and who did. */
-export type GoalFieldChanges = Record<string, { revision: number; by: string; at: string }>;
+/** A person's agreement in chat to an agent's change: who, their own words, and the day. */
+export interface GoalAgreement {
+  by: string;
+  words: string;
+  /** The day, as 2026-11-06. */
+  on: string;
+}
+
+/** For each part of the goals, the board revision that last changed it and who did (and, for an agent's agreed change, on whose word). */
+export type GoalFieldChanges = Record<string, { revision: number; by: string; at: string; agreed?: GoalAgreement | undefined }>;
 
 export interface GoalsFile {
   version: 1;
@@ -139,7 +148,7 @@ export function goalsBlock(file: GoalsFile): string | null {
   return [
     "Goals, most important first:",
     ...file.goals.map((goal, index) => `${index + 1}. ${goal.statement}`),
-    "Read the Goals page for notes and context (planban_read_goals). Only people change goals.",
+    "Read the Goals page for notes and context (planban_read_goals). Change goals only as the person agrees in chat.",
   ].join("\n");
 }
 
@@ -248,6 +257,8 @@ interface Stamp {
   baseRevision?: number | undefined;
   by: string;
   now: string;
+  /** Set when an agent saves a change a person agreed to in chat. */
+  agreed?: GoalAgreement | undefined;
 }
 
 /**
@@ -258,11 +269,11 @@ function guard(file: GoalsFile, field: string, mine: unknown, theirs: unknown, s
   const last = file.changed[field];
   if (stamp.baseRevision === undefined || !last || last.revision <= stamp.baseRevision) return;
   if (JSON.stringify(mine) === JSON.stringify(theirs)) return;
-  throw new PlanbanConflictError(`Not saved: ${what} was changed by ${last.by} since you read it${theirs === undefined ? "" : `. It is now: ${typeof theirs === "string" ? quoted(theirs) : JSON.stringify(theirs)}`}. Look at the Goals page again and decide whether your change is still needed.`);
+  throw new PlanbanConflictError(`Not saved: ${what} was changed by ${last.by}${last.agreed ? `, as ${last.agreed.by} agreed in chat on ${last.agreed.on},` : ""} since you read it${theirs === undefined ? "" : `. It is now: ${typeof theirs === "string" ? quoted(theirs) : JSON.stringify(theirs)}`}. Look at the Goals page again and decide whether your change is still needed.`);
 }
 
 function mark(file: GoalsFile, field: string, stamp: Stamp) {
-  file.changed[field] = { revision: stamp.revision, by: stamp.by, at: stamp.now };
+  file.changed[field] = { revision: stamp.revision, by: stamp.by, at: stamp.now, ...(stamp.agreed ? { agreed: stamp.agreed } : {}) };
 }
 
 const clone = (file: GoalsFile): GoalsFile => JSON.parse(JSON.stringify(file)) as GoalsFile;
@@ -383,6 +394,33 @@ export function addSuggestion(fileInput: GoalsFile, input: { change: unknown; re
   return { goals: file, summary: `Goals: ${stamp.by} suggested to ${summary}`, suggestion: shown };
 }
 
+/** The person's own words of agreement, tidied to one line; never empty. */
+export function agreedWords(value: unknown): string {
+  const words = text(value).replace(/\s+/g, " ").trim();
+  if (!words) throw new PlanbanValidationError("agreed is the person's own words agreeing to this change, as they said them in chat. Without their agreement, leave it out and the change waits as a suggestion.");
+  if (words.length > MAX_REASON_CHARS) throw new PlanbanValidationError(`Keep the person's words to ${MAX_REASON_CHARS} characters: quote the part where they agree.`);
+  checkIndexText(words, "The person's words", MAX_REASON_CHARS * 4);
+  return words;
+}
+
+/**
+ * An agent saves a change the person agreed to in chat (owner decision, 6
+ * November 2026): made straight away, as the agent's, with the person's words
+ * and the day in the history and on the parts it changed. The same change
+ * waiting as a suggestion, or dismissed, is settled by it.
+ */
+export function applyAgreedChange(fileInput: GoalsFile, input: { change: unknown; agreed: unknown; agreedBy: string }, stamp: Stamp): { goals: GoalsFile; summary: string } {
+  const file = clone(fileInput);
+  dropExpired(file, stamp.now);
+  const change = parseGoalChange(file, input.change, true);
+  const agreed: GoalAgreement = { by: input.agreedBy, words: agreedWords(input.agreed), on: stamp.now.slice(0, 10) };
+  const fingerprint = changeFingerprint(change);
+  file.suggestions = file.suggestions.filter((entry) => entry.fingerprint !== fingerprint);
+  file.dismissed = file.dismissed.filter((entry) => entry.fingerprint !== fingerprint);
+  const applied = applyChange(file, change, { ...stamp, agreed });
+  return { goals: applied.goals, summary: `${applied.summary} (${stamp.by}, agreed by ${agreed.by} in chat on ${agreed.on}: ${quoted(agreed.words)})` };
+}
+
 /** A person accepts (the change is made, as theirs) or dismisses (remembered for 30 days) a suggestion. */
 export function decideSuggestion(fileInput: GoalsFile, input: { suggestionId: unknown; decision: unknown }, stamp: Stamp): { goals: GoalsFile; summary: string } {
   const file = clone(fileInput);
@@ -402,15 +440,15 @@ export function decideSuggestion(fileInput: GoalsFile, input: { suggestionId: un
   return { goals: applied.goals, summary: `${applied.summary} (${suggestion.by}'s suggestion, accepted)` };
 }
 
-/** Only people change goals, by every route; agents suggest. */
-export const PEOPLE_ONLY = "Only people change a board's goals. An agent asks the person in chat first, and with their agreement (or in an unattended run, with no person in the conversation) can suggest a change, with a reason, for them to accept or dismiss: planban_suggest_goal_change.";
+/** Only people decide goals, by every route; agents suggest, or save what the person agreed to in chat. */
+export const PEOPLE_ONLY = "Only people decide a board's goals; agents can't edit them directly. An agent asks the person in chat first. If they agree, it passes their own words as agreed to planban_suggest_goal_change and the change is saved at once (if their agents may complete on the board; otherwise it waits as a suggestion). In an unattended run, with no person in the conversation, it only suggests, with a reason, for them to accept or dismiss. Never invent agreement.";
 
 /**
  * The Planban protocol's Goals section, shortened (owner decisions, 16 October
  * 2026): the remote server's instructions, and the end of the Goals page as
  * agents read it, where they look when weighing goals.
  */
-export const GOALS_GUIDANCE = "Goals: a board may have goals, most important first (planban_get_board lists them; planban_read_goals adds notes and context). Treat them as judgement, not rules. When recommending or ranking work, prefer what serves the goals and name the goal in a few words; urgency, blockers, size and what the person asked can outweigh goal order. Work outside the goals is fine: never refuse, delay or argue against it because no goal covers it, and don't tag cards by goal. Do what the person asked. When asked what's next or to review priorities, glance at recent history: if chosen work keeps landing outside the goals, a goal has seen no work for weeks, the person keeps choosing differently from your goal-based suggestions, or a goal looks out of date, say so briefly in chat with that evidence and ask whether the goals still say what they want, offering to suggest a change (ask even if you think the goals are right); leave one (planban_suggest_goal_change) only if they agree, or if no person is in the conversation (an unattended run). Don't repeat a dismissed one unless something new has happened. Only people change goals. No goals: rank as usual without mentioning goals, and don't ask for them unless the person is planning priorities.";
+export const GOALS_GUIDANCE = "Goals: a board may have goals, most important first (planban_get_board lists them; planban_read_goals adds notes and context). Treat them as judgement, not rules. When recommending or ranking work, prefer what serves the goals and name the goal in a few words; urgency, blockers, size and what the person asked can outweigh goal order. Work outside the goals is fine: never refuse, delay or argue against it because no goal covers it, and don't tag cards by goal. Do what the person asked. When asked what's next or to review priorities, glance at recent history: if chosen work keeps landing outside the goals, a goal has seen no work for weeks, the person keeps choosing differently from your goal-based suggestions, or a goal looks out of date, say so briefly in chat with that evidence and ask whether the goals still say what they want, offering to change them (ask even if you think the goals are right). If they agree, save it with planban_suggest_goal_change, passing their own words as agreed: it is made at once, with their words and the day. With no person in the conversation (an unattended run), leave a suggestion without agreed for them to accept or dismiss. Never invent agreement. Don't repeat a dismissed one unless something new has happened. No goals: rank as usual without mentioning goals, and don't ask for them unless the person is planning priorities.";
 
 /** The whole Goals page as text, for agents (both MCP servers and the command line). */
 export function goalsPageText(page: GoalsPage): string {

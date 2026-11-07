@@ -55,7 +55,7 @@ import type { PlanbanHistoryPayload } from "./types";
 import { assertCardsHoldNoFiles, cardFolder, cardsHoldingFiles, PlanbanCardHoldsFilesError } from "./cardFiles";
 import { checkIndexCard, checkIndexDocument, checkIndexText, checkIndexValue, MAX_DETAILS_BYTES } from "./contentRules";
 import { appName } from "./agentNames";
-import { addSuggestion, applyGoalEdit, assertGoalsSize, decideSuggestion, emptyGoals, goalsBlock, goalsPage, normalizeGoals, PEOPLE_ONLY, type GoalsFile, type GoalsPage } from "./goals";
+import { addSuggestion, agreedWords, applyAgreedChange, applyGoalEdit, assertGoalsSize, decideSuggestion, emptyGoals, goalsBlock, goalsPage, normalizeGoals, PEOPLE_ONLY, type GoalsFile, type GoalsPage } from "./goals";
 
 import { assertCompletionConfirmed,
   assertBaseRevision as assertRoadmapBaseRevision,
@@ -1375,6 +1375,10 @@ export interface GoalsResult {
   /** Set when a suggestion wasn't added: why. */
   notAdded?: string | undefined;
   suggestion?: Record<string, unknown> | undefined;
+  /** Set when an agreed change was saved: its history summary. */
+  applied?: string | undefined;
+  /** Set when an agreed change was left as a suggestion instead: why. */
+  notApplied?: string | undefined;
 }
 
 /** The board's whole Goals page: goals with notes, context, retired goals and suggestions. */
@@ -1398,7 +1402,7 @@ async function changeLocalGoals(
   cwd: string,
   actor: PlanbanHistoryActor,
   request: { op: string; input: unknown; idempotencyKey?: string | undefined },
-  plan: (file: GoalsFile, stamp: { revision: number; now: string }) => { goals: GoalsFile | null; summary?: string; notAdded?: string; suggestion?: Record<string, unknown> },
+  plan: (file: GoalsFile, stamp: { revision: number; now: string }) => { goals: GoalsFile | null; summary?: string; notAdded?: string; suggestion?: Record<string, unknown>; applied?: boolean },
 ): Promise<GoalsResult> {
   const { planningRoot } = await loadState(cwd);
   // A retry with the same key after a lost reply returns the first answer and changes nothing again.
@@ -1420,7 +1424,7 @@ async function changeLocalGoals(
         throw error;
       }
       await rename(nextGoalsPath(state.planningRoot), goalsPath(state.planningRoot));
-      return { page: goalsPage(planned.goals), revision: roadmap.revision, ...(planned.suggestion ? { suggestion: planned.suggestion } : {}) } as GoalsResult;
+      return { page: goalsPage(planned.goals), revision: roadmap.revision, ...(planned.suggestion ? { suggestion: planned.suggestion } : {}), ...(planned.applied ? { applied: planned.summary } : {}) } as GoalsResult;
     }),
   });
   return value;
@@ -1444,12 +1448,19 @@ export async function decideGoalSuggestion(input: { cwd: string; suggestionId: s
     (file, stamp) => decideSuggestion(file, input, { ...stamp, baseRevision: input.baseRevision, by: "you" })).catch(againIfMoved(() => decideGoalSuggestion(input)));
 }
 
-/** An agent suggests one change to the goals, with its reason, for the person to accept or dismiss. */
-export async function suggestGoalChange(input: { cwd: string; change: unknown; reason: string; agentName?: string | undefined; idempotencyKey?: string | undefined }): Promise<GoalsResult> {
+/**
+ * An agent suggests one change to the goals, with its reason, for the person to accept or dismiss.
+ * With `agreed`, the person's own words agreeing to it in chat, the change is saved at once
+ * (owner decision, 6 November 2026). A board on this computer has no limit on its agents, so
+ * here it always is; online, only agents the person lets complete may.
+ */
+export async function suggestGoalChange(input: { cwd: string; change: unknown; reason: string; agreed?: string | undefined; agentName?: string | undefined; idempotencyKey?: string | undefined }): Promise<GoalsResult> {
   const online = await onlineManifest(input.cwd);
   if (online) return (await onlineOperation<GoalsResult>(resolveProjectCwd(input.cwd), online, "suggestGoalChange", { ...input, actor: "agent" } as typeof input)).result;
   const by = appName(input.agentName);
-  return changeLocalGoals(input.cwd, "agent", { op: "suggest", input: { change: input.change, reason: input.reason }, idempotencyKey: input.idempotencyKey }, (file, stamp) => {
+  const agreed = input.agreed === undefined ? undefined : agreedWords(input.agreed);
+  return changeLocalGoals(input.cwd, "agent", { op: agreed ? "agreed" : "suggest", input: { change: input.change, reason: input.reason, ...(agreed ? { agreed } : {}) }, idempotencyKey: input.idempotencyKey }, (file, stamp) => {
+    if (agreed) return { ...applyAgreedChange(file, { change: input.change, agreed, agreedBy: "you" }, { ...stamp, by }), applied: true };
     const added = addSuggestion(file, input, { ...stamp, by, id: randomUUID() });
     return added.goals ? added : { goals: null, notAdded: added.notAdded };
   }).catch(againIfMoved(() => suggestGoalChange(input)));

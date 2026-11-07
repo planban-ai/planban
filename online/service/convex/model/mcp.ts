@@ -152,7 +152,7 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "planban_suggest_goal_change",
     title: "Suggest a Planban Goals Change",
-    description: "Leave one suggested change to the board's goals, with the evidence, on the Goals page for a person to accept or dismiss. Ask the person in chat first and use this only if they agree, or if no person is in the conversation (an unattended run). Only people change goals; agents can't edit them. A dismissed suggestion isn't shown again for 30 days.",
+    description: "Change the board's goals as the person agreed in chat, or leave a suggested change for them to accept or dismiss on the Goals page. Ask the person in chat first. If they agree, pass their own words as agreed: the change is saved at once, with their words and the day (if their agents may complete on the board; otherwise it waits as a suggestion and the reply says so). Never invent agreement. With no person in the conversation (an unattended run), leave out agreed: it only suggests. A suggestion the person dismissed isn't shown again for 30 days.",
     inputSchema: object({
       boardId,
       kind: { type: "string", enum: ["add", "reword", "reorder", "retire"] },
@@ -161,6 +161,7 @@ export const TOOLS: ToolDefinition[] = [
       notes: { type: "string", description: "add, reword: optional notes for the goal." },
       position: { type: "number", description: "add, reorder: where it goes, 1 for the top." },
       reason: { type: "string", description: "Why, with evidence the person can check, in a sentence or two." },
+      agreed: { type: "string", description: "Only when the person agreed to this change in chat: their own words, quoted exactly. Leave out otherwise." },
       idempotencyKey,
     }, ["boardId", "kind", "reason"]),
     annotations: write,
@@ -488,10 +489,11 @@ async function callTool(service: McpService, origin: string, name: string, args:
       const boardIdArg = stringArg(args, "boardId");
       const key = typeof args.idempotencyKey === "string" ? args.idempotencyKey : undefined;
       const change = { kind: args.kind, goal: args.goal, statement: args.statement, notes: args.notes, position: args.position };
-      const outcome = await service.run(boardIdArg, "suggestGoalChange", { change, reason: args.reason, actor: "agent" }, false, key);
-      const result = outcome.result as { notAdded?: string; page: GoalsPage };
-      if (result.notAdded) return { added: false, note: result.notAdded };
-      return { added: true, suggestion: result.page.suggestions.at(-1), note: "It waits at the top of the Goals page for a person to accept or dismiss; tell them.", ...handoff(origin, boardIdArg) };
+      const outcome = await service.run(boardIdArg, "suggestGoalChange", { change, reason: args.reason, ...(args.agreed !== undefined ? { agreed: args.agreed } : {}), actor: "agent" }, false, key);
+      const result = outcome.result as { notAdded?: string; applied?: string; notApplied?: string; page: GoalsPage };
+      if (result.applied) return { added: false, applied: true, summary: result.applied, note: "Saved. Tell the person what changed.", ...handoff(origin, boardIdArg) };
+      if (result.notAdded) return { added: false, note: [result.notApplied, result.notAdded].filter(Boolean).join(" ") };
+      return { added: true, suggestion: result.page.suggestions.at(-1), note: result.notApplied ?? "It waits at the top of the Goals page for a person to accept or dismiss; tell them.", ...handoff(origin, boardIdArg) };
     }
     case "planban_query_cards": {
       const { boardId: _id, ...query } = args;
