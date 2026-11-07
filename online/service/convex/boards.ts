@@ -37,6 +37,7 @@ import { checkCards, checkDocuments } from "./model/indexRules";
 import { addStored, chargeWrite, sizeOf } from "./model/limits";
 import { historyEntries, historyPage, recordHistory, roadmapAtVersion, type Attribution, type BoardRows } from "./model/history";
 import { DOC_KINDS, currentRoadmap, docPayload, docRow, live, retiredIds, stateRow, type DocKind } from "./model/rows";
+import { someCards, storedSummary, writeRoadmap } from "./model/roadmapStore";
 import { reserveRetiredId } from "./model/retired";
 
 export const BOARD_OPERATIONS = [
@@ -77,10 +78,8 @@ async function commit(ctx: MutationCtx, board: Doc<"boards">, previous: PlanbanR
   const written = committed.roadmapItems.reduce((sum, item) => sum + (before.get(item.id) === JSON.stringify(item) ? 0 : sizeOf(item)), 0)
     + change.docWrites.reduce((sum, doc) => sum + sizeOf(doc.markdown), 0);
   await chargeWrite(ctx, attribution.userId, written);
-  const state = await stateRow(ctx, at);
-  const packedRoadmap = packJson(committed);
-  await ctx.db.patch(state._id, { roadmap: packedRoadmap });
-  await addStored(ctx, at, sizeOf(packedRoadmap) - sizeOf(state.roadmap));
+  // Only the cards that changed are written again (model/roadmapStore.ts).
+  await writeRoadmap(ctx, at, previous, committed);
   const remaining = new Set(committed.roadmapItems.map((item) => item.id));
   for (const item of previous.roadmapItems) {
     if (remaining.has(item.id)) continue;
@@ -307,15 +306,8 @@ export const listBoards = internalQuery({
       // The dashboard's summary of each online board (Planban 2.0 plan): people,
       // cards per column, the owner's name on shared boards, and, for the owner
       // only, how many cards wait on them.
-      const roadmap = await currentRoadmap(ctx, { boardId: board.boardId, generation: board.generation });
-      const cardCounts: Record<string, number> = {};
-      let needYou = 0;
-      for (const item of roadmap.roadmapItems) {
-        if (item.isGroup) continue;
-        cardCounts[item.status] = (cardCounts[item.status] ?? 0) + 1;
-        // The same cards the board itself marks "Needs you": active ones (In Progress, Up Next) whose next action is the owner's.
-        if ((item.status === "in-progress" || item.status === "up-next") && /^\s*Owner:/.test(item.nextAction ?? "")) needYou += 1;
-      }
+      // Kept with the board's index, so the list reads no cards.
+      const { cardCounts, needYou } = await storedSummary(ctx, { boardId: board.boardId, generation: board.generation });
       const people = (await ctx.db.query("members").withIndex("by_board", (q) => q.eq("boardId", board.boardId)).take(MAX_LISTED_PEOPLE + 1)).length;
       const owner = board.ownerId === connection.userId ? null
         : await ctx.db.query("people").withIndex("by_userId", (q) => q.eq("userId", board.ownerId)).unique();
@@ -364,8 +356,36 @@ export const getBoard = internalQuery({
     if (since !== undefined && since === board.revision) return { unchanged: true as const, revision: board.revision, authority: board.authority };
     // The role lets the web page show a viewer a board they can read but not change. The
     // features let a computer's older Planban say it can't show everything (16 October 2026).
-    const goals = await goalsOf(ctx, live(board));
-    return { roadmap: await currentRoadmap(ctx, live(board)), authority: board.authority, role, features: boardFeatures({ hasGoals: hasGoalsContent(goals) }) };
+    const state = await stateRow(ctx, live(board));
+    const goals = goalsIn(state);
+    return { roadmap: await currentRoadmap(ctx, live(board), state), authority: board.authority, role, features: boardFeatures({ hasGoals: hasGoalsContent(goals) }) };
+  })()),
+});
+
+/**
+ * One card, read without loading the board: the card, its Groups above it,
+ * and the cards its freshness depends on (its blocker, and a Group's
+ * children), with the board's revision for the next edit.
+ */
+export const getCard = internalQuery({
+  args: { connectionId: v.id("connections"), boardId: v.string(), cardId: v.string() },
+  handler: async (ctx, { connectionId, boardId, cardId }) => packed(await (async () => {
+    const { board } = await readableBoard(ctx, connectionId, boardId);
+    const cards = await someCards(ctx, live(board));
+    const card = await cards.card(cardId);
+    if (!card) fail("not_found", `Card not found: ${cardId}`);
+    const ancestry = [];
+    for (let parentId = card!.parentId; parentId;) {
+      const parent = await cards.card(parentId);
+      if (!parent) fail("validation", `Parent not found: ${parentId}`);
+      ancestry.unshift(parent!);
+      parentId = parent!.parentId;
+    }
+    const related = [];
+    const blocker = card!.blockedBy ? await cards.card(card!.blockedBy) : null;
+    if (blocker) related.push(blocker);
+    if (card!.isGroup) for (const id of cards.childIds(cardId)) related.push((await cards.card(id))!);
+    return { revision: cards.revision, authority: board.authority, card: card!, ancestry, related };
   })()),
 });
 
@@ -382,8 +402,8 @@ export const readDoc = internalQuery({
   args: { connectionId: v.id("connections"), boardId: v.string(), cardId: v.string(), kind: v.union(v.literal("spec"), v.literal("plan")) },
   handler: async (ctx, { connectionId, boardId, cardId, kind }) => {
     const { board } = await readableBoard(ctx, connectionId, boardId);
-    const roadmap = await currentRoadmap(ctx, live(board));
-    const item = roadmap.roadmapItems.find((entry) => entry.id === cardId);
+    // Only the card's own chunk is read.
+    const item = await (await someCards(ctx, live(board))).card(cardId);
     if (!item) fail("not_found", `Card not found: ${cardId}`);
     return docPayload(await docRow(ctx, live(board), cardId, kind), cardId, kind, (kind === "spec" ? item!.specDoc : item!.planDoc) ?? null);
   },
@@ -391,7 +411,10 @@ export const readDoc = internalQuery({
 
 /** Agents' refused edits still waiting on this board, or one card (Spec point 20). For agent tools only. */
 async function goalsOf(ctx: QueryCtx, at: BoardRows): Promise<GoalsFile> {
-  const row = await stateRow(ctx, at);
+  return goalsIn(await stateRow(ctx, at));
+}
+
+function goalsIn(row: Doc<"boardState">): GoalsFile {
   return normalizeGoals(row.goals ? unpackJson(row.goals) : null);
 }
 
@@ -714,10 +737,7 @@ export const fence = internalMutation({
     const now = new Date().toISOString();
     const previous = await currentRoadmap(ctx, live(board));
     const committed = committedRoadmap(previous, now);
-    const state = await stateRow(ctx, live(board));
-    const packedRoadmap = packJson(committed);
-    await ctx.db.patch(state._id, { roadmap: packedRoadmap });
-    await addStored(ctx, live(board), sizeOf(packedRoadmap) - sizeOf(state.roadmap));
+    await writeRoadmap(ctx, live(board), previous, committed);
     // Bumping the revision tells every watching client the board changed.
     await ctx.db.patch(board._id, {
       authority: "returned-local", revision: committed.revision, updatedAt: now,

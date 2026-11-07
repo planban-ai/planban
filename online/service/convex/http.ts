@@ -204,6 +204,8 @@ export async function handleApi(ctx: ActionCtx, request: Request, auth: Authenti
     const since = url.searchParams.get("since");
     return json(unpacked(await ctx.runQuery(internal.boards.getBoard, { connectionId, boardId, ...(since === null ? {} : { since: Number(since) }) })));
   }
+  // One card, without reading the whole board.
+  if (rest[0] === "cards" && rest.length === 2 && method === "GET") return json(unpacked(await ctx.runQuery(internal.boards.getCard, { connectionId, boardId, cardId: rest[1]! })));
   if (rest[0] === "export" && rest.length === 1 && method === "GET") return json(unpacked(await ctx.runQuery(internal.boards.exportBoard, { connectionId, boardId })));
   const transfer = url.searchParams.get("transferId");
   const bound = transfer === null ? {} : { transferId: transfer };

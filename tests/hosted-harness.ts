@@ -66,19 +66,40 @@ export function checkConvexValue(value: unknown, where: string, depth = 0) {
   }
 }
 
+/** A stored document's size as database traffic counts it: its fields, with bytes at their length. */
+export function documentBytes(row: unknown): number {
+  return JSON.stringify(row, (key, value) => (key === "_table" ? undefined : value instanceof ArrayBuffer ? "x".repeat(value.byteLength) : ArrayBuffer.isView(value) ? "x".repeat(value.byteLength) : value)).length;
+}
+
+/** Database traffic so far: documents returned to functions, and documents written (inserted, rewritten by a patch, or deleted). */
+export interface DatabaseMeter { read: number; written: number; rowsRead: number; byTable: Record<string, number> }
+
 export function memoryService() {
   /** Paginated queries run by the function being called (Convex allows one). */
   let paginations = 0;
   const rows: any[] = [];
   const jobs: Array<{ name: string; args: unknown }> = [];
   let sequence = 0;
+  const meter: DatabaseMeter = { read: 0, written: 0, rowsRead: 0, byTable: {} };
+  const read = <T>(row: T): T => {
+    if (row) {
+      const bytes = documentBytes(row);
+      meter.read += bytes;
+      meter.rowsRead += 1;
+      const table = (row as { _table: string })._table;
+      meter.byTable[table] = (meter.byTable[table] ?? 0) + bytes;
+    }
+    return row;
+  };
+  const wrote = (row: unknown) => { meter.written += documentBytes(row); };
   const db: any = {
-    get: async (id: string) => rows.find((row) => row._id === id) ?? null,
+    get: async (id: string) => read(rows.find((row) => row._id === id) ?? null),
     insert: async (table: string, value: any) => {
       // Stored documents follow Convex's value rules too.
       checkConvexValue(value, `${table} document`);
       const id = `${table}-${++sequence}`;
       rows.push({ ...value, _id: id, _table: table, _creationTime: sequence });
+      wrote(rows.at(-1));
       return id;
     },
     patch: async (id: string, patch: any) => {
@@ -88,15 +109,20 @@ export function memoryService() {
         if (value === undefined) delete row[key];
         else row[key] = value;
       }
+      // A patch writes the whole document again.
+      wrote(row);
     },
     replace: async (id: string, value: any) => {
       const row = rows.find((entry) => entry._id === id);
       checkConvexValue(value, `${row?._table ?? "row"} document`);
       for (const key of Object.keys(row)) if (!key.startsWith("_")) delete row[key];
       Object.assign(row, value);
+      wrote(row);
     },
     delete: async (id: string) => {
-      rows.splice(rows.findIndex((row) => row._id === id), 1);
+      const index = rows.findIndex((row) => row._id === id);
+      wrote(rows[index]);
+      rows.splice(index, 1);
     },
     normalizeId: (table: string, id: string) => (rows.some((row) => row._id === id && row._table === table) ? id : null),
     query: (table: string) => {
@@ -138,11 +164,11 @@ export function memoryService() {
         unique: async () => {
           const found = rows.filter(match);
           if (found.length > 1) throw new Error(`unique() found ${found.length} ${table} rows`);
-          return found[0] ?? null;
+          return read(found[0] ?? null);
         },
-        first: async () => ordered()[0] ?? null,
-        collect: async () => ordered(),
-        take: async (count: number) => ordered().slice(0, count),
+        first: async () => read(ordered()[0] ?? null),
+        collect: async () => ordered().map(read),
+        take: async (count: number) => ordered().slice(0, count).map(read),
         paginate: async ({ numItems, cursor, maximumBytesRead }: { numItems: number; cursor: string | null; maximumBytesRead?: number }) => {
           // As Convex: a function may run only one paginated query.
           paginations += 1;
@@ -158,10 +184,10 @@ export function memoryService() {
               if (read > maximumBytesRead && index > start) { end = index; break; }
             }
           }
-          return { page: all.slice(start, end), isDone: end >= all.length, continueCursor: String(end) };
+          return { page: all.slice(start, end).map(read), isDone: end >= all.length, continueCursor: String(end) };
         },
         async *[Symbol.asyncIterator]() {
-          for (const row of ordered()) yield row;
+          for (const row of ordered()) yield read(row);
         },
       };
       return query;
@@ -237,5 +263,5 @@ export function memoryService() {
     }
   }
 
-  return { rows, jobs, ctx, actionCtx, signIn, browserSend, adapterFor, liveRevision, runJobs, call };
+  return { rows, jobs, meter, ctx, actionCtx, signIn, browserSend, adapterFor, liveRevision, runJobs, call };
 }

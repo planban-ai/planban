@@ -56,14 +56,28 @@ export default defineSchema({
     key: v.string(),
   }).index("by_key", ["key"]).index("by_board_generation", ["boardId", "generation"]),
 
-  /** The whole roadmap, deflate-compressed: the shared planning rules need all of it. */
+  /**
+   * A board generation's roadmap (see model/roadmapStore.ts): a small packed
+   * index of its fields and cards' order, with the cards in boardCards. Boards
+   * stored before that keep the whole roadmap, deflate-compressed, in `roadmap`
+   * until maintenance:splitRoadmaps moves them.
+   */
   boardState: defineTable({
     boardId: v.string(),
     generation: v.number(),
-    roadmap: v.bytes(),
+    roadmap: v.optional(v.bytes()),
+    index: v.optional(v.bytes()),
     /** The board's goals (src/core/goals.ts), when it has any. */
     goals: v.optional(v.bytes()),
   }).index("by_board_generation", ["boardId", "generation"]),
+
+  /** A board's cards, packed, about 32 KB of them per row (model/roadmapStore.ts). */
+  boardCards: defineTable({
+    boardId: v.string(),
+    generation: v.number(),
+    chunk: v.number(),
+    cards: v.bytes(),
+  }).index("by_board_generation_chunk", ["boardId", "generation", "chunk"]),
 
   /**
    * Agents' edits that were refused because something they touched changed

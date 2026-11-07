@@ -23,6 +23,7 @@ import { seedCardChanges } from "./cardChanges";
 import { importHistoryVersion, recordHistory, type Attribution, type BoardRows } from "./history";
 import { DOC_KINDS, currentRoadmap, docRow, retiredIds, stateRow, type DocKind } from "./rows";
 import { reserveRetiredId } from "./retired";
+import { insertState, writeRoadmap } from "./roadmapStore";
 import { boardIdReserved } from "./erasureGate";
 
 /** Delay before an old generation's clean-up (and file carry-over) starts after a commit. */
@@ -152,10 +153,7 @@ export async function beginTransfer(ctx: MutationCtx, connection: Doc<"connectio
   const at = { boardId, generation };
   // Take Online counts towards the account's daily import limit and the board's size limit.
   await chargeImport(ctx, connection.userId, sizeOf(input.roadmap) + sizeOf(input.retiredIds ?? []) + sizeOf(input.retention ?? null) + sizeOf(goals));
-  const packedRoadmap = packJson(roadmap);
-  const packedGoals = goals ? packJson(goals) : undefined;
-  await ctx.db.insert("boardState", { ...at, roadmap: packedRoadmap, ...(packedGoals ? { goals: packedGoals } : {}) });
-  await addStored(ctx, at, sizeOf(packedRoadmap) + (packedGoals ? sizeOf(packedGoals) : 0));
+  await insertState(ctx, at, roadmap, goals ? packJson(goals) : undefined);
   const live = new Set(roadmap.roadmapItems.map((item) => item.id));
   for (const cardId of new Set(input.retiredIds ?? [])) {
     if (!live.has(cardId)) await reserveRetiredId(ctx, at, cardId);
@@ -255,10 +253,7 @@ export async function commitTransfer(ctx: MutationCtx, connection: Doc<"connecti
   // adds a history version, keeping earlier version numbers intact. A board
   // taken online again never goes back to an older revision.
   const committed = committedRoadmap({ ...roadmap, revision: Math.max(roadmap.revision, transfer.previousRevision) }, now);
-  const state = await stateRow(ctx, at);
-  const packedRoadmap = packJson(committed);
-  await ctx.db.patch(state._id, { roadmap: packedRoadmap });
-  await addStored(ctx, at, sizeOf(packedRoadmap) - sizeOf(state.roadmap));
+  await writeRoadmap(ctx, at, roadmap, committed);
   const previousGeneration = board!.generation;
   // Version numbers are never reused, even if the local history was trimmed.
   const baseVersion = Math.max(transfer.maxVersion, transfer.previousRevision >= 0 ? board!.historyVersion : 0);
@@ -320,9 +315,7 @@ export async function createOnlineBoard(ctx: MutationCtx, connection: Doc<"conne
   const roadmap = createEmptyRoadmap({ repoId: boardId, title, now });
   const generation = await nextGeneration(ctx);
   const at = { boardId, generation };
-  const packedRoadmap = packJson(roadmap);
-  await ctx.db.insert("boardState", { ...at, roadmap: packedRoadmap });
-  await addStored(ctx, at, sizeOf(packedRoadmap));
+  await insertState(ctx, at, roadmap);
   const id = await ctx.db.insert("boards", {
     boardId, title, ownerId: connection.userId, authority: "online", revision: roadmap.revision,
     generation, historyVersion: 0, onlineSince: now, uid: crypto.randomUUID(), createdAt: now, updatedAt: now,

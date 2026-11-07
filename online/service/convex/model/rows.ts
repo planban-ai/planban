@@ -1,27 +1,16 @@
 // Reading and writing a board's rows in one generation.
-import type { PlanbanDocPayload, PlanbanRoadmap } from "../../../../src/core/types";
+import type { PlanbanDocPayload } from "../../../../src/core/types";
 import type { Doc } from "../_generated/dataModel";
 import type { QueryCtx } from "../_generated/server";
-import { unpackJson, unpackText } from "./codec";
-import { fail } from "./errors";
+import { unpackText } from "./codec";
 import type { BoardRows } from "./history";
+export { currentRoadmap, stateRow } from "./roadmapStore";
 
 export type DocKind = "spec" | "plan";
 export const DOC_KINDS = new Set<string>(["spec", "plan"]);
 
 export function live(board: Doc<"boards">): BoardRows {
   return { boardId: board.boardId, generation: board.generation };
-}
-
-export async function stateRow(ctx: QueryCtx, at: BoardRows) {
-  const row = await ctx.db.query("boardState")
-    .withIndex("by_board_generation", (q) => q.eq("boardId", at.boardId).eq("generation", at.generation)).unique();
-  if (!row) fail("not_found", `Online Board not found: ${at.boardId}`);
-  return row!;
-}
-
-export async function currentRoadmap(ctx: QueryCtx, at: BoardRows): Promise<PlanbanRoadmap> {
-  return unpackJson<PlanbanRoadmap>((await stateRow(ctx, at)).roadmap);
 }
 
 export async function docRow(ctx: QueryCtx, at: BoardRows, cardId: string, kind: DocKind) {

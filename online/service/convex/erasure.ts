@@ -34,10 +34,10 @@ const KEEP_FINISHED_MS = 24 * 60 * 60 * 1000;
 const BOARD_ROWS = [
   ["historyDocs", "by_board_version"], ["historyPayloads", "by_board_version"], ["history", "by_board_version"],
   ["docs", "by_board_card_kind"], ["retiredIds", "by_board_card"], ["boardFingerprints", "by_board_generation"],
-  ["cardChanges", "by_board_generation_card"], ["boardSizes", "by_board_generation"], ["boardState", "by_board_generation"],
+  ["cardChanges", "by_board_generation_card"], ["boardSizes", "by_board_generation"], ["boardCards", "by_board_generation_chunk"], ["boardState", "by_board_generation"],
   ["presence", "by_board_card"], ["unresolvedChanges", "by_board_card"],
 ] as const;
-const LARGE_TABLES = new Set(["historyDocs", "historyPayloads", "docs", "boardState"]);
+const LARGE_TABLES = new Set(["historyDocs", "historyPayloads", "docs", "boardCards", "boardState"]);
 
 type Step = (ctx: MutationCtx, erasure: Doc<"erasures">) => Promise<"more" | "next" | "wait">;
 

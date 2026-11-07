@@ -43,6 +43,7 @@ import type * as model_oauthHttp from "../model/oauthHttp.js";
 import type * as model_presence from "../model/presence.js";
 import type * as model_providerUsage from "../model/providerUsage.js";
 import type * as model_retired from "../model/retired.js";
+import type * as model_roadmapStore from "../model/roadmapStore.js";
 import type * as model_rows from "../model/rows.js";
 import type * as model_sha256 from "../model/sha256.js";
 import type * as model_signInEmail from "../model/signInEmail.js";
@@ -101,6 +102,7 @@ declare const fullApi: ApiFromModules<{
   "model/presence": typeof model_presence;
   "model/providerUsage": typeof model_providerUsage;
   "model/retired": typeof model_retired;
+  "model/roadmapStore": typeof model_roadmapStore;
   "model/rows": typeof model_rows;
   "model/sha256": typeof model_sha256;
   "model/signInEmail": typeof model_signInEmail;

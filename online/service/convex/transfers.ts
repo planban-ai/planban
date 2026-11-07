@@ -69,8 +69,8 @@ export const importBundle = internalMutation({
   })()),
 });
 
-async function deleteSome(ctx: MutationCtx, table: "boardState" | "docs" | "history" | "historyPayloads" | "historyDocs" | "retiredIds" | "boardFingerprints" | "cardChanges" | "boardSizes" | "presence" | "unresolvedChanges", boardId: string, generation: number) {
-  const index = table === "boardState" || table === "boardFingerprints" || table === "boardSizes" ? "by_board_generation" : table === "docs" ? "by_board_card_kind" : table === "retiredIds" || table === "presence" || table === "unresolvedChanges" ? "by_board_card" : table === "cardChanges" ? "by_board_generation_card" : "by_board_version";
+async function deleteSome(ctx: MutationCtx, table: "boardState" | "boardCards" | "docs" | "history" | "historyPayloads" | "historyDocs" | "retiredIds" | "boardFingerprints" | "cardChanges" | "boardSizes" | "presence" | "unresolvedChanges", boardId: string, generation: number) {
+  const index = table === "boardState" || table === "boardFingerprints" || table === "boardSizes" ? "by_board_generation" : table === "docs" ? "by_board_card_kind" : table === "retiredIds" || table === "presence" || table === "unresolvedChanges" ? "by_board_card" : table === "cardChanges" ? "by_board_generation_card" : table === "boardCards" ? "by_board_generation_chunk" : "by_board_version";
   const rows = await (ctx.db.query(table) as any).withIndex(index, (q: any) => q.eq("boardId", boardId).eq("generation", generation)).take(CLEANUP_BATCH);
   for (const row of rows) await ctx.db.delete(row._id);
   return rows.length;
@@ -82,7 +82,7 @@ export const cleanupGeneration = internalMutation({
     const board = await ctx.db.query("boards").withIndex("by_boardId", (q) => q.eq("boardId", boardId)).unique();
     if (board && board.generation === generation) return; // never remove the live board
     let removed = 0;
-    for (const table of ["historyDocs", "historyPayloads", "history", "docs", "retiredIds", "boardFingerprints", "cardChanges", "presence", "unresolvedChanges", "boardSizes", "boardState"] as const) {
+    for (const table of ["historyDocs", "historyPayloads", "history", "docs", "retiredIds", "boardFingerprints", "cardChanges", "presence", "unresolvedChanges", "boardSizes", "boardCards", "boardState"] as const) {
       removed += await deleteSome(ctx, table, boardId, generation);
       if (removed >= CLEANUP_BATCH) break;
     }

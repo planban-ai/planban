@@ -7,9 +7,8 @@
 // access rules, base versions and idempotency apply.
 import { ConvexError } from "convex/values";
 import { sectionList } from "../../../../src/core/docSections";
-import { PLANBAN_STATUSES, type PlanbanDocPayload, type PlanbanHistoryPayload, type PlanbanRoadmap } from "../../../../src/core/types";
+import { PLANBAN_STATUSES, type PlanbanDocPayload, type PlanbanHistoryPayload, type PlanbanRoadmap, type PlanbanRoadmapItem } from "../../../../src/core/types";
 import { boardOnlyStaleness, cardPrRefs, isActiveStatus, largeDocNote, stalenessAttention } from "../../../../src/core/staleness";
-import { cardAncestry } from "../../../../src/core/boardOperations";
 import { queryWorkItems, type WorkItemQuery } from "../../../../src/core/workItemQuery";
 import { internal } from "../_generated/api";
 import { HOW_TO_REFER } from "../../../../src/core/contentRules";
@@ -393,6 +392,12 @@ export class McpService {
     return (board as { roadmap: PlanbanRoadmap }).roadmap;
   }
 
+  /** One card, its Groups and the cards its freshness depends on, without reading the whole board. */
+  async getCard(boardId: string, cardId: string) {
+    return unpacked<{ revision: number; card: PlanbanRoadmapItem; ancestry: PlanbanRoadmapItem[]; related: PlanbanRoadmapItem[] }>(
+      await this.call(() => this.ctx.runQuery(internal.boards.getCard, { connectionId: this.connectionId, boardId, cardId })));
+  }
+
   readDoc(boardId: string, cardId: string, kind: "spec" | "plan"): Promise<PlanbanDocPayload> {
     return this.call(() => this.ctx.runQuery(internal.boards.readDoc, { connectionId: this.connectionId, boardId, cardId, kind }));
   }
@@ -502,18 +507,17 @@ async function callTool(service: McpService, origin: string, name: string, args:
       return { boardId: roadmap.project.id, revision: roadmap.revision, ...queryWorkItems(roadmap.roadmapItems, query as WorkItemQuery) };
     }
     case "planban_get_card": {
-      const roadmap = await service.getBoard(stringArg(args, "boardId"));
       const cardId = stringArg(args, "cardId");
-      const card = roadmap.roadmapItems.find((item) => item.id === cardId);
-      if (!card) throw new ToolError(`not_found: Card not found: ${cardId}`);
+      // Only this card's rows are read; its freshness needs just the cards it depends on.
+      const { revision, card, ancestry, related } = await service.getCard(stringArg(args, "boardId"), cardId);
       // Agents see edits to this card that were refused and are still waiting, and who else is working on it (Spec point 20).
       const boardId = stringArg(args, "boardId");
       await service.notePresence(boardId, cardId);
       const [{ changes }, { working }] = await Promise.all([service.unresolved(boardId, cardId), service.working(boardId, cardId)]);
       const others = working[cardId] ?? [];
-      const freshness = boardOnlyStaleness(roadmap.roadmapItems, Date.now());
+      const freshness = boardOnlyStaleness([card, ...related], Date.now());
       return {
-        revision: roadmap.revision, card, ancestry: cardAncestry(roadmap, cardId),
+        revision, card, ancestry,
         // The note only for an active card that names a PR, whose merge this view can't check.
         staleness: freshness.cards[cardId] ?? [],
         ...(freshness.notes?.length && isActiveStatus(card.status) && cardPrRefs(card).length ? { stalenessNote: freshness.notes.join(" ") } : {}),
@@ -597,9 +601,7 @@ async function callTool(service: McpService, origin: string, name: string, args:
     case "fetch": {
       const [id, cardId] = stringArg(args, "id").split("/");
       if (!id || !cardId) throw new ToolError("validation: id must look like board/card.");
-      const roadmap = await service.getBoard(id);
-      const card = roadmap.roadmapItems.find((item) => item.id === cardId);
-      if (!card) throw new ToolError(`not_found: Card not found: ${cardId}`);
+      const { card } = await service.getCard(id, cardId);
       const spec = await service.readDoc(id, cardId, "spec");
       const text = [
         `# ${card.title}`,
