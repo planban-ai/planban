@@ -33,7 +33,7 @@ on:
       from_version:
         description: Public Planban version used as the old marketplace
         required: true
-        default: "1.1.6"
+        default: "2.0.0"
         type: string
       target_ref:
         description: Remote branch or tag containing the exact candidate
@@ -85,7 +85,7 @@ jobs:
           - { os: windows-latest, shard: 5, iterations: 1 }
     runs-on: ${{ matrix.os }}
     env:
-      FROM_VERSION: ${{ inputs.from_version || '1.1.6' }}
+      FROM_VERSION: ${{ inputs.from_version || '2.0.0' }}
       TARGET_REF: ${{ inputs.target_ref || github.event.pull_request.head.ref }}
       RELEASE_SOURCE_URL: https://github.com/${{ github.repository }}.git
       TARGET_SOURCE_URL: ${{ github.event.pull_request.head.repo.clone_url || format('https://github.com/{0}.git', github.repository) }}
@@ -169,7 +169,7 @@ jobs:
           - macos-latest
     runs-on: ${{ matrix.os }}
     env:
-      FROM_VERSION: ${{ inputs.from_version || '1.1.6' }}
+      FROM_VERSION: ${{ inputs.from_version || '2.0.0' }}
       EXPECTED_COMMIT: ${{ inputs.expected_commit || github.event.pull_request.head.sha }}
     steps:
       - name: Check out exact candidate
