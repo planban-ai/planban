@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { stableNodePath } from "./stable-node-path.mjs";
 
 const repoRoot = resolve(process.argv[2] ?? process.cwd());
 const mcpPath = resolve(repoRoot, "plugins/planban/.mcp.json");
@@ -9,7 +10,7 @@ const manifest = {
   mcpServers: {
     planban: {
       cwd: repoRoot,
-      command: process.execPath,
+      command: stableNodePath(process.execPath),
       args: ["./plugins/planban/scripts/start-planban-mcp.mjs"],
       startup_timeout_sec: 120,
       env: {
