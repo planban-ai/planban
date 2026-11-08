@@ -1,0 +1,7 @@
+/*
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'sha256-7I/IdFpCBgsGT0b5Dgnm9TBXS6C5eZt37r3lcsfOHh8=' https://clerk.app.planban.ai https://challenges.cloudflare.com https://*.protect.clerk.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://clerk.app.planban.ai https://*.protect.clerk.com:* https://canny-turtle-411.eu-west-1.convex.cloud wss://canny-turtle-411.eu-west-1.convex.cloud; img-src 'self' https://clerk.app.planban.ai https://img.clerk.com data:; font-src 'self'; frame-src https://clerk.app.planban.ai https://challenges.cloudflare.com https://*.protect.clerk.com; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+  Referrer-Policy: no-referrer
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Cross-Origin-Opener-Policy: same-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
