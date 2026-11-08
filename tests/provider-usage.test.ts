@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { getFunctionName } from "convex/server";
-import { USAGE_POLICY, USAGE_CLOUD, USAGE_SITE, HOUR, LEASE, RETRY_WINDOW, collectionConfigured, usageEnabled, mailEnabled, parseUsage, utcMonth, emptyMonitor, observeUsage, finishUsage, canSend, monitorStale, type Reading } from "../online/service/convex/model/providerUsage";
+import { USAGE_POLICY, USAGE_CLOUD, USAGE_SITE, HOUR, LEASE, RETRY_WINDOW, collectionConfigured, usageEnabled, mailEnabled, parseUsage, utcMonth, emptyMonitor, observeUsage, finishUsage, canSend, monitorStale, estimateCost, projectUsage, OVERAGE_PRICES, REGION_UPLIFT, PROJECTION_MIN_DAYS, type Reading } from "../online/service/convex/model/providerUsage";
 import { boundedJson, runUsagePoll, status as usageStatus } from "../online/service/convex/providerUsage";
 
 const now = Date.UTC(2026, 9, 12, 12);
@@ -10,11 +10,64 @@ const body = () => ({ seedStatus: "complete", metrics: {
   functionCalls: { unit: "calls", usage: { current_month: 700000 } },
   actionComputeConvexGbHours: { unit: "GB-hours", usage: { current_month: 5 } },
   actionComputeNodeJsGbHours: { unit: "GB-hours", usage: { current_month: 1 } },
-  databaseIoGb: { unit: "GB", usage: { current_month: .1 } },
+  databaseIoGb: { unit: "GB", usage: { current_month: 25 } },
   dataEgressGb: { unit: "GB", usage: { current_month: .1 } },
   actionComputeCpuGbHours: { unit: "GB-hours", usage: { current_month: 500 } },
 } });
-const reading = (calls = 700000, at = now): Reading => ({ month: utcMonth(at), at, values: { calls, actions: 6, io: .1, egress: .1 } });
+// Database I/O drives the cost in these readings, as it does in production.
+// At EU prices each GB beyond the first costs $0.286, so 25 GB is about $6.86
+// so far, and on 12 October the month-end projection is about $20 (function calls add $1).
+const reading = (io = 25, at = now): Reading => ({ month: utcMonth(at), at, values: { calls: 500000, actions: 6, io, egress: .1 } });
+const spent = (dollars: 5 | 15) => ({ kind: "spent", dollars });
+const projected = { kind: "projected", dollars: 15 };
+
+test("estimated overage charges each metric beyond its included amount at EU Starter prices", () => {
+  assert.equal(REGION_UPLIFT, 1.3);
+  assert.deepEqual(OVERAGE_PRICES, { calls: 2.2 / 1e6, actions: .33, io: .22, egress: .132 });
+  assert.equal(estimateCost({ calls: 1e6, actions: 20, io: 1, egress: 1 }).total, 0, "the included amounts cost nothing");
+  const cost = estimateCost({ calls: 2e6, actions: 30, io: 11, egress: 11 });
+  const close = (a: number, b: number) => assert.ok(Math.abs(a - b) < 1e-9, `${a} is not ${b}`);
+  close(cost.metrics.calls, 2.86); close(cost.metrics.actions, 4.29); close(cost.metrics.io, 2.86); close(cost.metrics.egress, 1.716);
+  close(cost.total, 2.86 + 4.29 + 2.86 + 1.716);
+  close(estimateCost({ calls: 0, actions: 0, io: 3, egress: 0 }).total, .572);
+});
+
+test("the month-end projection follows this month's daily rate and waits for a few days of readings", () => {
+  assert.equal(PROJECTION_MIN_DAYS, 3);
+  assert.equal(projectUsage(reading(10, Date.UTC(2026, 9, 3, 12))), null, "two and a half days in is too early");
+  const mid = projectUsage(reading(10, Date.UTC(2026, 10, 16)))!;
+  assert.equal(mid.io, 20, "halfway through a 30-day month doubles usage");
+  assert.equal(mid.calls, 1000000);
+  const end = projectUsage(reading(10, Date.UTC(2026, 11, 1) - 1))!;
+  assert.ok(Math.abs(end.io - 10) < 1e-6, "the last moment of the month projects what was used");
+});
+
+test("a month spent a few times over the free allowance but under $5 sends nothing", () => {
+  const s = emptyMonitor();
+  for (const [io, at] of [[3, now], [8, now + HOUR], [2, Date.UTC(2026, 9, 28)], [18, Date.UTC(2026, 9, 31, 12)]] as const) {
+    assert.equal(observeUsage(s, reading(io, at), "complete", at, true), null, `${io} GB must not warn`);
+  }
+  assert.equal(s.batches.length, 0);
+});
+
+test("warnings go once a month at $5 and $15 so far, and early when the month-end projection passes $15", () => {
+  const s = emptyMonitor(), day8 = Date.UTC(2026, 9, 8, 12);
+  const early = observeUsage(s, reading(18, day8), "complete", day8, true)!;
+  assert.deepEqual(early.events, [projected], "$4.86 so far, about $21 by month end");
+  finishUsage(s, early.id, early.fence, "sent", day8);
+  assert.equal(observeUsage(s, reading(18, day8 + HOUR), "complete", day8 + HOUR, true), null);
+  const five = observeUsage(s, reading(19, day8 + 2 * HOUR), "complete", day8 + 2 * HOUR, true)!;
+  assert.deepEqual(five.events, [spent(5)]);
+  finishUsage(s, five.id, five.fence, "sent", day8 + 2 * HOUR);
+  const fifteen = observeUsage(s, reading(60, day8 + 3 * HOUR), "complete", day8 + 3 * HOUR, true)!;
+  assert.deepEqual(fifteen.events, [spent(15)]);
+  finishUsage(s, fifteen.id, fifteen.fence, "sent", day8 + 3 * HOUR);
+  assert.equal(observeUsage(s, reading(90, day8 + 4 * HOUR), "complete", day8 + 4 * HOUR, true), null);
+  const jump = emptyMonitor();
+  assert.deepEqual(observeUsage(jump, reading(60), "complete", now, true)!.events, [spent(15)], "one email when $15 is already passed");
+  const both = observeUsage(emptyMonitor(), reading(25), "complete", now, true)!;
+  assert.deepEqual(both.events, [spent(5), projected]);
+});
 
 test("complete provider readings validate constituent units, known exclusions and calendar boundaries without coercion", () => {
   assert.equal(parseUsage(body(), now, now + 5).values.actions, 6, "CPU compute is excluded");
@@ -65,38 +118,38 @@ test("disabled-mail observations never flush stale or old-month warnings; enabli
   assert.equal(s.batches.length, 0);
   assert.equal(observeUsage(s, null, "unavailable", now + HOUR, true), null);
   assert.equal(observeUsage(s, reading(), "complete", now + HOUR, true), null, "cached snapshot cannot trigger mail");
-  assert.equal(observeUsage(s, reading(100, now + HOUR), "complete", now + HOUR, true), null);
-  const b = observeUsage(s, reading(900000, now + 2 * HOUR), "complete", now + 2 * HOUR, true)!;
-  assert.deepEqual(b.events, [{ metric: "calls", level: 90 }]);
+  assert.equal(observeUsage(s, reading(1, now + HOUR), "complete", now + HOUR, true), null);
+  const b = observeUsage(s, reading(60, now + 2 * HOUR), "complete", now + 2 * HOUR, true)!;
+  assert.deepEqual(b.events, [spent(15)]);
   finishUsage(s, b.id, b.fence, "sent", now + 2 * HOUR);
-  assert.equal(observeUsage(s, reading(700000, now + 3 * HOUR), "complete", now + 3 * HOUR, true), null);
+  assert.equal(observeUsage(s, reading(25, now + 3 * HOUR), "complete", now + 3 * HOUR, true), null);
   const next = Date.UTC(2026, 10, 1);
-  assert.ok(observeUsage(s, reading(700000, next), "complete", next, true), "new UTC month re-arms");
+  assert.deepEqual(observeUsage(s, reading(25, next), "complete", next, true)?.events, [spent(5)], "new UTC month re-arms");
   assert.equal(s.lastSuccess?.month, "2026-11");
 });
 
 test("lost acknowledgments retry identical immutable bytes/key under a new fence and never expand attempted membership", () => {
   const s = emptyMonitor(), first = observeUsage(s, reading(), "complete", now, true)!;
-  assert.equal(observeUsage(s, reading(700000, now + 1), "complete", now + 1, true), null, "serialized concurrent claim cannot duplicate");
-  const later = reading(900000, now + LEASE + 1); later.values.io = .9;
+  assert.equal(observeUsage(s, reading(25, now + 1), "complete", now + 1, true), null, "serialized concurrent claim cannot duplicate");
+  const later = reading(60, now + LEASE + 1);
   const retry = observeUsage(s, later, "complete", later.at, true)!;
   assert.equal(retry.id, first.id); assert.equal(retry.payload, first.payload); assert.equal(retry.hash, first.hash);
   assert.deepEqual(retry.events, first.events); assert.equal(retry.fence, 2);
   finishUsage(s, first.id, first.fence, "sent", later.at); assert.equal(s.batches[0]?.status, "sending", "old lease cannot commit");
   finishUsage(s, retry.id, retry.fence, "sent", later.at);
   const high = observeUsage(s, later, "complete", later.at, true)!;
-  assert.notEqual(high.id, first.id); assert.deepEqual(high.events, [{ metric: "calls", level: 90 }, { metric: "io", level: 90 }]);
+  assert.notEqual(high.id, first.id); assert.deepEqual(high.events, [spent(15)]);
 });
 
 test("ambiguous batches are held after bounded attempts or idempotency expiry; month rollover preserves in-flight outcomes", () => {
   const s = emptyMonitor(); let b = observeUsage(s, reading(), "complete", now, true)!;
-  for (let i = 1; i < 3; i++) { finishUsage(s, b.id, b.fence, "retry", now + i); b = observeUsage(s, reading(700000, now + i * HOUR), "complete", now + i * HOUR, true)!; }
+  for (let i = 1; i < 3; i++) { finishUsage(s, b.id, b.fence, "retry", now + i); b = observeUsage(s, reading(25, now + i * HOUR), "complete", now + i * HOUR, true)!; }
   finishUsage(s, b.id, b.fence, "retry", now + 2 * HOUR);
-  assert.equal(s.batches[0]?.status, "held"); assert.equal(observeUsage(s, reading(700000, now + 3 * HOUR), "complete", now + 3 * HOUR, true), null);
+  assert.equal(s.batches[0]?.status, "held"); assert.equal(observeUsage(s, reading(25, now + 3 * HOUR), "complete", now + 3 * HOUR, true), null);
   const expired = emptyMonitor(), old = observeUsage(expired, reading(), "complete", now, true)!;
-  assert.equal(observeUsage(expired, reading(700000, now + RETRY_WINDOW), "complete", now + RETRY_WINDOW, true), null);
+  assert.equal(observeUsage(expired, reading(25, now + RETRY_WINDOW), "complete", now + RETRY_WINDOW, true), null);
   assert.equal(expired.batches[0]?.status, "held");
-  const boundary = Date.UTC(2026, 9, 31, 23, 59, 50), crossing = emptyMonitor(), inflight = observeUsage(crossing, reading(700000, boundary), "complete", boundary, true)!;
+  const boundary = Date.UTC(2026, 9, 31, 23, 59, 50), crossing = emptyMonitor(), inflight = observeUsage(crossing, reading(25, boundary), "complete", boundary, true)!;
   const midnight = Date.UTC(2026, 10, 1); observeUsage(crossing, reading(0, midnight), "complete", midnight, true);
   assert.equal(canSend(inflight, env(), midnight), false);
   finishUsage(crossing, inflight.id, inflight.fence, "sent", midnight); assert.equal(crossing.batches[0]?.month, "2026-10"); assert.equal(crossing.batches[0]?.status, "sent");
@@ -123,10 +176,23 @@ test("actual action adapter emits no external call while disabled or copied, and
   }
 });
 
-test("warning bytes are content-free and distinguish shared included usage from native spending controls", () => {
+test("the warning says in plain words what it costs so far, where the month is heading and what Convex does at $10 and $20", () => {
   const b = observeUsage(emptyMonitor(), reading(), "complete", now, true)!; const p = JSON.parse(b.payload);
   assert.deepEqual(p.to, ["hello@planban.ai"]); assert.equal(p.from, "Planban <alerts@planban.ai>");
-  assert.match(p.text, /Team coverage is incomplete/); assert.match(p.text, /not a team total/); assert.match(p.text, /can incur charges/); assert.match(p.text, /seat fees are excluded/);
+  assert.equal(p.subject, "[Planban] Convex usage has passed $5 this month");
+  assert.match(p.text, /^Planban's Convex usage this month has passed \$5 in estimated charges/);
+  assert.match(p.text, /Estimated charges so far: \$6\.86\./);
+  assert.match(p.text, /By the end of the month, at the current daily rate: about \$19\.98\./);
+  assert.match(p.text, /Database I\/O: 25\.00 GB used, 1 GB included, about \$6\.86/);
+  assert.ok(!p.text.includes("Function calls"), "metrics inside their allowance are left out");
+  assert.match(p.text, /spending alert at \$10/); assert.match(p.text, /\$20/); assert.match(p.text, /seat fees/);
+  assert.match(p.text, /12 October 2026/); assert.match(p.text, /1 November 2026/);
+  assert.ok(!/included-usage/i.test(p.text + p.subject));
+  const ahead = JSON.parse(observeUsage(emptyMonitor(), reading(18, Date.UTC(2026, 9, 8, 12)), "complete", Date.UTC(2026, 9, 8, 12), true)!.payload);
+  assert.equal(ahead.subject, "[Planban] Convex usage is on course to pass $15 this month");
+  assert.match(ahead.text, /^At this month's daily rate so far, Planban's Convex usage would cost more than \$15/);
+  const day1 = Date.UTC(2026, 9, 1, 12), soon = JSON.parse(observeUsage(emptyMonitor(), reading(25, day1), "complete", day1, true)!.payload);
+  assert.match(soon.text, /too early in the month to estimate the month-end total/);
   assert.ok(!p.html.includes("<script")); assert.ok(!p.text.includes("synthetic"));
   assert.equal(canSend({ ...b, payload: b.payload + "tampered" }, env(), now), false);
   assert.equal(canSend(b, { ...env(), PLANBAN_USAGE_EMAIL_ENABLED: "0" }, now), false);
@@ -180,23 +246,30 @@ test("retention holds ambiguous batches and refuses growth at the bound instead 
   const s = emptyMonitor(), b = observeUsage(s, reading(), "complete", now, true)!;
   finishUsage(s, b.id, b.fence, "held", now);
   s.batches = Array.from({ length: 104 }, (_, i) => ({ ...structuredClone(b), id: `${b.id}/${i}`, month: "2020-01", status: "held" as const }));
-  assert.equal(observeUsage(s, reading(900000), "complete", now, true), null);
+  assert.equal(observeUsage(s, reading(60), "complete", now, true), null);
   assert.equal(s.batches.length, 104); assert.equal(s.status, "retention_review_required");
 });
 
-test("twenty healthy month-end windows keep all eight warnings available while successful payload retention stays bounded", () => {
-  const s = emptyMonitor(); const included = { calls: 1000000, actions: 20, io: 1, egress: 1 };
+test("twenty busy months keep all three warnings available while successful payload retention stays bounded", () => {
+  const s = emptyMonitor();
   for (let m = 0; m < 20; m++) {
-    let at = Date.UTC(2025, m + 1, 0, 12); const r = reading(0, at); r.values = { calls: 0, actions: 0, io: 0, egress: 0 };
-    for (const metric of ["calls", "actions", "io", "egress"] as const) for (const level of [70, 90] as const) {
-      r.at = at++; r.values[metric] = included[metric] * level / 100;
-      const b = observeUsage(s, structuredClone(r), "complete", r.at, true);
-      assert.ok(b, `month ${m + 1}, ${metric} ${level} must not be suppressed`);
-      assert.deepEqual(b.events, [{ metric, level }]); finishUsage(s, b.id, b.fence, "sent", r.at);
+    let at = Date.UTC(2025, m, 8, 12);
+    for (const [io, expected] of [[18, projected], [19, spent(5)], [60, spent(15)]] as const) {
+      const r = reading(io, at); const b = observeUsage(s, r, "complete", at, true);
+      assert.ok(b, `month ${m + 1}, ${io} GB must not be suppressed`);
+      assert.deepEqual(b.events, [expected]); finishUsage(s, b.id, b.fence, "sent", at++);
     }
-    assert.ok(s.batches.length <= 16, "only two months of successful payloads remain");
-    assert.ok(Object.keys(s.covered).length <= 104, "compact suppression spans thirteen months");
+    assert.ok(s.batches.length <= 6, "only two months of successful payloads remain");
+    assert.ok(Object.keys(s.covered).length <= 39, "compact suppression spans thirteen months");
   }
+});
+
+test("a warning left over from the old allowance thresholds is never resent", () => {
+  const s = emptyMonitor(), b = observeUsage(s, reading(), "complete", now, true)!;
+  finishUsage(s, b.id, b.fence, "retry", now);
+  s.batches[0]!.events = [{ metric: "io", level: 90 } as any];
+  assert.equal(observeUsage(s, reading(90, now + HOUR), "complete", now + HOUR, true)?.id === b.id, false);
+  assert.equal(s.batches[0]?.status, "held");
 });
 
 test("mocked mail adapter holds permanent failures and retries transient or ambiguous receipts with original batch state", async () => {
