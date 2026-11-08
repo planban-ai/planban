@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 
 import { stableNodePath } from "../scripts/stable-node-path.mjs";
@@ -35,7 +35,9 @@ test("a Homebrew Node path is recorded through its opt link, which survives Node
     mkdirSync(join(prefix, "opt"), { recursive: true });
     symlinkSync("../Cellar/node@24/24.21.0_2", join(prefix, "opt/node@24"));
 
-    assert.equal(stableNodePath(join(cellarBin, "node")), join(prefix, "opt/node@24/bin/node"));
+    // Homebrew reports POSIX paths, even when this fixture runs on Windows CI.
+    const cellarNode = join(cellarBin, "node").split(sep).join("/");
+    assert.equal(stableNodePath(cellarNode), join(prefix, "opt/node@24/bin/node"));
   } finally {
     rmSync(prefix, { recursive: true, force: true });
   }
@@ -50,11 +52,12 @@ test("other Node paths, and Homebrew paths whose opt link leads elsewhere, are k
     }
     mkdirSync(join(prefix, "opt"), { recursive: true });
     symlinkSync("../Cellar/node@24/24.21.0_2", join(prefix, "opt/node@24"));
-    const older = join(prefix, "Cellar/node@24/24.20.0/bin/node");
+    const older = join(prefix, "Cellar/node@24/24.20.0/bin/node").split(sep).join("/");
 
     assert.equal(stableNodePath(older), older);
     assert.equal(stableNodePath(join(prefix, "Cellar/node/25.0.0/bin/node")), join(prefix, "Cellar/node/25.0.0/bin/node"));
     assert.equal(stableNodePath("/usr/bin/node"), "/usr/bin/node");
+    assert.equal(stableNodePath(String.raw`C:\Program Files\nodejs\node.exe`), String.raw`C:\Program Files\nodejs\node.exe`);
   } finally {
     rmSync(prefix, { recursive: true, force: true });
   }
