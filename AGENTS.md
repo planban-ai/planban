@@ -15,6 +15,8 @@ at `CONTRIBUTING.md`.
 - Maintainers' agents also follow their own global instructions for owner
   decisions, checking work and landing work; this file adds only what is
   Planban's own.
+- Merges that release nothing, staging deploys, and bug fixes with no visible
+  change go ahead without asking; summarise them to the owner afterwards.
 - An app update cannot be undone once people's machines install it, only
   fixed by a newer one. Never publish one without the owner's yes.
 - This repository is public: never commit secrets, private paths, personal
