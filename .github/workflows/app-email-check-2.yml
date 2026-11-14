@@ -1,0 +1,9 @@
+name: App email check 2 (deliberate failure)
+on:
+  pull_request:
+    branches: [app-fail2-base]
+jobs:
+  fail:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Deliberate failure to check no email reaches Pierce (agent infrastructure, 14 Nov 2026)"; exit 1
