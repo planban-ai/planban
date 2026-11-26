@@ -840,7 +840,9 @@ export function useChangeAuthor(attribution: { userId: string; clientName: strin
     return { person: owner, agent: actor === "agent", via: null };
   }
   const person = board.people.find((entry) => entry.userId === attribution.userId) ?? absentPerson(attribution.userId);
-  return { person, agent: attribution.actor === "agent", via: attribution.actor === "agent" ? attribution.clientName : null };
+  // An integration (GitHub recording a merge) acts for the person who linked it, named as itself.
+  const acting = attribution.actor === "agent" || attribution.actor === "system";
+  return { person, agent: acting, via: acting ? attribution.clientName : null };
 }
 
 /** On shared boards: the face and name of whoever made a history entry, and the agent they used. */

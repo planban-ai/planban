@@ -10,6 +10,7 @@ const roadmap: any = {
 const service: any = {
   listBoards: async () => [{ boardId: "deadleg", title: "Deadleg" }],
   getBoard: async () => roadmap,
+  board: async () => ({ roadmap, linkedRepos: [] }),
   readDoc: async () => ({ markdown: "## Purpose\nOne supplier for 300 units." }),
   goals: async () => ({ page: { goals: [], context: "", retired: [], suggestions: [], recentlyDismissed: [] }, revision: 3 }),
 };
@@ -59,7 +60,7 @@ test("the hosted tools show every freshness warning they can, and say merges are
       { id: "shipped", title: "Shipped", status: "complete", summary: "Landed in PR 40.", nextAction: null, tags: [], isGroup: false, parentId: null, priority: 1, updatedAt: week },
     ],
   };
-  const hosted: any = { ...service, getBoard: async () => board, unresolved: async () => ({ changes: [] }), working: async () => ({ working: {} }), notePresence: async () => undefined };
+  const hosted: any = { ...service, getBoard: async () => board, board: async () => ({ roadmap: board, linkedRepos: [] }), unresolved: async () => ({ changes: [] }), working: async () => ({ working: {} }), notePresence: async () => undefined };
   const ask = async (name: string, args: Record<string, unknown>) => {
     const response = await handleMcp(new Request("https://app.planban.example/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) }), hosted, "https://app.planban.example");
     return (await response.json()).result.structuredContent;

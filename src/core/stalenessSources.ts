@@ -10,7 +10,7 @@ import { githubMerges, githubRepoFor } from "./githubMerges";
 import { boardPath, onlineRequest } from "./online/client";
 import { defaultPlanningRoot, expandHome, historyIndexPath, resolveInsideRoot, roadmapPath } from "./paths";
 import { cardPrRefs, computeStaleness, isActiveStatus, parseMergeLog, type BoardStaleness, type DocMtime, type MergeRecord } from "./staleness";
-import type { PlanbanHistoryEntry, PlanbanHistoryPayload, PlanbanProjectManifest, PlanbanRoadmap, PlanbanRoadmapItem } from "./types";
+import type { PlanbanHistoryEntry, PlanbanHistoryPayload, PlanbanLanding, PlanbanProjectManifest, PlanbanRoadmap, PlanbanRoadmapItem } from "./types";
 
 type Storage = PlanbanProjectManifest["storage"];
 type OnlineStorage = Extract<NonNullable<Storage>, { kind: "online" }>;
@@ -104,10 +104,10 @@ async function readOnlineHistoryRows(storage: OnlineStorage): Promise<HistoryRow
  * card names that the log doesn't already show merged. A bare `#123` is in this project's origin
  * repository; `owner/name#123` and full addresses are in theirs. No PR named, no GitHub read.
  */
-async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: number, deadlineMs?: number): Promise<{ merges: MergeRecord[]; notes: string[] }> {
+async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: number, deadlineMs?: number): Promise<{ merges: MergeRecord[]; notes: string[]; origin: string | null }> {
   const named = items.filter((item) => isActiveStatus(item.status)).flatMap((item) => cardPrRefs(item));
   const local = await cachedMergeLog(cwd, now);
-  if (!named.length) return { merges: local, notes: [] };
+  if (!named.length) return { merges: local, notes: [], origin: null };
   const origin = await githubRepoFor(cwd);
   const seenHere = new Set(local.map((merge) => merge.pr));
   const lookups = named.flatMap((ref) => {
@@ -117,7 +117,7 @@ async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: numbe
   const notes = !origin && named.some((ref) => ref.repo === null)
     ? ["Merged-PR warnings for pull requests named as #123 use only this computer's git history: this project has no GitHub origin remote."]
     : [];
-  if (!lookups.length) return { merges: local, notes };
+  if (!lookups.length) return { merges: local, notes, origin };
   const github = await githubMerges(lookups, { now, ...(deadlineMs === undefined ? {} : { deadlineMs }) });
   // A merge matches a card's owner/name#123; one in the origin repository also matches a bare #123.
   const isOrigin = (repo: string) => !!origin && repo.toLowerCase() === origin.toLowerCase();
@@ -129,7 +129,7 @@ async function onlineMerges(cwd: string, items: PlanbanRoadmapItem[], now: numbe
       return isOrigin(merge.repo) ? [record, { pr: merge.number, mergedAt: merge.mergedAt }] : [record];
     }),
   ];
-  return { merges, notes: [...notes, ...github.notes] };
+  return { merges, notes: [...notes, ...github.notes], origin };
 }
 
 async function readDocMtimes(planningRoot: string, items: PlanbanRoadmapItem[]): Promise<DocMtime[]> {
@@ -164,8 +164,9 @@ export async function collectStaleness(input: {
     try {
       // Online documents change only through Planban, so none is "edited outside Planban", and the
       // board holds no files. Document sizes are checked when a document is read or written.
-      const [history, { merges, notes }] = await Promise.all([readOnlineHistoryRows(storage), onlineMerges(input.cwd, input.items, now, input.githubDeadlineMs)]);
-      return computeStaleness({ items: input.items, history, docMtimes: [], merges, notes, now });
+      const [history, { merges, notes, origin }] = await Promise.all([readOnlineHistoryRows(storage), onlineMerges(input.cwd, input.items, now, input.githubDeadlineMs)]);
+      // A bare #123 here means this project's GitHub origin, as it does for the merges found above.
+      return computeStaleness({ items: input.items, history, docMtimes: [], merges, notes, now, homeRepo: origin });
     } catch {
       return { cards: {}, wip: null };
     }
@@ -187,7 +188,7 @@ export async function collectStaleness(input: {
  * Read-only staleness for a project directory, for callers that must not load or migrate the board
  * (the session-start hook). Returns null when the project has no readable Planban board.
  */
-export async function projectStaleness(projectDir: string, options: { githubDeadlineMs?: number } = {}): Promise<{ items: PlanbanRoadmapItem[]; staleness: BoardStaleness } | null> {
+export async function projectStaleness(projectDir: string, options: { githubDeadlineMs?: number } = {}): Promise<{ items: PlanbanRoadmapItem[]; staleness: BoardStaleness; inbox?: PlanbanLanding[] | undefined } | null> {
   try {
     const manifest = JSON.parse(await readFile(join(projectDir, ".planban/project.json"), "utf8")) as {
       repoId?: unknown;
@@ -203,7 +204,11 @@ export async function projectStaleness(projectDir: string, options: { githubDead
       if (!read) return { items: [], staleness: { cards: {}, wip: null, notes: ["Planban couldn't reach the Online Board to check which cards look stale."] } };
       const { roadmap } = read;
       const items = roadmap.roadmapItems;
-      return { items, staleness: await collectStaleness({ cwd: projectDir, planningRoot: projectDir, items, storage, githubDeadlineMs: options.githubDeadlineMs }) };
+      // Merges from a linked GitHub repository that named no card, for agents to assign or dismiss.
+      return {
+        items, staleness: await collectStaleness({ cwd: projectDir, planningRoot: projectDir, items, storage, githubDeadlineMs: options.githubDeadlineMs }),
+        ...(roadmap.landingInbox?.length ? { inbox: roadmap.landingInbox } : {}),
+      };
     }
     const planningRoot = typeof manifest.storage?.root === "string" && manifest.storage.root
       ? resolve(expandHome(manifest.storage.root))

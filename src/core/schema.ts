@@ -24,6 +24,16 @@ export const manifestSchema = z.object({
   ]).optional(),
 });
 
+export const landingSchema = z.object({
+  repo: z.string().min(1),
+  number: z.number().int().positive(),
+  title: z.string(),
+  mergedAt: z.string().min(1),
+  url: z.string(),
+  recordedAt: z.string().min(1),
+  reportedThrough: z.string().min(1).max(200).optional(),
+});
+
 const roadmapItemBaseSchema = z.object({
     id: z.string().min(1),
     title: z.string().min(1),
@@ -41,6 +51,7 @@ const roadmapItemBaseSchema = z.object({
     updatedAt: z.string().nullable().default(null),
     progressNotedAt: z.string().nullish(),
     metadata: z.record(z.string(), z.unknown()).optional(),
+    landings: z.array(landingSchema).optional(),
   });
 
 export const roadmapV1ItemSchema = roadmapItemBaseSchema.passthrough();
@@ -83,6 +94,7 @@ const roadmapBaseShape = {
       }),
     )
     .default([]),
+  landingInbox: z.array(landingSchema).optional(),
 };
 
 export const roadmapV1Schema = z.object({

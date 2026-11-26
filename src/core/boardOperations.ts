@@ -173,8 +173,10 @@ export function normalizeRoadmap(input: unknown): PlanbanRoadmap {
           : "programmeRank" in item ? item.programmeRank as number | null : null
         : null,
       ...(item.metadata ? { metadata: item.metadata } : {}),
+      ...(item.landings?.length ? { landings: item.landings } : {}),
     })),
   };
+  if (!parsed.landingInbox?.length) delete roadmap.landingInbox;
   if (parsed.version === 1 || parsed.writerVersion < 6) {
     roadmap.roadmapItems = assignHierarchyRanks(roadmap.roadmapItems);
   }

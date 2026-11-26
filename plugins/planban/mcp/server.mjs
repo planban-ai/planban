@@ -25,8 +25,9 @@ const moveFilesOutModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_RO
 const errorReportModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/errorReport.ts")).href);
 const accountsModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/online/accounts.ts")).href);
 const goalsModule = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/goals.ts")).href);
+const { inboxForAgents, landingNote, parseLandingRef } = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/landings.ts")).href);
 
-const { cardAncestry, createCard, createCards, createGroup, dropChange, exportFlatVersion1, getStatus, historyPayload, loadState, moveCard, notePresence, readDoc, readDocSections, readGoals, readGoalsBlock, reconstructHierarchy, setCardParent, suggestGoalChange, unresolvedChanges, updateCard, workingOnCard, writeDoc, writeDocSection } = storageModule;
+const { cardAncestry, clearLanding, createCard, createCards, createGroup, dropChange, exportFlatVersion1, getStatus, historyPayload, loadState, moveCard, notePresence, readDoc, readDocSections, readGoals, readGoalsBlock, reconstructHierarchy, setCardParent, suggestGoalChange, unresolvedChanges, updateCard, workingOnCard, writeDoc, writeDocSection } = storageModule;
 const { goalsPageText } = goalsModule;
 const { UPDATE_HOW } = await import(pathToFileURL(resolve(PLANBAN_RUNTIME_ROOT, "src/core/clientVersion.ts")).href);
 const { archiveBoard, deleteBoard, duplicateBoard, listAllBoards, listBoards, resolveBoardCwd, restoreBoard } = registryModule;
@@ -576,7 +577,7 @@ const tools = [
   {
     name: "planban_get_board",
     title: "Get Planban Board",
-    description: "Load one Planban board state for a repo path or registered repo id.",
+    description: "Load one Planban board state for a repo path or registered repo id. Its attention section lists cards whose freshness needs fixing, and, on an Online Board with a linked GitHub repository, merged pull requests waiting in its inbox (landingInbox) to be assigned to a card or dismissed.",
     inputSchema: schema.object(commonBoardProperties),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -628,6 +629,19 @@ const tools = [
       baseRevision: { type: "number", description: "Roadmap revision you last read." },
       idempotencyKey: { type: "string", description: "Reuse only to retry the same drop after a lost reply." },
     }, ["changeId", "reason", "baseRevision"]),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: "planban_clear_landing",
+    title: "Clear a Planban Inbox Merge",
+    description: "On an Online Board with a linked GitHub repository: take one merged pull request out of the board's inbox (planban_get_board's landingInbox). Assign it to the card it finished, which gets it as a landing note, or dismiss it with a reason when it needs no card (a release or dependency merge, say). Write what the merge means into the card first. Board history records it.",
+    inputSchema: schema.object({
+      ...commonBoardProperties,
+      pullRequest: { type: "string", description: "The inbox merge as owner/name#123, as the inbox lists it." },
+      cardId: { type: "string", description: "The card it finished. Leave out to dismiss it." },
+      reason: { type: "string", description: "Why it is dismissed, in a sentence." },
+      idempotencyKey: { type: "string", description: "Reuse only to retry the same change after a lost reply." },
+    }, ["pullRequest"]),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
@@ -895,7 +909,7 @@ async function callToolImpl(name, args) {
   if (name === "planban_status") {
     const status = await getStatus(await cwdFromArgs(args));
     const board = status.initialized ? await projectStaleness(status.cwd) : null;
-    const attention = board ? stalenessAttention(board.staleness, board.items) : null;
+    const attention = board ? stalenessAttention(board.staleness, board.items, board.inbox) : null;
     const goals = status.initialized ? await readGoalsBlock(status.cwd) : null;
     return await boardResult(
       withLine(withLine(status.initialized ? `Planban is initialized for ${status.cwd}.` : `Planban is not initialized for ${status.cwd}.`, attention && stalenessLine(attention, "attention in this result")), goals),
@@ -947,14 +961,15 @@ async function callToolImpl(name, args) {
   if (name === "planban_get_board") {
     const cwd = await cwdFromArgs(args);
     const state = await loadState(cwd);
-    const attention = stalenessAttention(await boardStaleness(state), state.roadmap.roadmapItems);
+    const attention = stalenessAttention(await boardStaleness(state), state.roadmap.roadmapItems, state.roadmap.landingInbox);
+    const inbox = inboxForAgents(state.roadmap.landingInbox);
     const goals = await readGoalsBlock(cwd);
     // A board using features this Planban can't show: say so plainly, and how to update.
     const behind = state.planbanBehind ? `${state.planbanBehind.notice} ${UPDATE_HOW}` : null;
     return await boardResult(
       withLine(withLine(withLine(`Loaded Planban board ${state.manifest.repoId} at revision ${state.roadmap.revision}.`, behind), goals), stalenessLine(attention, "attention in this result")),
       state.manifest.repoId,
-      { ...summarizeBoard(state), attention, ...(goals ? { goals } : {}), ...(behind ? { planbanBehind: { ...state.planbanBehind, notice: behind } } : {}) },
+      { ...summarizeBoard(state), attention, ...(inbox.length ? { landingInbox: inbox } : {}), ...(goals ? { goals } : {}), ...(behind ? { planbanBehind: { ...state.planbanBehind, notice: behind } } : {}) },
     );
   }
 
@@ -1007,6 +1022,8 @@ async function callToolImpl(name, args) {
       planningRoot: state.planningRoot,
       card,
       ancestry: cardAncestry(state.roadmap, cardId),
+      // Pull requests that merged naming this card, as the board recorded them.
+      ...(card.landings?.length ? { landingNotes: card.landings.map(landingNote) } : {}),
       staleness,
       ...(stalenessNotes.length ? { stalenessNotes } : {}),
       // Edits to this card that were refused and still wait, and who else is working on it (online boards; Spec point 20).
@@ -1028,6 +1045,22 @@ async function callToolImpl(name, args) {
       baseRevision: optionalRevision(args.baseRevision, "baseRevision"), actor: "agent", idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
     });
     return await boardResult(`Dropped unresolved change ${args.changeId}.`, state.manifest.repoId, compactBoardSummary(state));
+  }
+
+  if (name === "planban_clear_landing") {
+    const cwd = await cwdFromArgs(args);
+    const ref = parseLandingRef(requireString(args.pullRequest, "pullRequest"));
+    if (!ref) throw new Error("Name the merge as owner/name#123, as the inbox lists it.");
+    const cardId = optionalString(args.cardId, "cardId");
+    const state = await clearLanding({
+      cwd, ...ref, cardId, reason: optionalString(args.reason, "reason"), actor: "agent", idempotencyKey: optionalString(args.idempotencyKey, "idempotencyKey"),
+    });
+    const left = state.roadmap.landingInbox?.length ?? 0;
+    return await boardResult(
+      `${cardId ? `Assigned ${ref.repo}#${ref.number} to ${cardId}` : `Dismissed ${ref.repo}#${ref.number}`}; ${left} merge${left === 1 ? "" : "s"} left in the inbox.`,
+      state.manifest.repoId,
+      { ...compactBoardSummary(state), inboxLeft: left, ...(cardId ? { card: findCard(state, cardId) } : {}) },
+    );
   }
 
   if (name === "planban_history") {

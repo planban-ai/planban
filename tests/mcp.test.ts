@@ -165,6 +165,7 @@ test("Planban MCP server registers focused tools", () => {
       "planban_get_card",
       "planban_unresolved_changes",
       "planban_drop_change",
+      "planban_clear_landing",
       "planban_history",
       "planban_read_goals",
       "planban_suggest_goal_change",

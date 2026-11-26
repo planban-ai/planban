@@ -20,7 +20,8 @@ const PRUNE_BATCH = 25;
 export interface Attribution {
   userId: string;
   clientName: string;
-  actor: "user" | "agent";
+  /** "system" for an integration acting on the board's behalf, such as GitHub recording a merge. */
+  actor: "user" | "agent" | "system";
   connectionId: string;
 }
 
@@ -156,7 +157,7 @@ export async function recordHistory(ctx: MutationCtx, input: {
   }
   // Faces on shared boards: who last changed each card this version touched.
   await noteCardChanges(ctx, at, [...entry.affectedCards, ...entry.affectedDocs.map((doc) => doc.cardId)], {
-    userId: attribution.userId, agent: attribution.actor === "agent", clientName: attribution.actor === "agent" ? attribution.clientName : null, at: now, summary: history.summary,
+    userId: attribution.userId, agent: attribution.actor !== "user", clientName: attribution.actor !== "user" ? attribution.clientName : null, at: now, summary: history.summary,
   });
   await ctx.db.patch(board._id, { historyVersion: version });
   await pruneHistory(ctx, at, version - MAX_HISTORY_VERSIONS);

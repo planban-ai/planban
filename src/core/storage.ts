@@ -1153,6 +1153,16 @@ export async function dropChange(input: { cwd: string; changeId: string; reason:
   return (await onlineOperation(resolveProjectCwd(input.cwd), online, "dropChange", input)).state;
 }
 
+/**
+ * Takes one merged pull request out of an Online Board's inbox: onto the card it finished, as a
+ * landing note, or dismissed. A board on this computer has no inbox (its merges come from git).
+ */
+export async function clearLanding(input: { cwd: string; repo: string; number: number; cardId?: string | undefined; reason?: string | undefined; actor?: PlanbanHistoryActor | undefined; idempotencyKey?: string | undefined }): Promise<PlanbanResolvedState> {
+  const online = await onlineManifest(input.cwd);
+  if (!online) throw new PlanbanValidationError("Only Online Boards with a linked GitHub repository have an inbox of merges.");
+  return (await onlineOperation(resolveProjectCwd(input.cwd), online, "clearLanding", input)).state;
+}
+
 export async function readHistoryDoc(input: {
   cwd: string;
   version: number;

@@ -15,4 +15,5 @@ crons.daily("forget ended browser sign-ins", { hourUTC: 4, minuteUTC: 30 }, inte
 crons.hourly("forget who was working on cards long ago", { minuteUTC: 41 }, internal.maintenance.expirePresence, {});
 crons.daily("finish deletions of boards and accounts", { hourUTC: 5, minuteUTC: 0 }, internal.erasure.sweep, {});
 crons.hourly("forget old sign-in approval counts", { minuteUTC: 41 }, internal.oauth.pruneApprovals, {});
+crons.daily("forget old GitHub delivery ids", { hourUTC: 5, minuteUTC: 30 }, internal.github.forgetDeliveries, {});
 export default crons;
