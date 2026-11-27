@@ -527,3 +527,27 @@ test("goals on the web: the page reads them and the owner changes them; a viewer
     assert.equal(refused.status, 403, JSON.stringify(refused.body));
   });
 });
+
+test("the page reads the board and its history in full once, then only what changed (PB-81)", async () => {
+  await withServiceEnv(async () => {
+    const { service, owner, boardId, adapter, log } = await ownerWithBoard();
+    const paths = () => log.filter((entry) => entry.method === "GET").map((entry) => entry.path);
+    const first = await page(adapter, boardPath(boardId, "/state"));
+    await page(adapter, boardPath(boardId, "/history"));
+    const created = await page(adapter, boardPath(boardId, "/cards"), { method: "POST", body: { title: "Cut database reads", status: "pending", baseRevision: first.body.roadmap.revision } });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    log.length = 0;
+    const state = await page(adapter, boardPath(boardId, "/state"));
+    const history = await page(adapter, boardPath(boardId, "/history"));
+    assert.deepEqual(paths(), [`/api/v1/boards/${boardId}?since=1`, `/api/v1/boards/${boardId}/history?after=1`]);
+    log.length = 0;
+    const unchanged = await page(adapter, boardPath(boardId, "/state"));
+    assert.deepEqual(paths(), [`/api/v1/boards/${boardId}?since=2`], "an unchanged board is not downloaded again");
+    // What the page gets is what a fresh page would get.
+    const fresh = service.adapterFor(owner.token, { log: [] });
+    assert.deepEqual(state.body, (await page(fresh, boardPath(boardId, "/state"))).body);
+    assert.deepEqual(unchanged.body, state.body);
+    assert.deepEqual(history.body, (await page(fresh, boardPath(boardId, "/history"))).body);
+    assert.deepEqual(history.body.entries.map((entry: Json) => entry.version), [2, 1]);
+  });
+});

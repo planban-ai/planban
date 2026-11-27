@@ -20,6 +20,7 @@
 // signInNeeded, so the page shows its signed-out screen.
 import type { PlanbanRoadmap } from "../core/types";
 import { boardOnlyStaleness, type StalenessSignal } from "../core/staleness";
+import { historyCache, type ServiceHistoryPayload } from "../core/online/historyCache";
 
 /** One request to the online service, at a path under its own address. */
 export type ServiceSend = (path: string, init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string; signal?: AbortSignal }) => Promise<Response>;
@@ -190,6 +191,10 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
     return { ok: true, value: await response.json() as T };
   }
 
+  const history = historyCache();
+  /** Each board as last read in full, kept as text so the page can't change it. */
+  const boardsRead = new Map<string, { revision: number; roadmap: string }>();
+
   async function get<T>(path: string, request?: PageRequest) {
     return read<T>(await call("GET", path, undefined, request?.signal ? { signal: request.signal } : {}));
   }
@@ -231,10 +236,18 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
   }
 
   async function loadBoard(boardId: string, request?: PageRequest): Promise<PageReply> {
-    const board = await get<{ roadmap: PlanbanRoadmap; authority?: string; role?: BoardRole }>(serviceBoard(boardId), request);
+    // The board as last read is reused when the service says it hasn't changed since (PB-81).
+    const known = boardsRead.get(boardId);
+    const board = await get<{ roadmap: PlanbanRoadmap; authority?: string; role?: BoardRole } | { unchanged: true; revision: number; authority?: string; role?: BoardRole }>(serviceBoard(boardId, known ? `?since=${known.revision}` : ""), request);
     if (!board.ok) return board.reply;
+    const roadmap = "roadmap" in board.value ? board.value.roadmap : known && board.value.revision === known.revision ? JSON.parse(known.roadmap) as PlanbanRoadmap : null;
+    if (!roadmap) {
+      boardsRead.delete(boardId);
+      return loadBoard(boardId, request);
+    }
+    if ("roadmap" in board.value) boardsRead.set(boardId, { revision: roadmap.revision, roadmap: JSON.stringify(roadmap) });
     roles.set(boardId, { role: board.value.role ?? roles.get(boardId)?.role ?? null, authority: board.value.authority ?? null });
-    return reply({ ...boardState(boardId, board.value.roadmap), staleness: pageStaleness(board.value.roadmap) });
+    return reply({ ...boardState(boardId, roadmap), staleness: pageStaleness(roadmap) });
   }
 
   const routes: Route[] = [
@@ -342,8 +355,18 @@ export function createHostedAdapter(options: HostedAdapterOptions) {
     // History: the list, a version as page state, and an old Spec or Plan.
     {
       method: "GET", pattern: ["boards", ":board", "history"], handle: async ({ board }, request) => {
-        const history = await get(serviceBoard(board!, "/history"), request);
-        return history.ok ? reply(history.value) : history.reply;
+        // Only entries newer than the last read are fetched (PB-81).
+        class Refused { constructor(readonly reply: PageReply) {} }
+        try {
+          return reply(await history.read(board!, async (after) => {
+            const read = await get<ServiceHistoryPayload>(serviceBoard(board!, after === undefined ? "/history" : `/history?after=${after}`), request);
+            if (!read.ok) throw new Refused(read.reply);
+            return read.value;
+          }));
+        } catch (error) {
+          if (error instanceof Refused) return error.reply;
+          throw error;
+        }
       },
     },
     {
