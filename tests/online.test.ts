@@ -92,7 +92,7 @@ async function fakeService() {
   let onMe: (() => Promise<void> | void) | undefined;
   const uploads = new Map<string, Buffer>();
   const sessions = new Map<string, any>();
-  const requests: { method: string; path: string; body: any }[] = [];
+  const requests: { method: string; path: string; body: any; search?: string }[] = [];
   const errors: Error[] = [];
   const server = createServer(async (req, res) => {
     try {
@@ -101,7 +101,7 @@ async function fakeService() {
       const rawBytes = await readBytes(req);
       const raw = rawBytes.toString("utf8");
       const body = raw && req.method !== "PUT" ? (req.headers["content-type"]?.includes("application/json") ? JSON.parse(raw) : Object.fromEntries(new URLSearchParams(raw))) : undefined;
-      requests.push({ method: req.method!, path, body });
+      requests.push({ method: req.method!, path, body, search: request.search });
       const json = (status: number, value: unknown) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(value)); };
       // The fake implements Planban's explicit service-owned enrollment.
       if (path === "/.well-known/planban.json") return json(200, { signIn: { issuer: url, cliClientId: "planban-cli", redirectPorts: [53682, 53683, 53684, 53685, 53686], scope: "planban:machine" } });
@@ -528,6 +528,19 @@ test("the sign-in server's endpoints must belong to it", async () => {
   fake.setMetadataOrigin("https://other.example");
   await assert.rejects(onlineLogin(fake.url, { switchAccount: true, openBrowser: async () => assert.fail("no browser should open") }), /must belong to it/);
   assert.equal(fake.requests.some((req) => req.path === "/oauth/token"), false);
+});
+
+test("a board read again unchanged is not downloaded again (PB-81)", async () => {
+  await takeOnline(fake.url, cwd);
+  const first = await storage.loadState(cwd);
+  const moved = await storage.moveCard({ cwd, cardId: "alpha", status: "up-next", baseRevision: first.roadmap.revision });
+  const changed = await storage.loadState(cwd);
+  assert.deepEqual(changed.roadmap, moved.roadmap);
+  const before = fake.requests.length;
+  const again = await storage.loadState(cwd);
+  const reads = fake.requests.slice(before).filter((req) => req.method === "GET" && /^\/api\/v1\/boards\/[^/]+$/.test(req.path));
+  assert.deepEqual(reads.map((req) => req.search), [`?since=${changed.roadmap.revision}`]);
+  assert.deepEqual(again.roadmap, changed.roadmap);
 });
 
 test("dispatch preserves state and result shapes for all card operations", async () => {

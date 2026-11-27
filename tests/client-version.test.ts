@@ -91,7 +91,7 @@ test("online: a board using a feature this Planban doesn't have shows the notice
   const bridge = await onlineBoard();
   try {
     const { roadmap } = await storage.loadState(cwd);
-    bridge.control.intercept = async (path) => (path === "/api/v1/boards/revival" ? { status: 200, body: { roadmap, features: ["goals", "timeline"] } } : undefined);
+    bridge.control.intercept = async (path) => (path.split("?")[0] === "/api/v1/boards/revival" ? { status: 200, body: { roadmap, features: ["goals", "timeline"] } } : undefined);
     assert.deepEqual((await storage.loadState(cwd)).planbanBehind, { notice: BEHIND_NOTICE, features: ["timeline"] });
     const [, board] = await runMcp([
       { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },

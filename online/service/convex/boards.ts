@@ -361,11 +361,13 @@ export const getBoard = internalQuery({
   args: { connectionId: v.id("connections"), boardId: v.string(), since: v.optional(v.number()) },
   handler: async (ctx, { connectionId, boardId, since }) => packed(await (async () => {
     const { board, role } = await readableBoard(ctx, connectionId, boardId);
-    if (since !== undefined && since === board.revision) return { unchanged: true as const, revision: board.revision, authority: board.authority };
+    if (since !== undefined && since === board.revision) return { unchanged: true as const, revision: board.revision, authority: board.authority, role };
     // The role lets the web page show a viewer a board they can read but not change. The
     // features let a computer's older Planban say it can't show everything (16 October 2026).
-    const goals = await goalsOf(ctx, live(board));
-    return { roadmap: await currentRoadmap(ctx, live(board)), authority: board.authority, role, features: boardFeatures({ hasGoals: hasGoalsContent(goals) }) };
+    // One read of the board's stored row serves both its roadmap and its goals (PB-81).
+    const row = await stateRow(ctx, live(board));
+    const goals = normalizeGoals(row.goals ? unpackJson(row.goals) : null);
+    return { roadmap: unpackJson<PlanbanRoadmap>(row.roadmap), authority: board.authority, role, features: boardFeatures({ hasGoals: hasGoalsContent(goals) }) };
   })()),
 });
 
@@ -429,8 +431,12 @@ export const history = internalQuery({
   handler: async (ctx, { connectionId, boardId, after }): Promise<PlanbanHistoryPayload> => {
     const { board } = await readableBoard(ctx, connectionId, boardId);
     const entries = await historyEntries(ctx, live(board), after ?? 0);
+    // The oldest version still kept (one small row), so a reader holding earlier entries
+    // can fetch only newer ones and drop what was trimmed (PB-81).
+    const oldest = await ctx.db.query("history").withIndex("by_board_version", (q) => q.eq("boardId", board.boardId).eq("generation", board.generation)).first();
     return {
       currentVersion: board.historyVersion,
+      oldestVersion: oldest?.version ?? null,
       retention: { boardVersions: 1000, cardVersions: 1000, documentVersions: 1000, hourlyDays: 0, maxAgeDays: 0 },
       entries,
     } as PlanbanHistoryPayload;

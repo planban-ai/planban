@@ -46,6 +46,7 @@ import { currentVersionInfo } from "./version";
 import { flattenRoadmapForVersion1, hierarchyRecoveryManifest } from "./hierarchyMigration";
 import { loadOnlineState, onlineCacheRoot, onlineOperation, onlineState, refuseOnline } from "./online/adapter";
 import { boardPath, onlineRequest } from "./online/client";
+import { historyCache, type ServiceHistoryPayload } from "./online/historyCache";
 import { cardSubject, changesSince, conflictMessage, lastDocChange, MAX_CONFLICT_DOCUMENT_CHARS, PlanbanEditConflictError, RECONCILE, type ConflictDetails } from "./conflicts";
 import { editSection, sectionList } from "./docSections";
 import { assertNotStaleCopy, checkInBackground, ONLINE_NOTE, STALE_MARKER } from "./online/copyCheck";
@@ -1041,9 +1042,16 @@ export async function writeDoc(input: {
   }).catch(againIfMoved(() => writeDoc(input)));
 }
 
+const onlineHistory = historyCache();
+
 export async function historyPayload(cwd: string) {
   const online = await onlineManifest(cwd);
-  if (online?.storage?.kind === "online") return onlineRequest<PlanbanHistoryPayload>(online.storage.url, boardPath(online.storage.boardId, "/history"));
+  if (online?.storage?.kind === "online") {
+    const { url, boardId } = online.storage;
+    // Only entries newer than the last read are fetched (PB-81).
+    return onlineHistory.read(`${url}\n${boardId}`, (after) =>
+      onlineRequest<ServiceHistoryPayload>(url, boardPath(boardId, after === undefined ? "/history" : `/history?after=${after}`)));
+  }
   const state = await loadState(cwd);
   const { listHistory } = await import("./history");
   return listHistory(state);

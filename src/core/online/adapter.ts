@@ -30,6 +30,10 @@ export function onlineState(cwd: string, manifest: PlanbanProjectManifest, roadm
 const boardFeaturesSeen = new Map<string, string[]>();
 const featuresKey = (storage: OnlineStorage) => `${serviceUrl(storage.url)}\n${storage.boardId}`;
 
+/** Each online board as last read in full here, kept as text so callers can't change it. */
+const boardsRead = new Map<string, { revision: number; roadmap: string; features: string[]; at: number }>();
+const FULL_READ_MS = 10 * 60 * 1000;
+
 function withBehindNotice(state: PlanbanResolvedState, storage: OnlineStorage) {
   const unknown = unknownFeatures(boardFeaturesSeen.get(featuresKey(storage)));
   if (unknown.length) state.planbanBehind = { notice: BEHIND_NOTICE, features: unknown };
@@ -43,12 +47,24 @@ export async function loadOnlineState(cwd: string, manifest: PlanbanProjectManif
   const linked = await boardAccount(storage.url, storage.boardId);
   const unlinkedDefault = linked ? undefined : (await readCredentials()).services[serviceUrl(storage.url)];
   const pinned = unlinkedDefault ? await withIdentity(storage.url, unlinkedDefault) : undefined;
-  type BoardRead = { roadmap: PlanbanRoadmap; features?: string[] };
-  const { roadmap, features } = await onlineRequest<BoardRead>(storage.url, boardPath(storage.boardId), undefined, pinned ? { credentials: pinned } : {}).catch(async (error: unknown) => {
+  type BoardRead = { roadmap: PlanbanRoadmap; features?: string[] } | { unchanged: true; revision: number };
+  // The board as last read here is reused when the service says it hasn't changed since (PB-81).
+  const held = boardsRead.get(featuresKey(storage));
+  // Read in full again now and then, so features a newer service reports for an unchanged board still show.
+  const known = held && Date.now() - held.at < FULL_READ_MS ? held : undefined;
+  const path = boardPath(storage.boardId, known ? `?since=${known.revision}` : "");
+  const read = await onlineRequest<BoardRead>(storage.url, path, undefined, pinned ? { credentials: pinned } : {}).catch(async (error: unknown) => {
     // "Not found" for a board not yet linked here may mean another signed-in account is the one.
     if (error instanceof PlanbanNotFoundError) return findBoardAccount<BoardRead>(storage.url, storage.boardId, boardPath(storage.boardId), error);
     throw error;
   });
+  const fresh = "roadmap" in read ? read : known && read.revision === known.revision ? { roadmap: JSON.parse(known.roadmap) as PlanbanRoadmap, features: known.features } : null;
+  if (!fresh) {
+    boardsRead.delete(featuresKey(storage));
+    return loadOnlineState(cwd, manifest);
+  }
+  const { roadmap, features } = fresh;
+  if ("roadmap" in read && typeof roadmap.revision === "number") boardsRead.set(featuresKey(storage), { revision: roadmap.revision, roadmap: JSON.stringify(roadmap), features: features ?? [], at: Date.now() });
   if (pinned?.person && !(await boardAccount(storage.url, storage.boardId))) {
     await recordBoardAccountAs(storage.url, storage.boardId, pinned).catch(() => undefined);
   }
